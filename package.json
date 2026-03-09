@@ -1,0 +1,21 @@
+{
+  "name": "codetracer-js-recorder",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CodeTracer JavaScript/TypeScript recorder — full-state recording via compile-time SWC instrumentation",
+  "workspaces": [
+    "packages/instrumenter",
+    "packages/runtime",
+    "packages/cli"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "prettier": "^3.4.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

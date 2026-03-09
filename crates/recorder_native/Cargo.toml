@@ -1,0 +1,19 @@
+[package]
+name = "codetracer_js_recorder_native"
+version = "0.1.0"
+edition = "2021"
+description = "CodeTracer JavaScript recorder — Rust N-API addon for trace writing"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2", features = ["napi8"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+strip = "symbols"

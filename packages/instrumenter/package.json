@@ -1,0 +1,17 @@
+{
+  "name": "@codetracer/instrumenter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SWC-based JavaScript/TypeScript instrumenter for CodeTracer",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@swc/core": "^1.10.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
