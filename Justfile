@@ -1,16 +1,18 @@
 alias t := test
 alias fmt := format
 
-# Run all tests
+# Run all tests (builds workspaces first so imports resolve)
 test:
+    npm run build
     npm test
 
-# Build the Rust native addon
+# Build the Rust native addon via napi-rs
 build-native:
-    cargo build --release --manifest-path crates/recorder_native/Cargo.toml
+    npx napi build --release --manifest-path crates/recorder_native/Cargo.toml --output-dir crates/recorder_native/
 
 # Build all packages
 build:
+    just build-native
     npm run build
 
 # Format Rust code
