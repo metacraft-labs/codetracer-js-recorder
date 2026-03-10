@@ -2,11 +2,13 @@
  * CodeTracer runtime library.
  *
  * Instrumented code calls these functions. Events are buffered in typed arrays
- * and flushed in batches (to the Rust N-API addon once M3 lands).
+ * and flushed in batches to the Rust N-API trace writer addon.
  *
  * Public surface:
- *   - `__ct`           — the singleton runtime instance
- *   - `createRuntime`  — factory for testing / advanced use
+ *   - `__ct`              — the singleton runtime instance
+ *   - `createRuntime`     — factory for testing / advanced use
+ *   - `startRecording`    — connect runtime to Rust trace writer
+ *   - `loadNativeAddon`   — load the native .node addon
  *   - Config / Buffer types for inspection
  */
 
@@ -18,13 +20,16 @@ export type { RuntimeConfig } from "./config.js";
 export { EventBuffer, EVENT_STEP, EVENT_ENTER, EVENT_RET } from "./buffer.js";
 export type { EventBatch, EventKind, FlushCallback } from "./buffer.js";
 
-export { createRuntime } from "./runtime.js";
+export { createRuntime, loadNativeAddon, startRecording } from "./runtime.js";
 export type {
   CtRuntime,
   TraceManifest,
   ManifestFunctionEntry,
   ManifestSiteEntry,
   CreateRuntimeOptions,
+  NativeAddon,
+  StartRecordingOptions,
+  RecordingSession,
 } from "./runtime.js";
 
 // ── Singleton ───────────────────────────────────────────────────────
