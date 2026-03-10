@@ -37,6 +37,7 @@ export type {
 } from "./buffer.js";
 
 export { encodeValue } from "./runtime.js";
+export type { EncodeValueOptions } from "./runtime.js";
 
 export { installConsoleCapture, removeConsoleCapture } from "./io-capture.js";
 

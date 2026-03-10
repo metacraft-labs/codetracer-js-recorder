@@ -153,22 +153,44 @@ describe("test_type_registration", () => {
     expect(result.value).toBe("Symbol(test)");
   });
 
-  it("encodes functions as Raw/'function'", () => {
-    const result = encodeValue(() => {});
-    expect(result.typeKind).toBe("Raw");
-    expect(result.value).toBe("function");
+  it("encodes named functions as FunctionKind with name", () => {
+    function myFunc() {}
+    const result = encodeValue(myFunc);
+    expect(result.typeKind).toBe("FunctionKind");
+    expect(result.value).toBe("myFunc");
   });
 
-  it("encodes objects as Raw/'object'", () => {
+  it("encodes anonymous functions as FunctionKind with 'anonymous'", () => {
+    // Use a function expression assigned to a const for truly anonymous behavior
+    const result = encodeValue(
+      (() => {
+        // eslint-disable-next-line no-inner-declarations
+        return Function("return 1");
+      })(),
+    );
+    expect(result.typeKind).toBe("FunctionKind");
+    expect(result.value).toBe("anonymous");
+  });
+
+  it("encodes objects as Struct", () => {
     const result = encodeValue({ a: 1 });
-    expect(result.typeKind).toBe("Raw");
-    expect(result.value).toBe("object");
+    expect(result.typeKind).toBe("Struct");
+    const fields = (
+      result.value as { fields: Array<{ name: string; value: EncodedValue }> }
+    ).fields;
+    expect(fields.length).toBe(1);
+    expect(fields[0].name).toBe("a");
+    expect(fields[0].value).toEqual({ value: 1, typeKind: "Int" });
   });
 
-  it("encodes arrays as Raw/'array'", () => {
+  it("encodes arrays as Seq", () => {
     const result = encodeValue([1, 2, 3]);
-    expect(result.typeKind).toBe("Raw");
-    expect(result.value).toBe("array");
+    expect(result.typeKind).toBe("Seq");
+    const elements = result.value as EncodedValue[];
+    expect(elements.length).toBe(3);
+    expect(elements[0]).toEqual({ value: 1, typeKind: "Int" });
+    expect(elements[1]).toEqual({ value: 2, typeKind: "Int" });
+    expect(elements[2]).toEqual({ value: 3, typeKind: "Int" });
   });
 });
 

@@ -36,63 +36,310 @@ import { AsyncContextTracker } from "./async-context.js";
 /** Maximum string length before truncation. */
 const MAX_STRING_LENGTH = 1000;
 
+/** Default maximum depth for nested object/array encoding. */
+const DEFAULT_MAX_DEPTH = 5;
+
+/** Default maximum number of elements/fields captured per object/array. */
+const DEFAULT_MAX_SIZE = 100;
+
+/** Options for controlling deep value encoding behavior. */
+export interface EncodeValueOptions {
+  /** Maximum nesting depth before values are encoded as "[depth limit]". Default: 5. */
+  maxDepth?: number;
+  /** Maximum number of elements/fields per object/array. Default: 100. */
+  maxSize?: number;
+}
+
 /**
  * Encode a JavaScript value into a serializable format with type annotation.
  *
- * For MVP, only primitive values are fully captured. Objects, arrays,
- * functions, and symbols get a brief type description.
+ * Handles primitive types, arrays, plain objects, Map, Set, Error, RegExp,
+ * Date, and functions. Supports depth limiting, circular reference detection,
+ * and size limiting for safe serialization of complex values.
+ *
+ * This function never throws and never infinite-loops.
  */
-export function encodeValue(value: unknown): EncodedValue {
-  if (value === undefined) {
-    return { value: null, typeKind: "None" };
-  }
-  if (value === null) {
-    return { value: null, typeKind: "None" };
-  }
+export function encodeValue(
+  value: unknown,
+  options?: EncodeValueOptions,
+): EncodedValue {
+  const maxDepth = options?.maxDepth ?? DEFAULT_MAX_DEPTH;
+  const maxSize = options?.maxSize ?? DEFAULT_MAX_SIZE;
+  const seen = new WeakSet<object>();
 
-  switch (typeof value) {
-    case "boolean":
-      return { value, typeKind: "Bool" };
+  return encodeValueInner(value, 0, maxDepth, maxSize, seen);
+}
 
-    case "number":
-      if (Number.isNaN(value)) {
-        return { value: "NaN", typeKind: "Raw" };
-      }
-      if (!Number.isFinite(value)) {
-        return { value: value > 0 ? "Infinity" : "-Infinity", typeKind: "Raw" };
-      }
-      if (Number.isInteger(value)) {
-        return { value, typeKind: "Int" };
-      }
-      return { value, typeKind: "Float" };
-
-    case "string": {
-      const truncated =
-        value.length > MAX_STRING_LENGTH
-          ? value.slice(0, MAX_STRING_LENGTH)
-          : value;
-      return { value: truncated, typeKind: "String" };
+/**
+ * Inner recursive encoder with depth tracking and circular reference detection.
+ */
+function encodeValueInner(
+  value: unknown,
+  depth: number,
+  maxDepth: number,
+  maxSize: number,
+  seen: WeakSet<object>,
+): EncodedValue {
+  try {
+    // Primitives: null and undefined
+    if (value === undefined) {
+      return { value: null, typeKind: "None" };
+    }
+    if (value === null) {
+      return { value: null, typeKind: "None" };
     }
 
-    case "bigint":
-      return { value: value.toString(), typeKind: "BigInt" };
+    switch (typeof value) {
+      case "boolean":
+        return { value, typeKind: "Bool" };
 
-    case "symbol":
-      return { value: value.toString(), typeKind: "Raw" };
+      case "number":
+        if (Number.isNaN(value)) {
+          return { value: "NaN", typeKind: "Raw" };
+        }
+        if (!Number.isFinite(value)) {
+          return {
+            value: value > 0 ? "Infinity" : "-Infinity",
+            typeKind: "Raw",
+          };
+        }
+        if (Number.isInteger(value)) {
+          return { value, typeKind: "Int" };
+        }
+        return { value, typeKind: "Float" };
 
-    case "function":
-      return { value: "function", typeKind: "Raw" };
-
-    case "object":
-      // Arrays, plain objects, etc. — brief repr for MVP
-      if (Array.isArray(value)) {
-        return { value: "array", typeKind: "Raw" };
+      case "string": {
+        const truncated =
+          value.length > MAX_STRING_LENGTH
+            ? value.slice(0, MAX_STRING_LENGTH)
+            : value;
+        return { value: truncated, typeKind: "String" };
       }
-      return { value: "object", typeKind: "Raw" };
 
-    default:
-      return { value: typeof value, typeKind: "Raw" };
+      case "bigint":
+        return { value: value.toString(), typeKind: "BigInt" };
+
+      case "symbol":
+        return { value: value.toString(), typeKind: "Raw" };
+
+      case "function":
+        return {
+          value: (value as Function).name || "anonymous",
+          typeKind: "FunctionKind",
+        };
+
+      case "object":
+        return encodeObject(value as object, depth, maxDepth, maxSize, seen);
+
+      default:
+        return { value: typeof value, typeKind: "Raw" };
+    }
+  } catch {
+    // Safety net: never throw from encodeValue
+    return { value: "[encoding error]", typeKind: "Raw" };
   }
+}
+
+/**
+ * Encode an object value (arrays, plain objects, Map, Set, Error, RegExp, Date).
+ */
+function encodeObject(
+  obj: object,
+  depth: number,
+  maxDepth: number,
+  maxSize: number,
+  seen: WeakSet<object>,
+): EncodedValue {
+  // Circular reference detection
+  if (seen.has(obj)) {
+    return { value: "[circular]", typeKind: "Raw" };
+  }
+
+  // Depth limit check
+  if (depth >= maxDepth) {
+    return { value: "[depth limit]", typeKind: "Raw" };
+  }
+
+  // Track this object for circular reference detection
+  seen.add(obj);
+
+  try {
+    // Date (check before plain object)
+    if (obj instanceof Date) {
+      return { value: obj.toISOString(), typeKind: "Raw" };
+    }
+
+    // RegExp (check before plain object)
+    if (obj instanceof RegExp) {
+      return { value: obj.toString(), typeKind: "Raw" };
+    }
+
+    // Error (check before plain object)
+    if (obj instanceof Error) {
+      return { value: obj.message, typeKind: "Error" };
+    }
+
+    // Array
+    if (Array.isArray(obj)) {
+      return encodeArray(obj, depth, maxDepth, maxSize, seen);
+    }
+
+    // Map
+    if (obj instanceof Map) {
+      return encodeMap(obj, depth, maxDepth, maxSize, seen);
+    }
+
+    // Set
+    if (obj instanceof Set) {
+      return encodeSet(obj, depth, maxDepth, maxSize, seen);
+    }
+
+    // Plain object (or other object types)
+    return encodeStruct(obj, depth, maxDepth, maxSize, seen);
+  } finally {
+    // Remove from seen set after encoding so the same object can appear
+    // in different branches of the object graph (just not recursively)
+    seen.delete(obj);
+  }
+}
+
+/**
+ * Encode an array as Seq typeKind.
+ */
+function encodeArray(
+  arr: unknown[],
+  depth: number,
+  maxDepth: number,
+  maxSize: number,
+  seen: WeakSet<object>,
+): EncodedValue {
+  const total = arr.length;
+  const limit = Math.min(total, maxSize);
+  const elements: EncodedValue[] = [];
+
+  for (let i = 0; i < limit; i++) {
+    elements.push(encodeValueInner(arr[i], depth + 1, maxDepth, maxSize, seen));
+  }
+
+  if (total > maxSize) {
+    elements.push({
+      value: `[... ${total - maxSize} more]`,
+      typeKind: "Raw",
+    });
+  }
+
+  return { value: elements, typeKind: "Seq" };
+}
+
+/**
+ * Encode a Map as TableKind typeKind.
+ */
+function encodeMap(
+  map: Map<unknown, unknown>,
+  depth: number,
+  maxDepth: number,
+  maxSize: number,
+  seen: WeakSet<object>,
+): EncodedValue {
+  const total = map.size;
+  const limit = Math.min(total, maxSize);
+  const entries: Array<{ key: EncodedValue; value: EncodedValue }> = [];
+
+  let count = 0;
+  for (const [key, val] of map) {
+    if (count >= limit) break;
+    entries.push({
+      key: encodeValueInner(key, depth + 1, maxDepth, maxSize, seen),
+      value: encodeValueInner(val, depth + 1, maxDepth, maxSize, seen),
+    });
+    count++;
+  }
+
+  if (total > maxSize) {
+    entries.push({
+      key: { value: `[... ${total - maxSize} more]`, typeKind: "Raw" },
+      value: { value: null, typeKind: "None" },
+    });
+  }
+
+  return { value: entries, typeKind: "TableKind" };
+}
+
+/**
+ * Encode a Set as Set typeKind.
+ */
+function encodeSet(
+  set: Set<unknown>,
+  depth: number,
+  maxDepth: number,
+  maxSize: number,
+  seen: WeakSet<object>,
+): EncodedValue {
+  const total = set.size;
+  const limit = Math.min(total, maxSize);
+  const elements: EncodedValue[] = [];
+
+  let count = 0;
+  for (const val of set) {
+    if (count >= limit) break;
+    elements.push(encodeValueInner(val, depth + 1, maxDepth, maxSize, seen));
+    count++;
+  }
+
+  if (total > maxSize) {
+    elements.push({
+      value: `[... ${total - maxSize} more]`,
+      typeKind: "Raw",
+    });
+  }
+
+  return { value: elements, typeKind: "Set" };
+}
+
+/**
+ * Encode a plain object as Struct typeKind.
+ */
+function encodeStruct(
+  obj: object,
+  depth: number,
+  maxDepth: number,
+  maxSize: number,
+  seen: WeakSet<object>,
+): EncodedValue {
+  let keys: string[];
+  try {
+    keys = Object.keys(obj);
+  } catch {
+    // Some exotic objects may throw on Object.keys
+    return { value: "[object]", typeKind: "Raw" };
+  }
+
+  const total = keys.length;
+  const limit = Math.min(total, maxSize);
+  const fields: Array<{ name: string; value: EncodedValue }> = [];
+
+  for (let i = 0; i < limit; i++) {
+    const key = keys[i];
+    let val: unknown;
+    try {
+      val = (obj as Record<string, unknown>)[key];
+    } catch {
+      val = "[access error]";
+    }
+    fields.push({
+      name: key,
+      value: encodeValueInner(val, depth + 1, maxDepth, maxSize, seen),
+    });
+  }
+
+  if (total > maxSize) {
+    fields.push({
+      name: `[... ${total - maxSize} more]`,
+      value: { value: null, typeKind: "None" },
+    });
+  }
+
+  return { value: { fields }, typeKind: "Struct" };
 }
 
 // createRequire needs a base URL; in CJS __filename is available.

@@ -227,27 +227,95 @@ var handle = addon.startRecording({
   format: ${esc(opts.format)},
 });
 
-// Value encoding for primitives
+// Deep value encoding with depth/circular/size limits
 var MAX_STRING_LENGTH = 1000;
-function encodeValue(value) {
-  if (value === undefined) return { value: null, typeKind: "None" };
-  if (value === null) return { value: null, typeKind: "None" };
-  switch (typeof value) {
-    case "boolean": return { value: value, typeKind: "Bool" };
-    case "number":
-      if (value !== value) return { value: "NaN", typeKind: "Raw" };
-      if (!isFinite(value)) return { value: value > 0 ? "Infinity" : "-Infinity", typeKind: "Raw" };
-      if (Number.isInteger(value)) return { value: value, typeKind: "Int" };
-      return { value: value, typeKind: "Float" };
-    case "string":
-      return { value: value.length > MAX_STRING_LENGTH ? value.slice(0, MAX_STRING_LENGTH) : value, typeKind: "String" };
-    case "bigint": return { value: value.toString(), typeKind: "BigInt" };
-    case "symbol": return { value: value.toString(), typeKind: "Raw" };
-    case "function": return { value: "function", typeKind: "Raw" };
-    case "object":
-      if (Array.isArray(value)) return { value: "array", typeKind: "Raw" };
-      return { value: "object", typeKind: "Raw" };
-    default: return { value: typeof value, typeKind: "Raw" };
+var DEFAULT_MAX_DEPTH = 5;
+var DEFAULT_MAX_SIZE = 100;
+
+function encodeValue(value, depth, seen) {
+  if (depth === undefined) depth = 0;
+  if (seen === undefined) seen = new WeakSet();
+  try {
+    if (value === undefined) return { value: null, typeKind: "None" };
+    if (value === null) return { value: null, typeKind: "None" };
+    switch (typeof value) {
+      case "boolean": return { value: value, typeKind: "Bool" };
+      case "number":
+        if (value !== value) return { value: "NaN", typeKind: "Raw" };
+        if (!isFinite(value)) return { value: value > 0 ? "Infinity" : "-Infinity", typeKind: "Raw" };
+        if (Number.isInteger(value)) return { value: value, typeKind: "Int" };
+        return { value: value, typeKind: "Float" };
+      case "string":
+        return { value: value.length > MAX_STRING_LENGTH ? value.slice(0, MAX_STRING_LENGTH) : value, typeKind: "String" };
+      case "bigint": return { value: value.toString(), typeKind: "BigInt" };
+      case "symbol": return { value: value.toString(), typeKind: "Raw" };
+      case "function": return { value: value.name || "anonymous", typeKind: "FunctionKind" };
+      case "object": {
+        if (seen.has(value)) return { value: "[circular]", typeKind: "Raw" };
+        if (depth >= DEFAULT_MAX_DEPTH) return { value: "[depth limit]", typeKind: "Raw" };
+        seen.add(value);
+        try {
+          if (value instanceof Date) return { value: value.toISOString(), typeKind: "Raw" };
+          if (value instanceof RegExp) return { value: value.toString(), typeKind: "Raw" };
+          if (value instanceof Error) return { value: value.message, typeKind: "Error" };
+          if (Array.isArray(value)) {
+            var total = value.length;
+            var limit = Math.min(total, DEFAULT_MAX_SIZE);
+            var elements = [];
+            for (var i = 0; i < limit; i++) elements.push(encodeValue(value[i], depth + 1, seen));
+            if (total > DEFAULT_MAX_SIZE) elements.push({ value: "[... " + (total - DEFAULT_MAX_SIZE) + " more]", typeKind: "Raw" });
+            return { value: elements, typeKind: "Seq" };
+          }
+          if (value instanceof Map) {
+            var mapTotal = value.size;
+            var mapLimit = Math.min(mapTotal, DEFAULT_MAX_SIZE);
+            var mapEntries = [];
+            var mapCount = 0;
+            value.forEach(function(v, k) {
+              if (mapCount < mapLimit) {
+                mapEntries.push({ key: encodeValue(k, depth + 1, seen), value: encodeValue(v, depth + 1, seen) });
+                mapCount++;
+              }
+            });
+            if (mapTotal > DEFAULT_MAX_SIZE) mapEntries.push({ key: { value: "[... " + (mapTotal - DEFAULT_MAX_SIZE) + " more]", typeKind: "Raw" }, value: { value: null, typeKind: "None" } });
+            return { value: mapEntries, typeKind: "TableKind" };
+          }
+          if (value instanceof Set) {
+            var setTotal = value.size;
+            var setLimit = Math.min(setTotal, DEFAULT_MAX_SIZE);
+            var setElements = [];
+            var setCount = 0;
+            value.forEach(function(v) {
+              if (setCount < setLimit) {
+                setElements.push(encodeValue(v, depth + 1, seen));
+                setCount++;
+              }
+            });
+            if (setTotal > DEFAULT_MAX_SIZE) setElements.push({ value: "[... " + (setTotal - DEFAULT_MAX_SIZE) + " more]", typeKind: "Raw" });
+            return { value: setElements, typeKind: "Set" };
+          }
+          // Plain object
+          var keys;
+          try { keys = Object.keys(value); } catch(e) { return { value: "[object]", typeKind: "Raw" }; }
+          var objTotal = keys.length;
+          var objLimit = Math.min(objTotal, DEFAULT_MAX_SIZE);
+          var fields = [];
+          for (var j = 0; j < objLimit; j++) {
+            var k = keys[j];
+            var v;
+            try { v = value[k]; } catch(e) { v = "[access error]"; }
+            fields.push({ name: k, value: encodeValue(v, depth + 1, seen) });
+          }
+          if (objTotal > DEFAULT_MAX_SIZE) fields.push({ name: "[... " + (objTotal - DEFAULT_MAX_SIZE) + " more]", value: { value: null, typeKind: "None" } });
+          return { value: { fields: fields }, typeKind: "Struct" };
+        } finally {
+          seen.delete(value);
+        }
+      }
+      default: return { value: typeof value, typeKind: "Raw" };
+    }
+  } catch(e) {
+    return { value: "[encoding error]", typeKind: "Raw" };
   }
 }
 
