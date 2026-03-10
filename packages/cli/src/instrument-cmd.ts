@@ -60,10 +60,12 @@ function mergeManifestSlices(
   paths: string[];
   functions: FunctionEntry[];
   sites: SiteEntry[];
+  sourcesContent?: Record<string, string>;
 } {
   const paths: string[] = [];
   const functions: FunctionEntry[] = [];
   const sites: SiteEntry[] = [];
+  const sourcesContent: Record<string, string> = {};
 
   const globalPathMap = new Map<string, number>();
 
@@ -100,9 +102,27 @@ function mergeManifestSlices(
       }
       sites.push(reindexed);
     }
+
+    // Merge sourcesContent
+    if (slice.sourcesContent) {
+      for (const [key, value] of Object.entries(slice.sourcesContent)) {
+        sourcesContent[key] = value;
+      }
+    }
   }
 
-  return { paths, functions, sites };
+  const result: {
+    paths: string[];
+    functions: FunctionEntry[];
+    sites: SiteEntry[];
+    sourcesContent?: Record<string, string>;
+  } = { paths, functions, sites };
+
+  if (Object.keys(sourcesContent).length > 0) {
+    result.sourcesContent = sourcesContent;
+  }
+
+  return result;
 }
 
 /**

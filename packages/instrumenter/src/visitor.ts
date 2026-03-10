@@ -24,6 +24,7 @@ import type {
   SetterProperty,
 } from "@swc/types";
 import { ManifestBuilder } from "./manifest.js";
+import type { SourceMapResolver } from "./sourcemap.js";
 
 // ---------- helpers for building AST nodes ----------
 
@@ -124,8 +125,17 @@ function mkRetExpr(fnId: number, value?: Expression): Expression {
 
 export class LineColMapper {
   private lineStarts: number[];
+  /**
+   * The base offset from the SWC global span counter.
+   * SWC uses a global offset counter across parseSync calls,
+   * so the first file starts at 1, and subsequent files start
+   * from where the previous file ended. This base offset is
+   * subtracted from span offsets before resolving to line/col.
+   */
+  private baseOffset: number;
 
-  constructor(source: string) {
+  constructor(source: string, baseOffset: number = 1) {
+    this.baseOffset = baseOffset;
     this.lineStarts = [0];
     for (let i = 0; i < source.length; i++) {
       if (source[i] === "\n") {
@@ -135,23 +145,29 @@ export class LineColMapper {
   }
 
   /**
-   * Convert a 1-based SWC span offset to { line, col } (both 1-based).
+   * Convert a SWC span offset (global) to { line, col } (both 1-based).
+   * The line is 1-based, col is 0-based.
    */
   resolve(offset: number): { line: number; col: number } {
-    // SWC offsets are 1-based
-    const pos = offset - 1;
+    // Subtract the base offset to get a 0-based position within the source
+    const pos = offset - this.baseOffset;
+    // Clamp to valid range
+    const clampedPos = Math.max(
+      0,
+      Math.min(pos, this.lineStarts[this.lineStarts.length - 1] || 0),
+    );
     // Binary search for the line
     let lo = 0;
     let hi = this.lineStarts.length - 1;
     while (lo < hi) {
       const mid = (lo + hi + 1) >> 1;
-      if (this.lineStarts[mid] <= pos) {
+      if (this.lineStarts[mid] <= clampedPos) {
         lo = mid;
       } else {
         hi = mid - 1;
       }
     }
-    return { line: lo + 1, col: pos - this.lineStarts[lo] };
+    return { line: lo + 1, col: clampedPos - this.lineStarts[lo] };
   }
 }
 
@@ -293,6 +309,34 @@ export interface TransformContext {
   manifest: ManifestBuilder;
   pathIndex: number;
   mapper: LineColMapper;
+  /**
+   * Optional source map resolver for mapping generated-JS positions
+   * back to original source positions. When set, manifest entries
+   * will use original file paths and line numbers.
+   */
+  sourceMapResolver?: SourceMapResolver;
+  /**
+   * Resolve a generated-JS location to the manifest path index and
+   * original line/col. If a source map resolver is configured, it will
+   * attempt to resolve to the original position. Falls back to the
+   * generated position.
+   */
+  resolveLocation: (
+    line: number,
+    col: number,
+  ) => { pathIndex: number; line: number; col: number };
+}
+
+/**
+ * Helper: resolve a SWC span start offset to manifest location
+ * (pathIndex, line, col), going through the source map if available.
+ */
+function resolveSpan(
+  spanStart: number,
+  ctx: TransformContext,
+): { pathIndex: number; line: number; col: number } {
+  const loc = ctx.mapper.resolve(spanStart);
+  return ctx.resolveLocation(loc.line, loc.col);
 }
 
 /**
@@ -300,8 +344,19 @@ export interface TransformContext {
  */
 export function transformModule(module: Module, ctx: TransformContext): void {
   // Register a top-level "module" function
-  const moduleFnId = ctx.manifest.addFunction("<module>", ctx.pathIndex, 1, 0);
-  ctx.manifest.addCallSite(moduleFnId, ctx.pathIndex, 1, 0);
+  const modLoc = ctx.resolveLocation(1, 0);
+  const moduleFnId = ctx.manifest.addFunction(
+    "<module>",
+    modLoc.pathIndex,
+    modLoc.line,
+    modLoc.col,
+  );
+  ctx.manifest.addCallSite(
+    moduleFnId,
+    modLoc.pathIndex,
+    modLoc.line,
+    modLoc.col,
+  );
 
   // Process module body items
   const newBody: ModuleItem[] = [];
@@ -333,19 +388,26 @@ export function transformModule(module: Module, ctx: TransformContext): void {
     // Insert step before executable statements (not import/export declarations)
     if (isExecutableModuleItem(item)) {
       const span = (item as unknown as { span: Span }).span;
-      const loc = ctx.mapper.resolve(span.start);
-      const siteId = ctx.manifest.addStepSite(ctx.pathIndex, loc.line, loc.col);
+      const resolved = resolveSpan(span.start, ctx);
+      const siteId = ctx.manifest.addStepSite(
+        resolved.pathIndex,
+        resolved.line,
+        resolved.col,
+      );
       newBody.push(mkStepCall(siteId) as unknown as ModuleItem);
     }
 
     newBody.push(item);
   }
 
-  // Add __ct.ret at module end via process.on('exit', ...)
-  const retSiteId = ctx.manifest.addReturnSite(moduleFnId, ctx.pathIndex, 1, 0);
-  // We just call __ct.ret(fnId) directly — simpler than process.on('exit')
-  // since we want it to be the last thing that executes in normal flow
-  void retSiteId; // siteId is registered but the call below doesn't use it specifically
+  // Add __ct.ret at module end
+  const retSiteId = ctx.manifest.addReturnSite(
+    moduleFnId,
+    modLoc.pathIndex,
+    modLoc.line,
+    modLoc.col,
+  );
+  void retSiteId;
   newBody.push(mkExprStmt(mkRetExpr(moduleFnId)) as unknown as ModuleItem);
 
   module.body = newBody;
@@ -605,8 +667,12 @@ function transformBlockBody(stmts: Statement[], ctx: TransformContext): void {
     // Insert step call before executable statements
     if (isExecutableStatement(stmt)) {
       const span = (stmt as unknown as { span: Span }).span;
-      const loc = ctx.mapper.resolve(span.start);
-      const siteId = ctx.manifest.addStepSite(ctx.pathIndex, loc.line, loc.col);
+      const resolved = resolveSpan(span.start, ctx);
+      const siteId = ctx.manifest.addStepSite(
+        resolved.pathIndex,
+        resolved.line,
+        resolved.col,
+      );
       newStmts.push(mkStepCall(siteId));
     }
     newStmts.push(stmt);
@@ -824,12 +890,21 @@ function transformFunctionDecl(
 ): void {
   if (!decl.body) return;
 
-  const span = decl.span;
-  const loc = ctx.mapper.resolve(span.start);
+  const resolved = resolveSpan(decl.span.start, ctx);
   const name = decl.identifier?.value ?? "<anonymous>";
-  const fnId = ctx.manifest.addFunction(name, ctx.pathIndex, loc.line, loc.col);
+  const fnId = ctx.manifest.addFunction(
+    name,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
+  );
 
-  ctx.manifest.addCallSite(fnId, ctx.pathIndex, loc.line, loc.col);
+  ctx.manifest.addCallSite(
+    fnId,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
+  );
 
   instrumentFunctionBody(decl.body, fnId, false, ctx);
 }
@@ -840,14 +915,23 @@ function transformFunctionExpression(
 ): void {
   if (!expr.body) return;
 
-  const span = expr.span;
-  const loc = ctx.mapper.resolve(span.start);
+  const resolved = resolveSpan(expr.span.start, ctx);
   const name = getFunctionName(
     expr as unknown as { type: string; identifier?: { value: string } },
   );
-  const fnId = ctx.manifest.addFunction(name, ctx.pathIndex, loc.line, loc.col);
+  const fnId = ctx.manifest.addFunction(
+    name,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
+  );
 
-  ctx.manifest.addCallSite(fnId, ctx.pathIndex, loc.line, loc.col);
+  ctx.manifest.addCallSite(
+    fnId,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
+  );
 
   instrumentFunctionBody(expr.body, fnId, false, ctx);
 }
@@ -856,16 +940,20 @@ function transformArrowFunction(
   expr: ArrowFunctionExpression,
   ctx: TransformContext,
 ): void {
-  const span = expr.span;
-  const loc = ctx.mapper.resolve(span.start);
+  const resolved = resolveSpan(expr.span.start, ctx);
   const fnId = ctx.manifest.addFunction(
     "<arrow>",
-    ctx.pathIndex,
-    loc.line,
-    loc.col,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
   );
 
-  ctx.manifest.addCallSite(fnId, ctx.pathIndex, loc.line, loc.col);
+  ctx.manifest.addCallSite(
+    fnId,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
+  );
 
   if (expr.body.type === "BlockStatement") {
     // Arrow with block body
@@ -876,15 +964,21 @@ function transformArrowFunction(
     const originalExpr = expr.body as Expression;
     transformExpression(originalExpr, ctx);
 
-    const bodyLoc = ctx.mapper.resolve(
+    const bodyResolved = resolveSpan(
       (originalExpr as unknown as { span: Span }).span.start,
+      ctx,
     );
     const stepSiteId = ctx.manifest.addStepSite(
-      ctx.pathIndex,
-      bodyLoc.line,
-      bodyLoc.col,
+      bodyResolved.pathIndex,
+      bodyResolved.line,
+      bodyResolved.col,
     );
-    ctx.manifest.addReturnSite(fnId, ctx.pathIndex, bodyLoc.line, bodyLoc.col);
+    ctx.manifest.addReturnSite(
+      fnId,
+      bodyResolved.pathIndex,
+      bodyResolved.line,
+      bodyResolved.col,
+    );
 
     const block = mkBlock([
       mkEnterCall(fnId),
@@ -908,12 +1002,22 @@ function transformMethodProperty(
   };
   if (!fn.body) return;
 
-  const loc = ctx.mapper.resolve(fn.span.start);
+  const resolved = resolveSpan(fn.span.start, ctx);
   const name = getFunctionName(
     fn as unknown as { type: string; key?: { type: string; value?: string } },
   );
-  const fnId = ctx.manifest.addFunction(name, ctx.pathIndex, loc.line, loc.col);
-  ctx.manifest.addCallSite(fnId, ctx.pathIndex, loc.line, loc.col);
+  const fnId = ctx.manifest.addFunction(
+    name,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
+  );
+  ctx.manifest.addCallSite(
+    fnId,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
+  );
   instrumentFunctionBody(fn.body, fnId, false, ctx);
 }
 
@@ -922,17 +1026,22 @@ function transformGetterProperty(
   ctx: TransformContext,
 ): void {
   if (!prop.body) return;
-  const loc = ctx.mapper.resolve(prop.span.start);
+  const resolved = resolveSpan(prop.span.start, ctx);
   const keyName = getFunctionName(
     prop as unknown as { type: string; key?: { type: string; value?: string } },
   );
   const fnId = ctx.manifest.addFunction(
     `get ${keyName}`,
-    ctx.pathIndex,
-    loc.line,
-    loc.col,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
   );
-  ctx.manifest.addCallSite(fnId, ctx.pathIndex, loc.line, loc.col);
+  ctx.manifest.addCallSite(
+    fnId,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
+  );
   instrumentFunctionBody(prop.body, fnId, false, ctx);
 }
 
@@ -941,17 +1050,22 @@ function transformSetterProperty(
   ctx: TransformContext,
 ): void {
   if (!prop.body) return;
-  const loc = ctx.mapper.resolve(prop.span.start);
+  const resolved = resolveSpan(prop.span.start, ctx);
   const keyName = getFunctionName(
     prop as unknown as { type: string; key?: { type: string; value?: string } },
   );
   const fnId = ctx.manifest.addFunction(
     `set ${keyName}`,
-    ctx.pathIndex,
-    loc.line,
-    loc.col,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
   );
-  ctx.manifest.addCallSite(fnId, ctx.pathIndex, loc.line, loc.col);
+  ctx.manifest.addCallSite(
+    fnId,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
+  );
   instrumentFunctionBody(prop.body, fnId, false, ctx);
 }
 
@@ -1006,14 +1120,19 @@ function transformConstructor(
 ): void {
   if (!ctor.body) return;
 
-  const loc = ctx.mapper.resolve(ctor.span.start);
+  const resolved = resolveSpan(ctor.span.start, ctx);
   const fnId = ctx.manifest.addFunction(
     "constructor",
-    ctx.pathIndex,
-    loc.line,
-    loc.col,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
   );
-  ctx.manifest.addCallSite(fnId, ctx.pathIndex, loc.line, loc.col);
+  ctx.manifest.addCallSite(
+    fnId,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
+  );
 
   // Check if this is a derived constructor (has superClass)
   const clsAny = cls as unknown as { superClass?: Expression };
@@ -1026,12 +1145,22 @@ function transformClassMethod(cm: ClassMethod, ctx: TransformContext): void {
   const fn = cm.function;
   if (!fn.body) return;
 
-  const loc = ctx.mapper.resolve(cm.span.start);
+  const resolved = resolveSpan(cm.span.start, ctx);
   const name = getFunctionName(
     cm as unknown as { type: string; key?: { type: string; value?: string } },
   );
-  const fnId = ctx.manifest.addFunction(name, ctx.pathIndex, loc.line, loc.col);
-  ctx.manifest.addCallSite(fnId, ctx.pathIndex, loc.line, loc.col);
+  const fnId = ctx.manifest.addFunction(
+    name,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
+  );
+  ctx.manifest.addCallSite(
+    fnId,
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
+  );
 
   instrumentFunctionBody(fn.body, fnId, false, ctx);
 }
@@ -1046,6 +1175,19 @@ function transformClassMethod(cm: ClassMethod, ctx: TransformContext): void {
  * 3. Insert step calls before each executable statement
  * 4. Append implicit __ct.ret(fnId) if no explicit return
  */
+/**
+ * Helper to add a step site for a statement, resolving through source maps.
+ */
+function addStepSiteForStmt(stmt: Statement, ctx: TransformContext): number {
+  const span = (stmt as unknown as { span: Span }).span;
+  const resolved = resolveSpan(span.start, ctx);
+  return ctx.manifest.addStepSite(
+    resolved.pathIndex,
+    resolved.line,
+    resolved.col,
+  );
+}
+
 function instrumentFunctionBody(
   body: BlockStatement,
   fnId: number,
@@ -1079,13 +1221,7 @@ function instrumentFunctionBody(
       // Add everything up to and including super(), with steps
       for (let i = dirCount; i <= superIdx; i++) {
         if (isExecutableStatement(stmts[i])) {
-          const span = (stmts[i] as unknown as { span: Span }).span;
-          const loc = ctx.mapper.resolve(span.start);
-          const siteId = ctx.manifest.addStepSite(
-            ctx.pathIndex,
-            loc.line,
-            loc.col,
-          );
+          const siteId = addStepSiteForStmt(stmts[i], ctx);
           withSteps.push(mkStepCall(siteId));
         }
         withSteps.push(stmts[i]);
@@ -1097,13 +1233,7 @@ function instrumentFunctionBody(
       // Add remaining statements with steps
       for (let i = superIdx + 1; i < stmts.length; i++) {
         if (isExecutableStatement(stmts[i])) {
-          const span = (stmts[i] as unknown as { span: Span }).span;
-          const loc = ctx.mapper.resolve(span.start);
-          const siteId = ctx.manifest.addStepSite(
-            ctx.pathIndex,
-            loc.line,
-            loc.col,
-          );
+          const siteId = addStepSiteForStmt(stmts[i], ctx);
           withSteps.push(mkStepCall(siteId));
         }
         withSteps.push(stmts[i]);
@@ -1113,13 +1243,7 @@ function instrumentFunctionBody(
       withSteps.push(mkEnterCall(fnId));
       for (let i = dirCount; i < stmts.length; i++) {
         if (isExecutableStatement(stmts[i])) {
-          const span = (stmts[i] as unknown as { span: Span }).span;
-          const loc = ctx.mapper.resolve(span.start);
-          const siteId = ctx.manifest.addStepSite(
-            ctx.pathIndex,
-            loc.line,
-            loc.col,
-          );
+          const siteId = addStepSiteForStmt(stmts[i], ctx);
           withSteps.push(mkStepCall(siteId));
         }
         withSteps.push(stmts[i]);
@@ -1131,13 +1255,7 @@ function instrumentFunctionBody(
 
     for (let i = dirCount; i < stmts.length; i++) {
       if (isExecutableStatement(stmts[i])) {
-        const span = (stmts[i] as unknown as { span: Span }).span;
-        const loc = ctx.mapper.resolve(span.start);
-        const siteId = ctx.manifest.addStepSite(
-          ctx.pathIndex,
-          loc.line,
-          loc.col,
-        );
+        const siteId = addStepSiteForStmt(stmts[i], ctx);
         withSteps.push(mkStepCall(siteId));
       }
       withSteps.push(stmts[i]);
@@ -1147,8 +1265,13 @@ function instrumentFunctionBody(
   // Append implicit __ct.ret if no explicit return found
   if (!hasExplicitReturn(stmts)) {
     const bodySpan = body.span;
-    const loc = ctx.mapper.resolve(bodySpan.end);
-    ctx.manifest.addReturnSite(fnId, ctx.pathIndex, loc.line, loc.col);
+    const resolved = resolveSpan(bodySpan.end, ctx);
+    ctx.manifest.addReturnSite(
+      fnId,
+      resolved.pathIndex,
+      resolved.line,
+      resolved.col,
+    );
     withSteps.push(mkExprStmt(mkRetExpr(fnId)));
   }
 
@@ -1168,8 +1291,13 @@ function rewriteReturns(
     const stmt = stmts[i];
     if (stmt.type === "ReturnStatement") {
       const ret = stmt as unknown as ReturnStatement & { span: Span };
-      const loc = ctx.mapper.resolve(ret.span.start);
-      ctx.manifest.addReturnSite(fnId, ctx.pathIndex, loc.line, loc.col);
+      const resolved = resolveSpan(ret.span.start, ctx);
+      ctx.manifest.addReturnSite(
+        fnId,
+        resolved.pathIndex,
+        resolved.line,
+        resolved.col,
+      );
 
       if (ret.argument) {
         ret.argument = mkRetExpr(fnId, ret.argument);

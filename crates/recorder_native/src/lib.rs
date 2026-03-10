@@ -42,6 +42,8 @@ struct Manifest {
     paths: Vec<String>,
     functions: Vec<ManifestFunction>,
     sites: Vec<ManifestSite>,
+    #[serde(default)]
+    sources_content: HashMap<String, String>,
 }
 
 // ── Trace event types (serialized to JSON) ──────────────────────────
@@ -327,16 +329,23 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
     })?;
 
     for source_path in &state.manifest.paths {
-        let src = Path::new(source_path);
-        if src.exists() {
-            // Preserve directory structure inside files/.
-            // Strip leading '/' from absolute paths so join() doesn't replace the base.
-            let relative = source_path.strip_prefix('/').unwrap_or(source_path);
-            let dest = files_dir.join(relative);
-            if let Some(parent) = dest.parent() {
-                let _ = fs::create_dir_all(parent);
+        // Preserve directory structure inside files/.
+        // Strip leading '/' from absolute paths so join() doesn't replace the base.
+        let relative = source_path.strip_prefix('/').unwrap_or(source_path);
+        let dest = files_dir.join(relative);
+        if let Some(parent) = dest.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        // First check sourcesContent from the manifest (from source maps),
+        // then fall back to reading from the filesystem.
+        if let Some(content) = state.manifest.sources_content.get(source_path) {
+            let _ = fs::write(&dest, content);
+        } else {
+            let src = Path::new(source_path);
+            if src.exists() {
+                let _ = fs::copy(src, &dest);
             }
-            let _ = fs::copy(src, &dest);
         }
     }
 

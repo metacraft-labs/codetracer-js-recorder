@@ -9,6 +9,7 @@ export class ManifestBuilder {
   private functions: FunctionEntry[] = [];
   private sites: SiteEntry[] = [];
   private pathIndexMap = new Map<string, number>();
+  private _sourcesContent = new Map<string, string>();
 
   /**
    * Register a file path and return its index.
@@ -20,6 +21,13 @@ export class ManifestBuilder {
     this.paths.push(filePath);
     this.pathIndexMap.set(filePath, idx);
     return idx;
+  }
+
+  /**
+   * Store original source content for a path (from source map sourcesContent).
+   */
+  setSourceContent(filePath: string, content: string): void {
+    this._sourcesContent.set(filePath, content);
   }
 
   /**
@@ -77,10 +85,20 @@ export class ManifestBuilder {
    * Build the final manifest slice.
    */
   build(): ManifestSlice {
-    return {
+    const result: ManifestSlice = {
       paths: [...this.paths],
       functions: [...this.functions],
       sites: [...this.sites],
     };
+
+    if (this._sourcesContent.size > 0) {
+      const sourcesContent: Record<string, string> = {};
+      for (const [k, v] of this._sourcesContent) {
+        sourcesContent[k] = v;
+      }
+      result.sourcesContent = sourcesContent;
+    }
+
+    return result;
   }
 }
