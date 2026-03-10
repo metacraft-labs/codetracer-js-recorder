@@ -15,11 +15,13 @@
 export const EVENT_STEP = 0 as const;
 export const EVENT_ENTER = 1 as const;
 export const EVENT_RET = 2 as const;
+export const EVENT_WRITE = 3 as const;
 
 export type EventKind =
   | typeof EVENT_STEP
   | typeof EVENT_ENTER
-  | typeof EVENT_RET;
+  | typeof EVENT_RET
+  | typeof EVENT_WRITE;
 
 /** Encoded representation of a JS value for tracing. */
 export interface EncodedValue {
@@ -37,16 +39,28 @@ export interface ValueEntry {
   returnValue?: EncodedValue;
 }
 
+/** A write entry associated with a Write event (console output). */
+export interface WriteEntry {
+  /** Index of the event in the batch this write belongs to. */
+  eventIndex: number;
+  /** Write kind: "stdout" or "stderr". */
+  kind: string;
+  /** The written content. */
+  content: string;
+}
+
 /** A flushed batch — a snapshot of the typed arrays at flush time. */
 export interface EventBatch {
-  /** Event kind per slot (0=step, 1=enter, 2=ret). */
+  /** Event kind per slot (0=step, 1=enter, 2=ret, 3=write). */
   eventKinds: Uint8Array;
-  /** siteId (for step) or fnId (for enter/ret) per slot. */
+  /** siteId (for step) or fnId (for enter/ret) per slot. Id is unused for write events (set to 0). */
   ids: Uint32Array;
   /** Number of valid events in this batch. */
   length: number;
   /** Captured values for enter/ret events. */
   values: ValueEntry[];
+  /** Captured writes for write events (console output). */
+  writes: WriteEntry[];
 }
 
 /** Callback invoked when the buffer is flushed. */
@@ -74,6 +88,9 @@ export class EventBuffer {
 
   /** Pending value entries for the current buffer window. */
   private _values: ValueEntry[] = [];
+
+  /** Pending write entries for the current buffer window. */
+  private _writes: WriteEntry[] = [];
 
   /** User-provided flush callback. */
   private _onFlush: FlushCallback | null = null;
@@ -125,6 +142,13 @@ export class EventBuffer {
   }
 
   /**
+   * Attach a write entry to the most recently pushed event.
+   */
+  pushWrite(entry: WriteEntry): void {
+    this._writes.push(entry);
+  }
+
+  /**
    * Flush all buffered events.
    *
    * Creates a snapshot batch (copies of the typed arrays up to _length),
@@ -141,6 +165,7 @@ export class EventBuffer {
       ids: this.ids.slice(0, this._length),
       length: this._length,
       values: this._values,
+      writes: this._writes,
     };
 
     this.flushedBatches.push(batch);
@@ -149,8 +174,9 @@ export class EventBuffer {
       this._onFlush(batch);
     }
 
-    // Reset write cursor and values — we reuse the same backing arrays.
+    // Reset write cursor, values, and writes — we reuse the same backing arrays.
     this._length = 0;
     this._values = [];
+    this._writes = [];
   }
 }

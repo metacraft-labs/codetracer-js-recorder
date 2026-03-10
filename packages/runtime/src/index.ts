@@ -17,16 +17,25 @@
 export { readConfig } from "./config.js";
 export type { RuntimeConfig } from "./config.js";
 
-export { EventBuffer, EVENT_STEP, EVENT_ENTER, EVENT_RET } from "./buffer.js";
+export {
+  EventBuffer,
+  EVENT_STEP,
+  EVENT_ENTER,
+  EVENT_RET,
+  EVENT_WRITE,
+} from "./buffer.js";
 export type {
   EventBatch,
   EventKind,
   FlushCallback,
   EncodedValue,
   ValueEntry,
+  WriteEntry,
 } from "./buffer.js";
 
 export { encodeValue } from "./runtime.js";
+
+export { installConsoleCapture, removeConsoleCapture } from "./io-capture.js";
 
 export { createRuntime, loadNativeAddon, startRecording } from "./runtime.js";
 export type {

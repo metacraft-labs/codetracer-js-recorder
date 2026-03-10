@@ -13,10 +13,22 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
-import { EventBuffer, EVENT_STEP, EVENT_ENTER, EVENT_RET } from "./buffer.js";
-import type { FlushCallback, EventBatch, EncodedValue } from "./buffer.js";
+import {
+  EventBuffer,
+  EVENT_STEP,
+  EVENT_ENTER,
+  EVENT_RET,
+  EVENT_WRITE,
+} from "./buffer.js";
+import type {
+  FlushCallback,
+  EventBatch,
+  EncodedValue,
+  WriteEntry,
+} from "./buffer.js";
 import { readConfig } from "./config.js";
 import type { RuntimeConfig } from "./config.js";
+import { installConsoleCapture, removeConsoleCapture } from "./io-capture.js";
 
 // ── Value encoding ──────────────────────────────────────────────────
 
@@ -102,6 +114,7 @@ export interface NativeAddon {
     eventKinds: Uint8Array,
     ids: Uint32Array,
     valuesJson: string,
+    writesJson?: string,
   ): void;
   flushAndStop(handle: number): string;
 }
@@ -254,29 +267,41 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
     },
 
     step(siteId: number): void {
-      buffer.push(EVENT_STEP, siteId);
+      try {
+        buffer.push(EVENT_STEP, siteId);
+      } catch {
+        // Never crash the user's program
+      }
     },
 
     enter(fnId: number, argsLike: IArguments): void {
-      buffer.push(EVENT_ENTER, fnId);
-      // Capture argument values in the side channel
-      const encodedArgs: EncodedValue[] = [];
-      for (let i = 0; i < argsLike.length; i++) {
-        encodedArgs.push(encodeValue(argsLike[i]));
+      try {
+        buffer.push(EVENT_ENTER, fnId);
+        // Capture argument values in the side channel
+        const encodedArgs: EncodedValue[] = [];
+        for (let i = 0; i < argsLike.length; i++) {
+          encodedArgs.push(encodeValue(argsLike[i]));
+        }
+        buffer.pushValue({
+          eventIndex: buffer.length - 1,
+          args: encodedArgs,
+        });
+      } catch {
+        // Never crash the user's program
       }
-      buffer.pushValue({
-        eventIndex: buffer.length - 1,
-        args: encodedArgs,
-      });
     },
 
     ret(fnId: number, value?: unknown): unknown {
-      buffer.push(EVENT_RET, fnId);
-      // Capture return value in the side channel
-      buffer.pushValue({
-        eventIndex: buffer.length - 1,
-        returnValue: encodeValue(value),
-      });
+      try {
+        buffer.push(EVENT_RET, fnId);
+        // Capture return value in the side channel
+        buffer.pushValue({
+          eventIndex: buffer.length - 1,
+          returnValue: encodeValue(value),
+        });
+      } catch {
+        // Never crash the user's program
+      }
       return value;
     },
 
@@ -323,10 +348,19 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
  *
  * Uses createRequire to load the .node file as a CommonJS module,
  * which is how napi-rs addons are loaded.
+ *
+ * Returns null if the addon fails to load (graceful degradation).
  */
-export function loadNativeAddon(addonPath: string): NativeAddon {
-  const resolved = path.resolve(addonPath);
-  return _require(resolved) as NativeAddon;
+export function loadNativeAddon(addonPath: string): NativeAddon | null {
+  try {
+    const resolved = path.resolve(addonPath);
+    return _require(resolved) as NativeAddon;
+  } catch (err) {
+    process.stderr.write(
+      `[codetracer] Warning: failed to load native addon from '${addonPath}': ${err}\n`,
+    );
+    return null;
+  }
 }
 
 /**
@@ -341,7 +375,9 @@ export function loadNativeAddon(addonPath: string): NativeAddon {
  * The runtime must already be initialized (init() called) so the manifest
  * is available.
  */
-export function startRecording(opts: StartRecordingOptions): RecordingSession {
+export function startRecording(
+  opts: StartRecordingOptions,
+): RecordingSession | null {
   const {
     runtime,
     addonPath,
@@ -358,36 +394,82 @@ export function startRecording(opts: StartRecordingOptions): RecordingSession {
     );
   }
 
-  // Load the native addon
-  const addon = loadNativeAddon(addonPath);
+  // Load the native addon — returns null on failure (graceful degradation)
+  const addonOrNull = loadNativeAddon(addonPath);
+  if (!addonOrNull) {
+    process.stderr.write(
+      "[codetracer] Warning: recording disabled — native addon failed to load. Program will run normally.\n",
+    );
+    return null;
+  }
+  const addon: NativeAddon = addonOrNull;
 
   // Serialize the manifest to JSON for the Rust side
   const manifestJson = JSON.stringify(runtime.manifest);
 
-  // Start recording on the Rust side
-  const handle = addon.startRecording({
-    outDir,
-    program,
-    args,
-    manifestJson,
-    format,
-  });
+  let handle: number;
+  try {
+    // Start recording on the Rust side
+    handle = addon.startRecording({
+      outDir,
+      program,
+      args,
+      manifestJson,
+      format,
+    });
+  } catch (err) {
+    process.stderr.write(
+      `[codetracer] Warning: failed to start recording: ${err}\n`,
+    );
+    return null;
+  }
 
   let stopped = false;
 
   // Wire the buffer's onFlush callback to forward batches to the addon
   runtime.buffer.onFlush = (batch: EventBatch) => {
     if (!stopped) {
-      const valuesJson =
-        batch.values.length > 0 ? JSON.stringify(batch.values) : "[]";
-      addon.appendEvents(handle, batch.eventKinds, batch.ids, valuesJson);
+      try {
+        const valuesJson =
+          batch.values.length > 0 ? JSON.stringify(batch.values) : "[]";
+        const writesJson =
+          batch.writes.length > 0 ? JSON.stringify(batch.writes) : "[]";
+        addon.appendEvents(
+          handle,
+          batch.eventKinds,
+          batch.ids,
+          valuesJson,
+          writesJson,
+        );
+      } catch (err) {
+        process.stderr.write(
+          `[codetracer] Warning: failed to append events: ${err}\n`,
+        );
+      }
     }
   };
+
+  // Install console capture to record Write events
+  installConsoleCapture((kind: string, content: string) => {
+    try {
+      runtime.buffer.push(EVENT_WRITE, 0);
+      runtime.buffer.pushWrite({
+        eventIndex: runtime.buffer.length - 1,
+        kind,
+        content,
+      });
+    } catch {
+      // Never let capture errors affect the program
+    }
+  });
 
   function stop(): string {
     if (stopped) {
       throw new Error("Recording session already stopped");
     }
+
+    // Remove console capture before flushing
+    removeConsoleCapture();
 
     // Flush any remaining buffered events first (while onFlush is still active)
     runtime.flush();
@@ -396,14 +478,25 @@ export function startRecording(opts: StartRecordingOptions): RecordingSession {
     stopped = true;
 
     // Finalize the trace on the Rust side
-    return addon.flushAndStop(handle);
+    try {
+      return addon.flushAndStop(handle);
+    } catch (err) {
+      process.stderr.write(
+        `[codetracer] Warning: failed to finalize trace: ${err}\n`,
+      );
+      return "";
+    }
   }
 
   // Register process exit hooks to auto-stop
   if (!skipProcessHooks) {
     process.on("exit", () => {
       if (!stopped) {
-        stop();
+        try {
+          stop();
+        } catch {
+          // Never crash on exit
+        }
       }
     });
   }

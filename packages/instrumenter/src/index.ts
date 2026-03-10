@@ -1,4 +1,10 @@
 export { instrument } from "./instrument.js";
+export {
+  shouldInstrument,
+  DEFAULT_INCLUDE,
+  DEFAULT_EXCLUDE,
+} from "./filter.js";
+export type { FilterOptions } from "./filter.js";
 
 export interface InstrumentOptions {
   /** Source file path (used for manifest and source map resolution) */

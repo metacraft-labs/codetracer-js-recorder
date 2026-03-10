@@ -67,6 +67,15 @@ struct ValueEntry {
     return_value: Option<EncodedValue>,
 }
 
+/// A write entry deserialized from the JS side (console output).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WriteEntryInput {
+    event_index: usize,
+    kind: String,
+    content: String,
+}
+
 // ── Trace event types (serialized to JSON) ──────────────────────────
 
 /// A named argument with value and type annotation.
@@ -112,6 +121,10 @@ enum TraceEvent {
     Return {
         #[serde(skip_serializing_if = "Option::is_none")]
         value: Option<TraceReturnValue>,
+    },
+    Write {
+        kind: String,
+        content: String,
     },
 }
 
@@ -250,6 +263,7 @@ pub fn append_events(
     event_kinds: napi::bindgen_prelude::Uint8Array,
     ids: napi::bindgen_prelude::Uint32Array,
     values_json: String,
+    writes_json: Option<String>,
 ) -> Result<()> {
     let mut map = recorder_map()
         .lock()
@@ -269,10 +283,24 @@ pub fn append_events(
         serde_json::from_str(&values_json).unwrap_or_default()
     };
 
+    // Parse writes JSON — an array of WriteEntryInput objects
+    let write_entries: Vec<WriteEntryInput> = match &writes_json {
+        Some(json) if !json.is_empty() && json != "[]" => {
+            serde_json::from_str(json).unwrap_or_default()
+        }
+        _ => vec![],
+    };
+
     // Build a lookup: event_index -> ValueEntry for quick access
     let mut value_map: HashMap<usize, &ValueEntry> = HashMap::new();
     for entry in &value_entries {
         value_map.insert(entry.event_index, entry);
+    }
+
+    // Build a lookup: event_index -> WriteEntryInput for quick access
+    let mut write_map: HashMap<usize, &WriteEntryInput> = HashMap::new();
+    for entry in &write_entries {
+        write_map.insert(entry.event_index, entry);
     }
 
     let kinds = event_kinds.as_ref();
@@ -342,6 +370,15 @@ pub fn append_events(
                 };
 
                 state.events.push(TraceEvent::Return { value });
+            }
+            // write (console output)
+            3 => {
+                if let Some(write_entry) = write_map.get(&i) {
+                    state.events.push(TraceEvent::Write {
+                        kind: write_entry.kind.clone(),
+                        content: write_entry.content.clone(),
+                    });
+                }
             }
             _ => {
                 // Unknown event kind — skip

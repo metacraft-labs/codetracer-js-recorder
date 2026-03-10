@@ -11,36 +11,34 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { instrument } from "@codetracer/instrumenter";
+import { instrument, shouldInstrument } from "@codetracer/instrumenter";
 import type {
   ManifestSlice,
   FunctionEntry,
   SiteEntry,
+  FilterOptions,
 } from "@codetracer/instrumenter";
-
-/** File extensions we instrument. */
-const INSTRUMENTABLE_EXTENSIONS = new Set([".js", ".ts", ".jsx", ".tsx"]);
-
-/** Directories we always skip. */
-const SKIP_DIRS = new Set(["node_modules", ".git", ".hg", ".svn"]);
 
 /**
  * Recursively collect all instrumentable files under a directory.
+ *
+ * Uses glob-based include/exclude filtering via picomatch.
+ * By default, includes all JS/TS files and excludes node_modules.
  */
-function collectFiles(dir: string): string[] {
+function collectFiles(dir: string, filterOpts?: FilterOptions): string[] {
   const results: string[] = [];
 
   function walk(current: string): void {
     const entries = fs.readdirSync(current, { withFileTypes: true });
     for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
-        if (!SKIP_DIRS.has(entry.name)) {
-          walk(path.join(current, entry.name));
-        }
+        walk(fullPath);
       } else if (entry.isFile()) {
-        const ext = path.extname(entry.name);
-        if (INSTRUMENTABLE_EXTENSIONS.has(ext)) {
-          results.push(path.join(current, entry.name));
+        // Use relative path for glob matching
+        const relPath = path.relative(dir, fullPath);
+        if (shouldInstrument(relPath, filterOpts)) {
+          results.push(fullPath);
         }
       }
     }
@@ -132,10 +130,14 @@ function parseArgs(args: string[]): {
   src: string;
   outDir: string;
   sourceMaps: boolean;
+  include: string[];
+  exclude: string[];
 } {
   let src: string | undefined;
   let outDir: string | undefined;
   let sourceMaps = false;
+  const include: string[] = [];
+  const exclude: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -143,9 +145,13 @@ function parseArgs(args: string[]): {
       outDir = args[++i];
     } else if (arg === "--source-maps") {
       sourceMaps = true;
+    } else if (arg === "--include" && i + 1 < args.length) {
+      include.push(args[++i]);
+    } else if (arg === "--exclude" && i + 1 < args.length) {
+      exclude.push(args[++i]);
     } else if (arg === "--help" || arg === "-h") {
       console.log(
-        `Usage: codetracer-js-recorder instrument <src> --out <dir> [--source-maps]`,
+        `Usage: codetracer-js-recorder instrument <src> --out <dir> [--source-maps] [--include <glob>] [--exclude <glob>]`,
       );
       process.exit(0);
     } else if (!src && !arg.startsWith("-")) {
@@ -162,14 +168,14 @@ function parseArgs(args: string[]): {
     process.exit(1);
   }
 
-  return { src: src!, outDir: outDir!, sourceMaps };
+  return { src: src!, outDir: outDir!, sourceMaps, include, exclude };
 }
 
 /**
  * Entry point for the `instrument` command.
  */
 export function instrumentCommand(args: string[]): void {
-  const { src, outDir, sourceMaps } = parseArgs(args);
+  const { src, outDir, sourceMaps, include, exclude } = parseArgs(args);
 
   const srcPath = path.resolve(src);
   if (!fs.existsSync(srcPath)) {
@@ -180,13 +186,22 @@ export function instrumentCommand(args: string[]): void {
   const stat = fs.statSync(srcPath);
   const isDir = stat.isDirectory();
 
+  // Build filter options from CLI flags
+  const filterOpts: FilterOptions | undefined =
+    include.length > 0 || exclude.length > 0
+      ? {
+          ...(include.length > 0 ? { include } : {}),
+          ...(exclude.length > 0 ? { exclude } : {}),
+        }
+      : undefined;
+
   // Collect files to instrument
   let files: string[];
   let baseDir: string;
 
   if (isDir) {
     baseDir = srcPath;
-    files = collectFiles(srcPath);
+    files = collectFiles(srcPath, filterOpts);
   } else {
     baseDir = path.dirname(srcPath);
     files = [srcPath];

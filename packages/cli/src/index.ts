@@ -26,10 +26,14 @@ Commands:
 Instrument options:
   --out <dir>             Output directory for instrumented files (required)
   --source-maps           Emit source maps
+  --include <glob>        Include glob pattern (repeatable)
+  --exclude <glob>        Exclude glob pattern (repeatable)
 
 Record options:
   --out-dir <dir>         Trace output directory (default: ./ct-traces/)
   --format json|binary    Trace format (default: json)
+  --include <glob>        Include glob pattern (repeatable)
+  --exclude <glob>        Exclude glob pattern (repeatable)
   --help                  Show this help message`);
   process.exit(0);
 }

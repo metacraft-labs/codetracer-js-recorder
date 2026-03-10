@@ -16,36 +16,34 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
-import { instrument } from "@codetracer/instrumenter";
+import { instrument, shouldInstrument } from "@codetracer/instrumenter";
 import type {
   ManifestSlice,
   FunctionEntry,
   SiteEntry,
+  FilterOptions,
 } from "@codetracer/instrumenter";
-
-/** File extensions we instrument. */
-const INSTRUMENTABLE_EXTENSIONS = new Set([".js", ".ts", ".jsx", ".tsx"]);
-
-/** Directories we always skip. */
-const SKIP_DIRS = new Set(["node_modules", ".git", ".hg", ".svn"]);
 
 /**
  * Recursively collect all instrumentable files under a directory.
+ *
+ * Uses glob-based include/exclude filtering via picomatch.
+ * By default, includes all JS/TS files and excludes node_modules.
  */
-function collectFiles(dir: string): string[] {
+function collectFiles(dir: string, filterOpts?: FilterOptions): string[] {
   const results: string[] = [];
 
   function walk(current: string): void {
     const entries = fs.readdirSync(current, { withFileTypes: true });
     for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
-        if (!SKIP_DIRS.has(entry.name)) {
-          walk(path.join(current, entry.name));
-        }
+        walk(fullPath);
       } else if (entry.isFile()) {
-        const ext = path.extname(entry.name);
-        if (INSTRUMENTABLE_EXTENSIONS.has(ext)) {
-          results.push(path.join(current, entry.name));
+        // Use relative path for glob matching
+        const relPath = path.relative(dir, fullPath);
+        if (shouldInstrument(relPath, filterOpts)) {
+          results.push(fullPath);
         }
       }
     }
@@ -135,11 +133,15 @@ function parseArgs(args: string[]): {
   outDir: string;
   format: string;
   appArgs: string[];
+  include: string[];
+  exclude: string[];
 } {
   let entryFile: string | undefined;
   let outDir = "./ct-traces/";
   let format = "json";
   const appArgs: string[] = [];
+  const include: string[] = [];
+  const exclude: string[] = [];
   let seenDashDash = false;
 
   for (let i = 0; i < args.length; i++) {
@@ -159,9 +161,13 @@ function parseArgs(args: string[]): {
       outDir = args[++i];
     } else if (arg === "--format" && i + 1 < args.length) {
       format = args[++i];
+    } else if (arg === "--include" && i + 1 < args.length) {
+      include.push(args[++i]);
+    } else if (arg === "--exclude" && i + 1 < args.length) {
+      exclude.push(args[++i]);
     } else if (arg === "--help" || arg === "-h") {
       console.log(
-        `Usage: codetracer-js-recorder record <file> [--out-dir <dir>] [--format json|binary] [-- app-args...]`,
+        `Usage: codetracer-js-recorder record <file> [--out-dir <dir>] [--format json|binary] [--include <glob>] [--exclude <glob>] [-- app-args...]`,
       );
       process.exit(0);
     } else if (!entryFile && !arg.startsWith("-")) {
@@ -174,7 +180,7 @@ function parseArgs(args: string[]): {
     process.exit(1);
   }
 
-  return { entryFile: entryFile!, outDir, format, appArgs };
+  return { entryFile: entryFile!, outDir, format, appArgs, include, exclude };
 }
 
 /**
@@ -251,12 +257,20 @@ var ids = new Uint32Array(BUFFER_CAPACITY);
 var bufLen = 0;
 var valueEntries = [];
 
+var writeEntries = [];
+
 function flushBuffer() {
   if (bufLen === 0) return;
-  var valuesJson = valueEntries.length > 0 ? JSON.stringify(valueEntries) : "[]";
-  addon.appendEvents(handle, eventKinds.slice(0, bufLen), ids.slice(0, bufLen), valuesJson);
+  try {
+    var valuesJson = valueEntries.length > 0 ? JSON.stringify(valueEntries) : "[]";
+    var writesJson = writeEntries.length > 0 ? JSON.stringify(writeEntries) : "[]";
+    addon.appendEvents(handle, eventKinds.slice(0, bufLen), ids.slice(0, bufLen), valuesJson, writesJson);
+  } catch(e) {
+    process.stderr.write("[codetracer] Warning: failed to append events: " + e + "\\n");
+  }
   bufLen = 0;
   valueEntries = [];
+  writeEntries = [];
 }
 
 function pushEvent(kind, id) {
@@ -271,21 +285,66 @@ function pushEvent(kind, id) {
 // Set up globalThis.__ct
 globalThis.__ct = {
   step: function(siteId) {
-    pushEvent(0, siteId);
+    try { pushEvent(0, siteId); } catch(e) {}
   },
   enter: function(fnId, argsLike) {
-    pushEvent(1, fnId);
-    var encodedArgs = [];
-    for (var i = 0; i < argsLike.length; i++) {
-      encodedArgs.push(encodeValue(argsLike[i]));
-    }
-    valueEntries.push({ eventIndex: bufLen - 1, args: encodedArgs });
+    try {
+      pushEvent(1, fnId);
+      var encodedArgs = [];
+      for (var i = 0; i < argsLike.length; i++) {
+        encodedArgs.push(encodeValue(argsLike[i]));
+      }
+      valueEntries.push({ eventIndex: bufLen - 1, args: encodedArgs });
+    } catch(e) {}
   },
   ret: function(fnId, value) {
-    pushEvent(2, fnId);
-    valueEntries.push({ eventIndex: bufLen - 1, returnValue: encodeValue(value) });
+    try {
+      pushEvent(2, fnId);
+      valueEntries.push({ eventIndex: bufLen - 1, returnValue: encodeValue(value) });
+    } catch(e) {}
     return value;
   },
+};
+
+// Install console capture for IO recording
+var _origLog = console.log;
+var _origInfo = console.info;
+var _origWarn = console.warn;
+var _origError = console.error;
+
+function _formatArgs(args) {
+  return Array.prototype.map.call(args, function(a) {
+    return typeof a === "string" ? a : String(a);
+  }).join(" ");
+}
+
+console.log = function() {
+  _origLog.apply(console, arguments);
+  try {
+    pushEvent(3, 0);
+    writeEntries.push({ eventIndex: bufLen - 1, kind: "stdout", content: _formatArgs(arguments) });
+  } catch(e) {}
+};
+console.info = function() {
+  _origInfo.apply(console, arguments);
+  try {
+    pushEvent(3, 0);
+    writeEntries.push({ eventIndex: bufLen - 1, kind: "stdout", content: _formatArgs(arguments) });
+  } catch(e) {}
+};
+console.warn = function() {
+  _origWarn.apply(console, arguments);
+  try {
+    pushEvent(3, 0);
+    writeEntries.push({ eventIndex: bufLen - 1, kind: "stderr", content: _formatArgs(arguments) });
+  } catch(e) {}
+};
+console.error = function() {
+  _origError.apply(console, arguments);
+  try {
+    pushEvent(3, 0);
+    writeEntries.push({ eventIndex: bufLen - 1, kind: "stderr", content: _formatArgs(arguments) });
+  } catch(e) {}
 };
 
 // Register exit handler to flush and stop
@@ -293,11 +352,20 @@ var stopped = false;
 process.on("exit", function() {
   if (!stopped) {
     stopped = true;
-    flushBuffer();
-    var traceDir = addon.flushAndStop(handle);
-    // Write trace dir path to a marker file so the parent process can read it
-    var markerPath = ${esc(opts.manifestPath)}.replace("codetracer.manifest.json", "__ct_trace_dir.txt");
-    fs.writeFileSync(markerPath, traceDir);
+    // Restore original console methods
+    console.log = _origLog;
+    console.info = _origInfo;
+    console.warn = _origWarn;
+    console.error = _origError;
+    try {
+      flushBuffer();
+      var traceDir = addon.flushAndStop(handle);
+      // Write trace dir path to a marker file so the parent process can read it
+      var markerPath = ${esc(opts.manifestPath)}.replace("codetracer.manifest.json", "__ct_trace_dir.txt");
+      fs.writeFileSync(markerPath, traceDir);
+    } catch(e) {
+      process.stderr.write("[codetracer] Warning: failed to finalize trace: " + e + "\\n");
+    }
   }
 });
 
@@ -310,7 +378,8 @@ require(${esc(opts.instrumentedEntry)});
  * Entry point for the `record` command.
  */
 export function recordCommand(args: string[]): void {
-  const { entryFile, outDir, format, appArgs } = parseArgs(args);
+  const { entryFile, outDir, format, appArgs, include, exclude } =
+    parseArgs(args);
 
   const entryPath = path.resolve(entryFile);
   if (!fs.existsSync(entryPath)) {
@@ -321,6 +390,15 @@ export function recordCommand(args: string[]): void {
   const stat = fs.statSync(entryPath);
   const isDir = stat.isDirectory();
 
+  // Build filter options from CLI flags
+  const filterOpts: FilterOptions | undefined =
+    include.length > 0 || exclude.length > 0
+      ? {
+          ...(include.length > 0 ? { include } : {}),
+          ...(exclude.length > 0 ? { exclude } : {}),
+        }
+      : undefined;
+
   // Collect files to instrument
   let files: string[];
   let baseDir: string;
@@ -328,7 +406,7 @@ export function recordCommand(args: string[]): void {
 
   if (isDir) {
     baseDir = entryPath;
-    files = collectFiles(entryPath);
+    files = collectFiles(entryPath, filterOpts);
     // Look for index.js or index.ts as entry point
     const indexFile = files.find(
       (f) => path.basename(f) === "index.js" || path.basename(f) === "index.ts",
