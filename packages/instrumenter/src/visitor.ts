@@ -98,6 +98,68 @@ function mkBlock(stmts: Statement[]): BlockStatement {
   } as unknown as BlockStatement;
 }
 
+// ---------- parameter name extraction ----------
+
+/**
+ * Extract a readable name from a pattern (parameter binding).
+ *
+ * Handles simple identifiers and provides placeholder names
+ * for destructuring and other complex patterns.
+ */
+function extractPatternName(pat: unknown, index: number): string {
+  if (!pat || typeof pat !== "object") return `_param${index}`;
+  const p = pat as { type: string; value?: string; left?: unknown };
+
+  switch (p.type) {
+    case "Identifier":
+      return p.value ?? `_param${index}`;
+    case "AssignmentPattern":
+      // e.g., function foo(x = 10) — the left side is the name
+      return extractPatternName(p.left, index);
+    case "RestElement": {
+      // e.g., function foo(...args) — the argument is the name
+      const rest = p as { argument?: unknown };
+      return "..." + extractPatternName(rest.argument, index);
+    }
+    case "ObjectPattern":
+      return `_param${index}`;
+    case "ArrayPattern":
+      return `_param${index}`;
+    default:
+      return `_param${index}`;
+  }
+}
+
+/**
+ * Extract parameter names from a function's params array.
+ *
+ * SWC wraps each parameter in a `Param { pat: Pattern }` node
+ * (for function declarations, function expressions, class methods,
+ * constructors). Arrow functions use params directly as Patterns.
+ * Constructor params may also be `TsParameterProperty { param }`.
+ */
+function extractParamNames(params: unknown[]): string[] {
+  const names: string[] = [];
+  for (let i = 0; i < params.length; i++) {
+    const param = params[i] as {
+      type?: string;
+      pat?: unknown;
+      param?: unknown;
+    };
+    if (param && param.type === "Parameter" && param.pat) {
+      // Standard Param node (type is "Parameter" in SWC JSON AST)
+      names.push(extractPatternName(param.pat, i));
+    } else if (param && param.type === "TsParameterProperty" && param.param) {
+      // TypeScript parameter property: constructor(public x: number)
+      names.push(extractPatternName(param.param, i));
+    } else {
+      // Arrow function params are direct patterns (no Param wrapper)
+      names.push(extractPatternName(param, i));
+    }
+  }
+  return names;
+}
+
 // ---------- __ct call builders ----------
 
 function mkStepCall(siteId: number): Statement {
@@ -892,11 +954,13 @@ function transformFunctionDecl(
 
   const resolved = resolveSpan(decl.span.start, ctx);
   const name = decl.identifier?.value ?? "<anonymous>";
+  const params = extractParamNames(decl.params as unknown[]);
   const fnId = ctx.manifest.addFunction(
     name,
     resolved.pathIndex,
     resolved.line,
     resolved.col,
+    params,
   );
 
   ctx.manifest.addCallSite(
@@ -919,11 +983,13 @@ function transformFunctionExpression(
   const name = getFunctionName(
     expr as unknown as { type: string; identifier?: { value: string } },
   );
+  const params = extractParamNames(expr.params as unknown[]);
   const fnId = ctx.manifest.addFunction(
     name,
     resolved.pathIndex,
     resolved.line,
     resolved.col,
+    params,
   );
 
   ctx.manifest.addCallSite(
@@ -941,11 +1007,13 @@ function transformArrowFunction(
   ctx: TransformContext,
 ): void {
   const resolved = resolveSpan(expr.span.start, ctx);
+  const params = extractParamNames(expr.params as unknown[]);
   const fnId = ctx.manifest.addFunction(
     "<arrow>",
     resolved.pathIndex,
     resolved.line,
     resolved.col,
+    params,
   );
 
   ctx.manifest.addCallSite(
@@ -999,6 +1067,7 @@ function transformMethodProperty(
     body?: BlockStatement;
     span: Span;
     key?: { type: string; value?: string };
+    params?: unknown[];
   };
   if (!fn.body) return;
 
@@ -1006,11 +1075,13 @@ function transformMethodProperty(
   const name = getFunctionName(
     fn as unknown as { type: string; key?: { type: string; value?: string } },
   );
+  const params = fn.params ? extractParamNames(fn.params) : [];
   const fnId = ctx.manifest.addFunction(
     name,
     resolved.pathIndex,
     resolved.line,
     resolved.col,
+    params,
   );
   ctx.manifest.addCallSite(
     fnId,
@@ -1030,6 +1101,7 @@ function transformGetterProperty(
   const keyName = getFunctionName(
     prop as unknown as { type: string; key?: { type: string; value?: string } },
   );
+  // Getters have no parameters
   const fnId = ctx.manifest.addFunction(
     `get ${keyName}`,
     resolved.pathIndex,
@@ -1054,11 +1126,15 @@ function transformSetterProperty(
   const keyName = getFunctionName(
     prop as unknown as { type: string; key?: { type: string; value?: string } },
   );
+  // Setters have one parameter from prop.param
+  const setterParam = (prop as unknown as { param?: unknown }).param;
+  const params = setterParam ? extractParamNames([setterParam]) : [];
   const fnId = ctx.manifest.addFunction(
     `set ${keyName}`,
     resolved.pathIndex,
     resolved.line,
     resolved.col,
+    params,
   );
   ctx.manifest.addCallSite(
     fnId,
@@ -1121,11 +1197,13 @@ function transformConstructor(
   if (!ctor.body) return;
 
   const resolved = resolveSpan(ctor.span.start, ctx);
+  const params = extractParamNames(ctor.params as unknown[]);
   const fnId = ctx.manifest.addFunction(
     "constructor",
     resolved.pathIndex,
     resolved.line,
     resolved.col,
+    params,
   );
   ctx.manifest.addCallSite(
     fnId,
@@ -1149,11 +1227,13 @@ function transformClassMethod(cm: ClassMethod, ctx: TransformContext): void {
   const name = getFunctionName(
     cm as unknown as { type: string; key?: { type: string; value?: string } },
   );
+  const params = extractParamNames(fn.params as unknown[]);
   const fnId = ctx.manifest.addFunction(
     name,
     resolved.pathIndex,
     resolved.line,
     resolved.col,
+    params,
   );
   ctx.manifest.addCallSite(
     fnId,

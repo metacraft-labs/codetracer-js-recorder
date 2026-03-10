@@ -38,9 +38,14 @@ export class ManifestBuilder {
     pathIndex: number,
     line: number,
     col: number,
+    params?: string[],
   ): number {
     const fnId = this.functions.length;
-    this.functions.push({ name, pathIndex, line, col });
+    const entry: FunctionEntry = { name, pathIndex, line, col };
+    if (params && params.length > 0) {
+      entry.params = params;
+    }
+    this.functions.push(entry);
     return fnId;
   }
 

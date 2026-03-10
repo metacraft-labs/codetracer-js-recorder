@@ -21,6 +21,22 @@ export type EventKind =
   | typeof EVENT_ENTER
   | typeof EVENT_RET;
 
+/** Encoded representation of a JS value for tracing. */
+export interface EncodedValue {
+  value: unknown;
+  typeKind: string;
+}
+
+/** A value entry associated with a specific event in a batch. */
+export interface ValueEntry {
+  /** Index of the event in the batch this value belongs to. */
+  eventIndex: number;
+  /** Encoded argument values (for enter events). */
+  args?: EncodedValue[];
+  /** Encoded return value (for ret events). */
+  returnValue?: EncodedValue;
+}
+
 /** A flushed batch — a snapshot of the typed arrays at flush time. */
 export interface EventBatch {
   /** Event kind per slot (0=step, 1=enter, 2=ret). */
@@ -29,6 +45,8 @@ export interface EventBatch {
   ids: Uint32Array;
   /** Number of valid events in this batch. */
   length: number;
+  /** Captured values for enter/ret events. */
+  values: ValueEntry[];
 }
 
 /** Callback invoked when the buffer is flushed. */
@@ -53,6 +71,9 @@ export class EventBuffer {
 
   /** Current number of buffered events. */
   private _length: number = 0;
+
+  /** Pending value entries for the current buffer window. */
+  private _values: ValueEntry[] = [];
 
   /** User-provided flush callback. */
   private _onFlush: FlushCallback | null = null;
@@ -96,6 +117,14 @@ export class EventBuffer {
   }
 
   /**
+   * Attach a value entry to the most recently pushed event.
+   * The eventIndex is automatically set to the current buffer position - 1.
+   */
+  pushValue(entry: ValueEntry): void {
+    this._values.push(entry);
+  }
+
+  /**
    * Flush all buffered events.
    *
    * Creates a snapshot batch (copies of the typed arrays up to _length),
@@ -111,6 +140,7 @@ export class EventBuffer {
       eventKinds: this.eventKinds.slice(0, this._length),
       ids: this.ids.slice(0, this._length),
       length: this._length,
+      values: this._values,
     };
 
     this.flushedBatches.push(batch);
@@ -119,7 +149,8 @@ export class EventBuffer {
       this._onFlush(batch);
     }
 
-    // Reset write cursor — we reuse the same backing arrays.
+    // Reset write cursor and values — we reuse the same backing arrays.
     this._length = 0;
+    this._values = [];
   }
 }

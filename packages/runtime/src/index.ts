@@ -18,7 +18,15 @@ export { readConfig } from "./config.js";
 export type { RuntimeConfig } from "./config.js";
 
 export { EventBuffer, EVENT_STEP, EVENT_ENTER, EVENT_RET } from "./buffer.js";
-export type { EventBatch, EventKind, FlushCallback } from "./buffer.js";
+export type {
+  EventBatch,
+  EventKind,
+  FlushCallback,
+  EncodedValue,
+  ValueEntry,
+} from "./buffer.js";
+
+export { encodeValue } from "./runtime.js";
 
 export { createRuntime, loadNativeAddon, startRecording } from "./runtime.js";
 export type {

@@ -220,16 +220,43 @@ var handle = addon.startRecording({
   format: ${esc(opts.format)},
 });
 
+// Value encoding for primitives
+var MAX_STRING_LENGTH = 1000;
+function encodeValue(value) {
+  if (value === undefined) return { value: null, typeKind: "None" };
+  if (value === null) return { value: null, typeKind: "None" };
+  switch (typeof value) {
+    case "boolean": return { value: value, typeKind: "Bool" };
+    case "number":
+      if (value !== value) return { value: "NaN", typeKind: "Raw" };
+      if (!isFinite(value)) return { value: value > 0 ? "Infinity" : "-Infinity", typeKind: "Raw" };
+      if (Number.isInteger(value)) return { value: value, typeKind: "Int" };
+      return { value: value, typeKind: "Float" };
+    case "string":
+      return { value: value.length > MAX_STRING_LENGTH ? value.slice(0, MAX_STRING_LENGTH) : value, typeKind: "String" };
+    case "bigint": return { value: value.toString(), typeKind: "BigInt" };
+    case "symbol": return { value: value.toString(), typeKind: "Raw" };
+    case "function": return { value: "function", typeKind: "Raw" };
+    case "object":
+      if (Array.isArray(value)) return { value: "array", typeKind: "Raw" };
+      return { value: "object", typeKind: "Raw" };
+    default: return { value: typeof value, typeKind: "Raw" };
+  }
+}
+
 // Event buffer (typed arrays for performance)
 var BUFFER_CAPACITY = 4096;
 var eventKinds = new Uint8Array(BUFFER_CAPACITY);
 var ids = new Uint32Array(BUFFER_CAPACITY);
 var bufLen = 0;
+var valueEntries = [];
 
 function flushBuffer() {
   if (bufLen === 0) return;
-  addon.appendEvents(handle, eventKinds.slice(0, bufLen), ids.slice(0, bufLen));
+  var valuesJson = valueEntries.length > 0 ? JSON.stringify(valueEntries) : "[]";
+  addon.appendEvents(handle, eventKinds.slice(0, bufLen), ids.slice(0, bufLen), valuesJson);
   bufLen = 0;
+  valueEntries = [];
 }
 
 function pushEvent(kind, id) {
@@ -246,11 +273,17 @@ globalThis.__ct = {
   step: function(siteId) {
     pushEvent(0, siteId);
   },
-  enter: function(fnId, args) {
+  enter: function(fnId, argsLike) {
     pushEvent(1, fnId);
+    var encodedArgs = [];
+    for (var i = 0; i < argsLike.length; i++) {
+      encodedArgs.push(encodeValue(argsLike[i]));
+    }
+    valueEntries.push({ eventIndex: bufLen - 1, args: encodedArgs });
   },
   ret: function(fnId, value) {
     pushEvent(2, fnId);
+    valueEntries.push({ eventIndex: bufLen - 1, returnValue: encodeValue(value) });
     return value;
   },
 };

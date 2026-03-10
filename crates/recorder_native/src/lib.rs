@@ -19,6 +19,8 @@ struct ManifestFunction {
     line: u32,
     #[allow(dead_code)]
     col: u32,
+    #[serde(default)]
+    params: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,7 +48,43 @@ struct Manifest {
     sources_content: HashMap<String, String>,
 }
 
+// ── Value types (deserialized from JS) ───────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EncodedValue {
+    value: serde_json::Value,
+    type_kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ValueEntry {
+    event_index: usize,
+    #[serde(default)]
+    args: Option<Vec<EncodedValue>>,
+    #[serde(default)]
+    return_value: Option<EncodedValue>,
+}
+
 // ── Trace event types (serialized to JSON) ──────────────────────────
+
+/// A named argument with value and type annotation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TraceArg {
+    name: String,
+    value: serde_json::Value,
+    type_kind: String,
+}
+
+/// A return value with type annotation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TraceReturnValue {
+    value: serde_json::Value,
+    type_kind: String,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
@@ -68,9 +106,13 @@ enum TraceEvent {
     Call {
         #[serde(rename = "fnId")]
         fn_id: usize,
-        args: Vec<serde_json::Value>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        args: Vec<TraceArg>,
     },
-    Return {},
+    Return {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        value: Option<TraceReturnValue>,
+    },
 }
 
 // ── Trace metadata ──────────────────────────────────────────────────
@@ -207,6 +249,7 @@ pub fn append_events(
     handle: u32,
     event_kinds: napi::bindgen_prelude::Uint8Array,
     ids: napi::bindgen_prelude::Uint32Array,
+    values_json: String,
 ) -> Result<()> {
     let mut map = recorder_map()
         .lock()
@@ -218,6 +261,19 @@ pub fn append_events(
             format!("Invalid recorder handle: {}", handle),
         )
     })?;
+
+    // Parse values JSON — an array of ValueEntry objects
+    let value_entries: Vec<ValueEntry> = if values_json.is_empty() || values_json == "[]" {
+        vec![]
+    } else {
+        serde_json::from_str(&values_json).unwrap_or_default()
+    };
+
+    // Build a lookup: event_index -> ValueEntry for quick access
+    let mut value_map: HashMap<usize, &ValueEntry> = HashMap::new();
+    for entry in &value_entries {
+        value_map.insert(entry.event_index, entry);
+    }
 
     let kinds = event_kinds.as_ref();
     let id_vals = ids.as_ref();
@@ -239,14 +295,53 @@ pub fn append_events(
             }
             // enter
             1 => {
-                state.events.push(TraceEvent::Call {
-                    fn_id: id,
-                    args: vec![],
-                });
+                let args = if let Some(entry) = value_map.get(&i) {
+                    if let Some(ref encoded_args) = entry.args {
+                        // Get parameter names from manifest
+                        let param_names = state
+                            .manifest
+                            .functions
+                            .get(id)
+                            .map(|f| &f.params)
+                            .cloned()
+                            .unwrap_or_default();
+
+                        encoded_args
+                            .iter()
+                            .enumerate()
+                            .map(|(j, ev)| {
+                                let name = param_names
+                                    .get(j)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("_param{}", j));
+                                TraceArg {
+                                    name,
+                                    value: ev.value.clone(),
+                                    type_kind: ev.type_kind.clone(),
+                                }
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
+
+                state.events.push(TraceEvent::Call { fn_id: id, args });
             }
             // ret
             2 => {
-                state.events.push(TraceEvent::Return {});
+                let value = if let Some(entry) = value_map.get(&i) {
+                    entry.return_value.as_ref().map(|rv| TraceReturnValue {
+                        value: rv.value.clone(),
+                        type_kind: rv.type_kind.clone(),
+                    })
+                } else {
+                    None
+                };
+
+                state.events.push(TraceEvent::Return { value });
             }
             _ => {
                 // Unknown event kind — skip

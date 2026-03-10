@@ -40,6 +40,7 @@ export interface FunctionEntry {
   pathIndex: number;
   line: number;
   col: number;
+  params?: string[];
 }
 
 export interface SiteEntry {

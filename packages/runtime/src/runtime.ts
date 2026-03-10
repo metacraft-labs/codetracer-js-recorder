@@ -14,9 +14,73 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
 import { EventBuffer, EVENT_STEP, EVENT_ENTER, EVENT_RET } from "./buffer.js";
-import type { FlushCallback, EventBatch } from "./buffer.js";
+import type { FlushCallback, EventBatch, EncodedValue } from "./buffer.js";
 import { readConfig } from "./config.js";
 import type { RuntimeConfig } from "./config.js";
+
+// ── Value encoding ──────────────────────────────────────────────────
+
+/** Maximum string length before truncation. */
+const MAX_STRING_LENGTH = 1000;
+
+/**
+ * Encode a JavaScript value into a serializable format with type annotation.
+ *
+ * For MVP, only primitive values are fully captured. Objects, arrays,
+ * functions, and symbols get a brief type description.
+ */
+export function encodeValue(value: unknown): EncodedValue {
+  if (value === undefined) {
+    return { value: null, typeKind: "None" };
+  }
+  if (value === null) {
+    return { value: null, typeKind: "None" };
+  }
+
+  switch (typeof value) {
+    case "boolean":
+      return { value, typeKind: "Bool" };
+
+    case "number":
+      if (Number.isNaN(value)) {
+        return { value: "NaN", typeKind: "Raw" };
+      }
+      if (!Number.isFinite(value)) {
+        return { value: value > 0 ? "Infinity" : "-Infinity", typeKind: "Raw" };
+      }
+      if (Number.isInteger(value)) {
+        return { value, typeKind: "Int" };
+      }
+      return { value, typeKind: "Float" };
+
+    case "string": {
+      const truncated =
+        value.length > MAX_STRING_LENGTH
+          ? value.slice(0, MAX_STRING_LENGTH)
+          : value;
+      return { value: truncated, typeKind: "String" };
+    }
+
+    case "bigint":
+      return { value: value.toString(), typeKind: "BigInt" };
+
+    case "symbol":
+      return { value: value.toString(), typeKind: "Raw" };
+
+    case "function":
+      return { value: "function", typeKind: "Raw" };
+
+    case "object":
+      // Arrays, plain objects, etc. — brief repr for MVP
+      if (Array.isArray(value)) {
+        return { value: "array", typeKind: "Raw" };
+      }
+      return { value: "object", typeKind: "Raw" };
+
+    default:
+      return { value: typeof value, typeKind: "Raw" };
+  }
+}
 
 // createRequire needs a base URL; in CJS __filename is available.
 const _require = createRequire(__filename);
@@ -33,7 +97,12 @@ export interface NativeAddon {
     manifestJson: string;
     format: string;
   }): number;
-  appendEvents(handle: number, eventKinds: Uint8Array, ids: Uint32Array): void;
+  appendEvents(
+    handle: number,
+    eventKinds: Uint8Array,
+    ids: Uint32Array,
+    valuesJson: string,
+  ): void;
   flushAndStop(handle: number): string;
 }
 
@@ -72,6 +141,7 @@ export interface ManifestFunctionEntry {
   pathIndex: number;
   line: number;
   col: number;
+  params?: string[];
 }
 
 export interface ManifestSiteEntry {
@@ -187,12 +257,26 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
       buffer.push(EVENT_STEP, siteId);
     },
 
-    enter(fnId: number, _argsLike: IArguments): void {
+    enter(fnId: number, argsLike: IArguments): void {
       buffer.push(EVENT_ENTER, fnId);
+      // Capture argument values in the side channel
+      const encodedArgs: EncodedValue[] = [];
+      for (let i = 0; i < argsLike.length; i++) {
+        encodedArgs.push(encodeValue(argsLike[i]));
+      }
+      buffer.pushValue({
+        eventIndex: buffer.length - 1,
+        args: encodedArgs,
+      });
     },
 
     ret(fnId: number, value?: unknown): unknown {
       buffer.push(EVENT_RET, fnId);
+      // Capture return value in the side channel
+      buffer.pushValue({
+        eventIndex: buffer.length - 1,
+        returnValue: encodeValue(value),
+      });
       return value;
     },
 
@@ -294,7 +378,9 @@ export function startRecording(opts: StartRecordingOptions): RecordingSession {
   // Wire the buffer's onFlush callback to forward batches to the addon
   runtime.buffer.onFlush = (batch: EventBatch) => {
     if (!stopped) {
-      addon.appendEvents(handle, batch.eventKinds, batch.ids);
+      const valuesJson =
+        batch.values.length > 0 ? JSON.stringify(batch.values) : "[]";
+      addon.appendEvents(handle, batch.eventKinds, batch.ids, valuesJson);
     }
   };
 
