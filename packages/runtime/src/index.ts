@@ -23,6 +23,9 @@ export {
   EVENT_ENTER,
   EVENT_RET,
   EVENT_WRITE,
+  EVENT_THREAD_START,
+  EVENT_THREAD_SWITCH,
+  EVENT_THREAD_EXIT,
 } from "./buffer.js";
 export type {
   EventBatch,
@@ -36,6 +39,8 @@ export type {
 export { encodeValue } from "./runtime.js";
 
 export { installConsoleCapture, removeConsoleCapture } from "./io-capture.js";
+
+export { AsyncContextTracker } from "./async-context.js";
 
 export { createRuntime, loadNativeAddon, startRecording } from "./runtime.js";
 export type {

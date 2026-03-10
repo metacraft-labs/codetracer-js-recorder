@@ -29,6 +29,7 @@ import type {
 import { readConfig } from "./config.js";
 import type { RuntimeConfig } from "./config.js";
 import { installConsoleCapture, removeConsoleCapture } from "./io-capture.js";
+import { AsyncContextTracker } from "./async-context.js";
 
 // ── Value encoding ──────────────────────────────────────────────────
 
@@ -180,6 +181,20 @@ export interface CtRuntime {
   enter(fnId: number, argsLike: IArguments): void;
   ret(fnId: number, value?: unknown): unknown;
 
+  /**
+   * Enable async context tracking.
+   *
+   * Once enabled, the runtime will automatically emit ThreadStart and
+   * ThreadSwitch events when execution moves between async contexts
+   * (e.g., across await boundaries, setTimeout callbacks).
+   */
+  enableAsyncTracking(): void;
+
+  /**
+   * Disable async context tracking.
+   */
+  disableAsyncTracking(): void;
+
   // ── testing / inspection helpers ──
   /** The underlying event buffer (exposed for testing). */
   readonly buffer: EventBuffer;
@@ -189,6 +204,8 @@ export interface CtRuntime {
   readonly config: RuntimeConfig;
   /** Whether the runtime has been initialized. */
   readonly initialized: boolean;
+  /** The async context tracker (exposed for testing). */
+  readonly asyncTracker: AsyncContextTracker;
   /** Manually flush remaining buffered events. */
   flush(): void;
 }
@@ -223,6 +240,8 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
   let manifest: TraceManifest | null = null;
   let initialized = false;
 
+  const asyncTracker = new AsyncContextTracker();
+
   // ── Disabled mode ───────────────────────────────────────────────
   if (config.disabled) {
     const noop: CtRuntime = {
@@ -232,6 +251,8 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
       ret(_fnId: number, value?: unknown): unknown {
         return value;
       },
+      enableAsyncTracking(): void {},
+      disableAsyncTracking(): void {},
       get buffer() {
         return buffer;
       },
@@ -243,6 +264,9 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
       },
       get initialized() {
         return false;
+      },
+      get asyncTracker() {
+        return asyncTracker;
       },
       flush(): void {},
     };
@@ -268,6 +292,7 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
 
     step(siteId: number): void {
       try {
+        asyncTracker.checkContext(buffer);
         buffer.push(EVENT_STEP, siteId);
       } catch {
         // Never crash the user's program
@@ -276,6 +301,7 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
 
     enter(fnId: number, argsLike: IArguments): void {
       try {
+        asyncTracker.checkContext(buffer);
         buffer.push(EVENT_ENTER, fnId);
         // Capture argument values in the side channel
         const encodedArgs: EncodedValue[] = [];
@@ -293,6 +319,7 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
 
     ret(fnId: number, value?: unknown): unknown {
       try {
+        asyncTracker.checkContext(buffer);
         buffer.push(EVENT_RET, fnId);
         // Capture return value in the side channel
         buffer.pushValue({
@@ -303,6 +330,14 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
         // Never crash the user's program
       }
       return value;
+    },
+
+    enableAsyncTracking(): void {
+      asyncTracker.enable(buffer);
+    },
+
+    disableAsyncTracking(): void {
+      asyncTracker.disable();
     },
 
     get buffer() {
@@ -316,6 +351,9 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
     },
     get initialized() {
       return initialized;
+    },
+    get asyncTracker() {
+      return asyncTracker;
     },
 
     flush,
@@ -449,6 +487,9 @@ export function startRecording(
     }
   };
 
+  // Enable async context tracking for the recording session
+  runtime.enableAsyncTracking();
+
   // Install console capture to record Write events
   installConsoleCapture((kind: string, content: string) => {
     try {
@@ -468,8 +509,9 @@ export function startRecording(
       throw new Error("Recording session already stopped");
     }
 
-    // Remove console capture before flushing
+    // Remove console capture and disable async tracking before flushing
     removeConsoleCapture();
+    runtime.disableAsyncTracking();
 
     // Flush any remaining buffered events first (while onFlush is still active)
     runtime.flush();

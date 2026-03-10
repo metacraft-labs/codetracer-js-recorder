@@ -9,6 +9,10 @@
  *   0 = step
  *   1 = enter
  *   2 = ret
+ *   3 = write
+ *   4 = thread_start
+ *   5 = thread_switch
+ *   6 = thread_exit
  */
 
 /** Numeric event kind codes matching the instrumenter output. */
@@ -16,12 +20,18 @@ export const EVENT_STEP = 0 as const;
 export const EVENT_ENTER = 1 as const;
 export const EVENT_RET = 2 as const;
 export const EVENT_WRITE = 3 as const;
+export const EVENT_THREAD_START = 4 as const;
+export const EVENT_THREAD_SWITCH = 5 as const;
+export const EVENT_THREAD_EXIT = 6 as const;
 
 export type EventKind =
   | typeof EVENT_STEP
   | typeof EVENT_ENTER
   | typeof EVENT_RET
-  | typeof EVENT_WRITE;
+  | typeof EVENT_WRITE
+  | typeof EVENT_THREAD_START
+  | typeof EVENT_THREAD_SWITCH
+  | typeof EVENT_THREAD_EXIT;
 
 /** Encoded representation of a JS value for tracing. */
 export interface EncodedValue {
@@ -51,7 +61,7 @@ export interface WriteEntry {
 
 /** A flushed batch — a snapshot of the typed arrays at flush time. */
 export interface EventBatch {
-  /** Event kind per slot (0=step, 1=enter, 2=ret, 3=write). */
+  /** Event kind per slot (0=step, 1=enter, 2=ret, 3=write, 4=thread_start, 5=thread_switch, 6=thread_exit). */
   eventKinds: Uint8Array;
   /** siteId (for step) or fnId (for enter/ret) per slot. Id is unused for write events (set to 0). */
   ids: Uint32Array;

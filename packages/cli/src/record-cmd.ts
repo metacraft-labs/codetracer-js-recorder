@@ -212,6 +212,7 @@ function generateRunner(opts: {
 
 var addon = require(${esc(opts.addonPath)});
 var fs = require("fs");
+var async_hooks = require("async_hooks");
 
 // Read the manifest
 var manifestJson = fs.readFileSync(${esc(opts.manifestPath)}, "utf-8");
@@ -282,13 +283,41 @@ function pushEvent(kind, id) {
   }
 }
 
+// Async context tracking via async_hooks.executionAsyncId()
+// Install a minimal async hook so executionAsyncId() returns meaningful values
+// after async boundaries. Without this, all async continuations return 0.
+var _asyncHook = async_hooks.createHook({ init: function() {} });
+_asyncHook.enable();
+
+var _knownContexts = {};
+var _lastCtxId = 0;
+
+// Initialize with the current context
+var _initialCtxId = async_hooks.executionAsyncId();
+_knownContexts[_initialCtxId] = true;
+pushEvent(4, _initialCtxId); // EVENT_THREAD_START
+_lastCtxId = _initialCtxId;
+
+function checkAsyncContext() {
+  var ctxId = async_hooks.executionAsyncId();
+  if (ctxId !== _lastCtxId) {
+    if (!_knownContexts[ctxId]) {
+      _knownContexts[ctxId] = true;
+      pushEvent(4, ctxId); // EVENT_THREAD_START
+    }
+    pushEvent(5, ctxId); // EVENT_THREAD_SWITCH
+    _lastCtxId = ctxId;
+  }
+}
+
 // Set up globalThis.__ct
 globalThis.__ct = {
   step: function(siteId) {
-    try { pushEvent(0, siteId); } catch(e) {}
+    try { checkAsyncContext(); pushEvent(0, siteId); } catch(e) {}
   },
   enter: function(fnId, argsLike) {
     try {
+      checkAsyncContext();
       pushEvent(1, fnId);
       var encodedArgs = [];
       for (var i = 0; i < argsLike.length; i++) {
@@ -299,6 +328,7 @@ globalThis.__ct = {
   },
   ret: function(fnId, value) {
     try {
+      checkAsyncContext();
       pushEvent(2, fnId);
       valueEntries.push({ eventIndex: bufLen - 1, returnValue: encodeValue(value) });
     } catch(e) {}
@@ -352,6 +382,8 @@ var stopped = false;
 process.on("exit", function() {
   if (!stopped) {
     stopped = true;
+    // Disable async hook
+    _asyncHook.disable();
     // Restore original console methods
     console.log = _origLog;
     console.info = _origInfo;

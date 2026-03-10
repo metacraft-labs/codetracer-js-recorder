@@ -126,6 +126,18 @@ enum TraceEvent {
         kind: String,
         content: String,
     },
+    ThreadStart {
+        #[serde(rename = "threadId")]
+        thread_id: u32,
+    },
+    ThreadSwitch {
+        #[serde(rename = "threadId")]
+        thread_id: u32,
+    },
+    ThreadExit {
+        #[serde(rename = "threadId")]
+        thread_id: u32,
+    },
 }
 
 // ── Trace metadata ──────────────────────────────────────────────────
@@ -379,6 +391,24 @@ pub fn append_events(
                         content: write_entry.content.clone(),
                     });
                 }
+            }
+            // thread_start (new async context)
+            4 => {
+                state.events.push(TraceEvent::ThreadStart {
+                    thread_id: id as u32,
+                });
+            }
+            // thread_switch (execution moved to a different async context)
+            5 => {
+                state.events.push(TraceEvent::ThreadSwitch {
+                    thread_id: id as u32,
+                });
+            }
+            // thread_exit (async context completed)
+            6 => {
+                state.events.push(TraceEvent::ThreadExit {
+                    thread_id: id as u32,
+                });
             }
             _ => {
                 // Unknown event kind — skip
