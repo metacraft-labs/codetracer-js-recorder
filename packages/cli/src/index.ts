@@ -8,11 +8,23 @@
  *   record <file> [-- args...]     Instrument and run, producing a trace
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { instrumentCommand } from "./instrument-cmd.js";
 import { recordCommand } from "./record-cmd.js";
 
+const pkgJsonPath = path.join(__dirname, "..", "package.json");
+const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8")) as {
+  version: string;
+};
+
 const args = process.argv.slice(2);
 const command = args[0];
+
+if (command === "--version" || command === "-V") {
+  console.log(`codetracer-js-recorder ${pkg.version}`);
+  process.exit(0);
+}
 
 if (!command || command === "--help" || command === "-h") {
   console.log(`Usage:
@@ -34,7 +46,8 @@ Record options:
   --format json|binary    Trace format (default: json)
   --include <glob>        Include glob pattern (repeatable)
   --exclude <glob>        Exclude glob pattern (repeatable)
-  --help                  Show this help message`);
+  --help                  Show this help message
+  --version               Print version and exit`);
   process.exit(0);
 }
 
