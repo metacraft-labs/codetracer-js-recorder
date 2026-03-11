@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "codetracer-trace-format": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1773220650,
+        "narHash": "sha256-vYaqyBhbNc3I2pSJI9h00vE9PcJUTsR1oOuG89hj9gc=",
+        "owner": "metacraft-labs",
+        "repo": "codetracer-trace-format",
+        "rev": "549b859962bbc8405b04f59c0585edee0780655c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "ref": "ffi-crate-and-format-fixes",
+        "repo": "codetracer-trace-format",
+        "type": "github"
+      }
+    },
     "fenix": {
       "inputs": {
         "nixpkgs": [
@@ -112,6 +129,7 @@
     },
     "root": {
       "inputs": {
+        "codetracer-trace-format": "codetracer-trace-format",
         "fenix": "fenix",
         "nixpkgs": "nixpkgs",
         "pre-commit-hooks": "pre-commit-hooks"
