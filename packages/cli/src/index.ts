@@ -8,12 +8,15 @@
  *   record <file> [-- args...]     Instrument and run, producing a trace
  */
 
-import { createRequire } from "node:module";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { instrumentCommand } from "./instrument-cmd.js";
 import { recordCommand } from "./record-cmd.js";
 
-const require = createRequire(import.meta.url);
-const pkg = require("../package.json") as { version: string };
+const pkgJsonPath = path.join(__dirname, "..", "package.json");
+const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8")) as {
+  version: string;
+};
 
 const args = process.argv.slice(2);
 const command = args[0];
