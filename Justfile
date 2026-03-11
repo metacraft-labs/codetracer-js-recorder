@@ -51,3 +51,12 @@ lint:
     just lint-rust
     just lint-js
     just lint-nix
+
+# Bump version across all package.json files (usage: just bump-version 0.2.0)
+bump-version version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for f in package.json packages/cli/package.json packages/instrumenter/package.json packages/runtime/package.json; do
+        node -e "const fs=require('fs'); const p=JSON.parse(fs.readFileSync('$f','utf8')); p.version='{{version}}'; fs.writeFileSync('$f',JSON.stringify(p,null,2)+'\n');"
+        echo "$f → {{version}}"
+    done
