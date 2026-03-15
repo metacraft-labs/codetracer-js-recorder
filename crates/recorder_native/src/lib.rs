@@ -149,6 +149,7 @@ struct TraceMetadata {
     args: Vec<String>,
     recorder: String,
     format: String,
+    workdir: String,
 }
 
 // ── Recorder state ──────────────────────────────────────────────────
@@ -447,12 +448,16 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
     })?;
 
     // Write trace_metadata.json
+    let workdir = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
     let metadata = TraceMetadata {
         language: "javascript".to_string(),
         program: state.program,
         args: state.args,
         recorder: "codetracer-js-recorder".to_string(),
         format: state.format,
+        workdir,
     };
     let metadata_json = serde_json::to_string_pretty(&metadata).map_err(|e| {
         Error::new(
