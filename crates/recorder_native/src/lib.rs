@@ -76,68 +76,165 @@ struct WriteEntryInput {
     content: String,
 }
 
-// ── Trace event types (serialized to JSON) ──────────────────────────
+// ── TraceLowLevelEvent-compatible types (serialized to JSON) ─────────
+//
+// These types mirror the `codetracer_trace_types` crate's serialization
+// format exactly, so the db-backend can deserialize traces produced by
+// the JS recorder without any conversion layer.
 
-/// A named argument with value and type annotation.
+/// Mirrors `codetracer_trace_types::TypeKind` — serialized as `repr(u8)`.
+///
+/// We only define the variants the JS recorder can produce.
+/// Values match the discriminants in the upstream enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+enum TypeKind {
+    Seq = 0,
+    Struct = 6,
+    Int = 7,
+    Float = 8,
+    String = 9,
+    Bool = 11,
+    Raw = 15,
+    FunctionKind = 22,
+    None = 27,
+}
+
+impl Serialize for TypeKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_u8(*self as u8)
+    }
+}
+
+impl TypeKind {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "Int" => TypeKind::Int,
+            "Float" => TypeKind::Float,
+            "String" => TypeKind::String,
+            "Bool" => TypeKind::Bool,
+            "Seq" => TypeKind::Seq,
+            "Struct" => TypeKind::Struct,
+            "FunctionKind" => TypeKind::FunctionKind,
+            "None" => TypeKind::None,
+            _ => TypeKind::Raw,
+        }
+    }
+}
+
+/// Mirrors `codetracer_trace_types::EventLogKind` — serialized as `repr(u8)`.
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum EventLogKind {
+    Write = 0,
+}
+
+impl Serialize for EventLogKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_u8(*self as u8)
+    }
+}
+
+/// Mirrors `codetracer_trace_types::TypeSpecificInfo`.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TraceArg {
+#[serde(tag = "kind")]
+enum TypeSpecificInfo {
+    None,
+    Struct { fields: Vec<FieldTypeRecord> },
+}
+
+/// Mirrors `codetracer_trace_types::FieldTypeRecord`.
+#[derive(Debug, Clone, Serialize)]
+struct FieldTypeRecord {
     name: String,
-    value: serde_json::Value,
-    type_kind: String,
+    type_id: usize,
 }
 
-/// A return value with type annotation.
+/// Mirrors `codetracer_trace_types::TypeRecord`.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TraceReturnValue {
-    value: serde_json::Value,
-    type_kind: String,
+struct TypeRecord {
+    kind: TypeKind,
+    lang_type: String,
+    specific_info: TypeSpecificInfo,
 }
 
+/// Mirrors `codetracer_trace_types::StepRecord`.
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type")]
+struct StepRecord {
+    path_id: usize,
+    line: i64,
+}
+
+/// Mirrors `codetracer_trace_types::FunctionRecord`.
+#[derive(Debug, Clone, Serialize)]
+struct FunctionRecord {
+    path_id: usize,
+    line: i64,
+    name: String,
+}
+
+/// Mirrors `codetracer_trace_types::CallRecord`.
+#[derive(Debug, Clone, Serialize)]
+struct CallRecord {
+    function_id: usize,
+    #[serde(default)]
+    args: Vec<FullValueRecord>,
+}
+
+/// Mirrors `codetracer_trace_types::ReturnRecord`.
+#[derive(Debug, Clone, Serialize)]
+struct ReturnRecord {
+    return_value: ValueRecord,
+}
+
+/// Mirrors `codetracer_trace_types::RecordEvent`.
+#[derive(Debug, Clone, Serialize)]
+struct RecordEvent {
+    kind: EventLogKind,
+    metadata: String,
+    content: String,
+}
+
+/// Mirrors `codetracer_trace_types::FullValueRecord`.
+#[derive(Debug, Clone, Serialize)]
+struct FullValueRecord {
+    variable_id: usize,
+    value: ValueRecord,
+}
+
+/// Mirrors `codetracer_trace_types::ValueRecord`.
+///
+/// Uses `#[serde(tag = "kind")]` internally tagged, matching upstream.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind")]
+enum ValueRecord {
+    Int { i: i64, type_id: usize },
+    Float { f: String, type_id: usize },
+    Bool { b: bool, type_id: usize },
+    String { text: String, type_id: usize },
+    Struct { field_values: Vec<ValueRecord>, type_id: usize },
+    Sequence { elements: Vec<ValueRecord>, is_slice: bool, type_id: usize },
+    Raw { r: String, type_id: usize },
+    None { type_id: usize },
+}
+
+/// Mirrors `codetracer_trace_types::TraceLowLevelEvent`.
+///
+/// Uses serde's default externally-tagged enum representation, matching upstream.
+#[derive(Debug, Clone, Serialize)]
 enum TraceEvent {
-    Path {
-        path: String,
-    },
-    Function {
-        name: String,
-        #[serde(rename = "pathIndex")]
-        path_index: usize,
-        line: u32,
-    },
-    Step {
-        #[serde(rename = "pathIndex")]
-        path_index: usize,
-        line: u32,
-    },
-    Call {
-        #[serde(rename = "fnId")]
-        fn_id: usize,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        args: Vec<TraceArg>,
-    },
-    Return {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        value: Option<TraceReturnValue>,
-    },
-    Write {
-        kind: String,
-        content: String,
-    },
-    ThreadStart {
-        #[serde(rename = "threadId")]
-        thread_id: u32,
-    },
-    ThreadSwitch {
-        #[serde(rename = "threadId")]
-        thread_id: u32,
-    },
-    ThreadExit {
-        #[serde(rename = "threadId")]
-        thread_id: u32,
-    },
+    Path(PathBuf),
+    VariableName(String),
+    Type(TypeRecord),
+    Function(FunctionRecord),
+    Step(StepRecord),
+    Call(CallRecord),
+    Return(ReturnRecord),
+    Event(RecordEvent),
+    Value(FullValueRecord),
+    ThreadStart(u64),
+    ThreadSwitch(u64),
+    ThreadExit(u64),
 }
 
 // ── Trace metadata ──────────────────────────────────────────────────
@@ -152,6 +249,82 @@ struct TraceMetadata {
     workdir: String,
 }
 
+// ── Type registry ───────────────────────────────────────────────────
+
+/// Tracks registered types so we emit each TypeKind only once and reuse
+/// the type_id for value records.
+struct TypeRegistry {
+    /// Maps TypeKind discriminant -> type_id (index into the type table).
+    map: HashMap<u8, usize>,
+    next_id: usize,
+}
+
+impl TypeRegistry {
+    fn new() -> Self {
+        TypeRegistry {
+            map: HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    /// Get or register a type, returning (type_id, optional TraceEvent::Type to emit).
+    fn get_or_register(&mut self, kind: TypeKind) -> (usize, Option<TraceEvent>) {
+        let disc = kind as u8;
+        if let Some(&id) = self.map.get(&disc) {
+            (id, None)
+        } else {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.map.insert(disc, id);
+            let lang_type = match kind {
+                TypeKind::Int => "number",
+                TypeKind::Float => "number",
+                TypeKind::String => "string",
+                TypeKind::Bool => "boolean",
+                TypeKind::Seq => "array",
+                TypeKind::Struct => "object",
+                TypeKind::FunctionKind => "function",
+                TypeKind::Raw => "raw",
+                TypeKind::None => "undefined",
+            };
+            let event = TraceEvent::Type(TypeRecord {
+                kind,
+                lang_type: lang_type.to_string(),
+                specific_info: TypeSpecificInfo::None,
+            });
+            (id, Some(event))
+        }
+    }
+}
+
+/// Tracks registered variable names so we emit VariableName events and
+/// map names to variable_id indices.
+struct VariableNameRegistry {
+    map: HashMap<String, usize>,
+    next_id: usize,
+}
+
+impl VariableNameRegistry {
+    fn new() -> Self {
+        VariableNameRegistry {
+            map: HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    /// Get or register a variable name, returning (variable_id, optional TraceEvent::VariableName to emit).
+    fn get_or_register(&mut self, name: &str) -> (usize, Option<TraceEvent>) {
+        if let Some(&id) = self.map.get(name) {
+            (id, None)
+        } else {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.map.insert(name.to_string(), id);
+            (id, Some(TraceEvent::VariableName(name.to_string())))
+        }
+    }
+}
+
 // ── Recorder state ──────────────────────────────────────────────────
 
 struct RecorderState {
@@ -161,6 +334,8 @@ struct RecorderState {
     program: String,
     args: Vec<String>,
     format: String,
+    type_registry: TypeRegistry,
+    var_name_registry: VariableNameRegistry,
 }
 
 // Global handle counter
@@ -172,6 +347,174 @@ fn recorder_map() -> &'static Mutex<HashMap<u32, RecorderState>> {
     use std::sync::OnceLock;
     static MAP: OnceLock<Mutex<HashMap<u32, RecorderState>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Convert an EncodedValue (from JS) to a ValueRecord (TraceLowLevelEvent-compatible).
+fn encoded_to_value_record(
+    ev: &EncodedValue,
+    type_registry: &mut TypeRegistry,
+    pending_events: &mut Vec<TraceEvent>,
+) -> ValueRecord {
+    let kind = TypeKind::from_str(&ev.type_kind);
+    let (type_id, type_event) = type_registry.get_or_register(kind);
+    if let Some(te) = type_event {
+        pending_events.push(te);
+    }
+
+    match kind {
+        TypeKind::Int => {
+            let i = ev.value.as_i64().unwrap_or(0);
+            ValueRecord::Int { i, type_id }
+        }
+        TypeKind::Float => {
+            let f = ev.value.as_f64().unwrap_or(0.0);
+            ValueRecord::Float {
+                f: f.to_string(),
+                type_id,
+            }
+        }
+        TypeKind::Bool => {
+            let b = ev.value.as_bool().unwrap_or(false);
+            ValueRecord::Bool { b, type_id }
+        }
+        TypeKind::String => {
+            let text = ev.value.as_str().unwrap_or("").to_string();
+            ValueRecord::String { text, type_id }
+        }
+        TypeKind::Seq => {
+            let elements = if let Some(arr) = ev.value.as_array() {
+                arr.iter()
+                    .map(|item| {
+                        // Each item in a sequence should have typeKind + value
+                        if let Some(obj) = item.as_object() {
+                            let inner_kind = obj
+                                .get("typeKind")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Raw");
+                            let inner_value = obj.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                            let inner_ev = EncodedValue {
+                                value: inner_value,
+                                type_kind: inner_kind.to_string(),
+                            };
+                            encoded_to_value_record(&inner_ev, type_registry, pending_events)
+                        } else {
+                            // Bare value - treat as raw
+                            let (raw_tid, raw_te) = type_registry.get_or_register(TypeKind::Raw);
+                            if let Some(te) = raw_te {
+                                pending_events.push(te);
+                            }
+                            ValueRecord::Raw {
+                                r: item.to_string(),
+                                type_id: raw_tid,
+                            }
+                        }
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+            ValueRecord::Sequence {
+                elements,
+                is_slice: false,
+                type_id,
+            }
+        }
+        TypeKind::Struct => {
+            let field_values = if let Some(obj) = ev.value.as_object() {
+                if let Some(fields) = obj.get("fields").and_then(|f| f.as_array()) {
+                    fields
+                        .iter()
+                        .filter_map(|field| {
+                            let field_obj = field.as_object()?;
+                            let _name = field_obj.get("name")?.as_str()?;
+                            let value = field_obj.get("value")?;
+                            let inner_kind = if let Some(obj) = value.as_object() {
+                                obj.get("typeKind")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Raw")
+                            } else {
+                                field_obj
+                                    .get("typeKind")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| {
+                                        if s == "Struct" {
+                                            // The value itself is the struct-like object
+                                            return s;
+                                        }
+                                        s
+                                    })
+                                    .unwrap_or("Raw")
+                            };
+                            // For nested structs/sequences, the value contains
+                            // {typeKind, value} structure; for simple types it's
+                            // just a plain JSON value.
+                            let inner_value = if let Some(inner_obj) = value.as_object() {
+                                if inner_obj.contains_key("typeKind") {
+                                    // It's a nested encoded value
+                                    let nested_ev = EncodedValue {
+                                        value: inner_obj
+                                            .get("value")
+                                            .cloned()
+                                            .unwrap_or(serde_json::Value::Null),
+                                        type_kind: inner_obj
+                                            .get("typeKind")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("Raw")
+                                            .to_string(),
+                                    };
+                                    return Some(encoded_to_value_record(
+                                        &nested_ev,
+                                        type_registry,
+                                        pending_events,
+                                    ));
+                                }
+                                // Regular object value -- serialize as raw
+                                let (raw_tid, raw_te) = type_registry.get_or_register(TypeKind::Raw);
+                                if let Some(te) = raw_te {
+                                    pending_events.push(te);
+                                }
+                                return Some(ValueRecord::Raw {
+                                    r: value.to_string(),
+                                    type_id: raw_tid,
+                                });
+                            } else {
+                                value.clone()
+                            };
+                            let field_ev = EncodedValue {
+                                value: inner_value,
+                                type_kind: inner_kind.to_string(),
+                            };
+                            Some(encoded_to_value_record(&field_ev, type_registry, pending_events))
+                        })
+                        .collect()
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            };
+            ValueRecord::Struct {
+                field_values,
+                type_id,
+            }
+        }
+        TypeKind::FunctionKind => {
+            let text = match &ev.value {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            ValueRecord::Raw { r: text, type_id }
+        }
+        TypeKind::None => ValueRecord::None { type_id },
+        TypeKind::Raw => {
+            let r = match &ev.value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => "<null>".to_string(),
+                other => other.to_string(),
+            };
+            ValueRecord::Raw { r, type_id }
+        }
+    }
 }
 
 // ── N-API exports ───────────────────────────────────────────────────
@@ -238,19 +581,42 @@ pub fn start_recording(opts: JsObject) -> Result<u32> {
         )
     })?;
 
+    let mut type_registry = TypeRegistry::new();
+    let var_name_registry = VariableNameRegistry::new();
+
     // Pre-register paths and functions as initial events
     let mut events: Vec<TraceEvent> = Vec::new();
 
     for p in &manifest.paths {
-        events.push(TraceEvent::Path { path: p.clone() });
+        events.push(TraceEvent::Path(PathBuf::from(p)));
+    }
+
+    // Register types that functions may reference — emit Type events
+    // before Function events so the db-backend has them available.
+    // We pre-register a few common types.
+    for kind in [
+        TypeKind::None,
+        TypeKind::Int,
+        TypeKind::Float,
+        TypeKind::String,
+        TypeKind::Bool,
+        TypeKind::Raw,
+        TypeKind::Seq,
+        TypeKind::Struct,
+        TypeKind::FunctionKind,
+    ] {
+        let (_id, type_event) = type_registry.get_or_register(kind);
+        if let Some(te) = type_event {
+            events.push(te);
+        }
     }
 
     for f in &manifest.functions {
-        events.push(TraceEvent::Function {
+        events.push(TraceEvent::Function(FunctionRecord {
+            path_id: f.path_index,
+            line: f.line as i64,
             name: f.name.clone(),
-            path_index: f.path_index,
-            line: f.line,
-        });
+        }));
     }
 
     let state = RecorderState {
@@ -260,6 +626,8 @@ pub fn start_recording(opts: JsObject) -> Result<u32> {
         program,
         args,
         format,
+        type_registry,
+        var_name_registry,
     };
 
     recorder_map()
@@ -328,14 +696,15 @@ pub fn append_events(
             // step
             0 => {
                 if let Some(site) = state.manifest.sites.get(id) {
-                    state.events.push(TraceEvent::Step {
-                        path_index: site.path_index,
-                        line: site.line,
-                    });
+                    state.events.push(TraceEvent::Step(StepRecord {
+                        path_id: site.path_index,
+                        line: site.line as i64,
+                    }));
                 }
             }
-            // enter
+            // enter (call)
             1 => {
+                let mut pending_events: Vec<TraceEvent> = Vec::new();
                 let args = if let Some(entry) = value_map.get(&i) {
                     if let Some(ref encoded_args) = entry.args {
                         // Get parameter names from manifest
@@ -355,10 +724,19 @@ pub fn append_events(
                                     .get(j)
                                     .cloned()
                                     .unwrap_or_else(|| format!("_param{}", j));
-                                TraceArg {
-                                    name,
-                                    value: ev.value.clone(),
-                                    type_kind: ev.type_kind.clone(),
+                                let (var_id, var_event) =
+                                    state.var_name_registry.get_or_register(&name);
+                                if let Some(ve) = var_event {
+                                    pending_events.push(ve);
+                                }
+                                let value = encoded_to_value_record(
+                                    ev,
+                                    &mut state.type_registry,
+                                    &mut pending_events,
+                                );
+                                FullValueRecord {
+                                    variable_id: var_id,
+                                    value,
                                 }
                             })
                             .collect()
@@ -369,47 +747,73 @@ pub fn append_events(
                     vec![]
                 };
 
-                state.events.push(TraceEvent::Call { fn_id: id, args });
+                // Emit any pending type/variable-name events before the Call event
+                state.events.extend(pending_events);
+                state.events.push(TraceEvent::Call(CallRecord {
+                    function_id: id,
+                    args,
+                }));
             }
-            // ret
+            // ret (return)
             2 => {
-                let value = if let Some(entry) = value_map.get(&i) {
-                    entry.return_value.as_ref().map(|rv| TraceReturnValue {
-                        value: rv.value.clone(),
-                        type_kind: rv.type_kind.clone(),
-                    })
+                let mut pending_events: Vec<TraceEvent> = Vec::new();
+                let return_value = if let Some(entry) = value_map.get(&i) {
+                    if let Some(rv) = &entry.return_value {
+                        encoded_to_value_record(rv, &mut state.type_registry, &mut pending_events)
+                    } else {
+                        let (none_tid, none_te) =
+                            state.type_registry.get_or_register(TypeKind::None);
+                        if let Some(te) = none_te {
+                            pending_events.push(te);
+                        }
+                        ValueRecord::None {
+                            type_id: none_tid,
+                        }
+                    }
                 } else {
-                    None
+                    let (none_tid, none_te) =
+                        state.type_registry.get_or_register(TypeKind::None);
+                    if let Some(te) = none_te {
+                        pending_events.push(te);
+                    }
+                    ValueRecord::None {
+                        type_id: none_tid,
+                    }
                 };
 
-                state.events.push(TraceEvent::Return { value });
+                state.events.extend(pending_events);
+                state
+                    .events
+                    .push(TraceEvent::Return(ReturnRecord { return_value }));
             }
-            // write (console output)
+            // write (console output) -> Event(RecordEvent)
             3 => {
                 if let Some(write_entry) = write_map.get(&i) {
-                    state.events.push(TraceEvent::Write {
-                        kind: write_entry.kind.clone(),
+                    // Map JS write kinds to EventLogKind
+                    let _kind = match write_entry.kind.as_str() {
+                        "stdout" | "stderr" | "log" | "warn" | "error" | "info" | "debug" => {
+                            EventLogKind::Write
+                        }
+                        _ => EventLogKind::Write,
+                    };
+                    state.events.push(TraceEvent::Event(RecordEvent {
+                        kind: EventLogKind::Write,
+                        metadata: String::new(),
                         content: write_entry.content.clone(),
-                    });
+                    }));
                 }
             }
             // thread_start (new async context)
             4 => {
-                state.events.push(TraceEvent::ThreadStart {
-                    thread_id: id as u32,
-                });
+                state.events.push(TraceEvent::ThreadStart(id as u64));
             }
             // thread_switch (execution moved to a different async context)
             5 => {
-                state.events.push(TraceEvent::ThreadSwitch {
-                    thread_id: id as u32,
-                });
+                state.events.push(TraceEvent::ThreadSwitch(id as u64));
             }
             // thread_exit (async context completed)
             6 => {
-                state.events.push(TraceEvent::ThreadExit {
-                    thread_id: id as u32,
-                });
+                state.events.push(TraceEvent::ThreadExit(id as u64));
             }
             _ => {
                 // Unknown event kind — skip
@@ -499,6 +903,12 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
         // Preserve directory structure inside files/.
         // Strip leading '/' from absolute paths so join() doesn't replace the base.
         let relative = source_path.strip_prefix('/').unwrap_or(source_path);
+        // On Windows, also strip leading drive letters like "D:\" so join() works.
+        let relative = relative
+            .get(1..)
+            .filter(|_| relative.as_bytes().get(1) == Some(&b':'))
+            .map(|s| s.strip_prefix('\\').or_else(|| s.strip_prefix('/')).unwrap_or(s))
+            .unwrap_or(relative);
         let dest = files_dir.join(relative);
         if let Some(parent) = dest.parent() {
             let _ = fs::create_dir_all(parent);
