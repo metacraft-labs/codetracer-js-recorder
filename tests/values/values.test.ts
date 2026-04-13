@@ -13,6 +13,7 @@ import {
 } from "@codetracer/runtime";
 import type { TraceManifest, EncodedValue } from "@codetracer/runtime";
 import { instrument } from "@codetracer/instrumenter";
+import { parseTraceEvents } from "../helpers/parse-trace.js";
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
 const ADDON_PATH = path.resolve(
@@ -515,8 +516,8 @@ describe("test_addon_value_capture", () => {
 
     const traceDir = session.stop();
 
-    const traceEvents = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceEvents = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     const callEvents = traceEvents.filter(
@@ -569,8 +570,8 @@ describe("test_addon_value_capture", () => {
 
     const traceDir = session.stop();
 
-    const traceEvents = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceEvents = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     const returnEvents = traceEvents.filter(
@@ -629,8 +630,8 @@ var msg = greet("World");
     const traceDir = traceDirMatch![1].trim();
 
     // Read trace events
-    const traceEvents = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceEvents = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     // Get all Call events
@@ -713,8 +714,8 @@ mixed(42, "test", true, null);
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    const traceEvents = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceEvents = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     const callEvents = traceEvents.filter(

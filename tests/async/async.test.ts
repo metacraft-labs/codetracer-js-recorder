@@ -18,6 +18,7 @@ import {
 } from "@codetracer/runtime";
 import type { TraceManifest } from "@codetracer/runtime";
 import { instrument } from "@codetracer/instrumenter";
+import { parseTraceEvents } from "../helpers/parse-trace.js";
 
 const ADDON_PATH = path.resolve(
   __dirname,
@@ -341,8 +342,8 @@ main();
     const traceDir = traceDirMatch![1].trim();
 
     // Read trace events
-    const traceEvents = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceEvents = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     // Should have ThreadStart events (at least one for the initial context)
@@ -438,8 +439,8 @@ main();
     const traceDir = traceDirMatch![1].trim();
 
     // Read trace events
-    const traceEvents = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceEvents = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     // Verify async context events are present

@@ -13,6 +13,7 @@ import {
 } from "@codetracer/runtime";
 import type { TraceManifest } from "@codetracer/runtime";
 import { instrument } from "@codetracer/instrumenter";
+import { parseTraceEvents } from "../helpers/parse-trace.js";
 
 const ADDON_PATH = path.resolve(
   __dirname,
@@ -210,8 +211,8 @@ describe("test_addon_append_events_batch", () => {
 
     const traceDir = session.stop();
 
-    const traceEvents = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceEvents = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     // First events are pre-registered paths and functions
@@ -287,8 +288,8 @@ describe("test_addon_append_events_batch", () => {
 
     const traceDir = session.stop();
 
-    const traceEvents = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceEvents = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     const stepEvents = traceEvents.filter(
@@ -448,8 +449,8 @@ greet("World");
     // Step 6: Verify the trace
     expect(fs.existsSync(traceDir)).toBe(true);
 
-    const traceEvents = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceEvents = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     // Should have Path events

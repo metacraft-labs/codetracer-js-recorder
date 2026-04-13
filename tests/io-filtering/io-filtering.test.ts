@@ -15,6 +15,7 @@ import {
   removeConsoleCapture,
 } from "@codetracer/runtime";
 import { shouldInstrument } from "@codetracer/instrumenter";
+import { parseTraceEvents } from "../helpers/parse-trace.js";
 
 // Resolve paths relative to the project root
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
@@ -379,8 +380,8 @@ describe("e2e_console_capture", () => {
     const traceDir = traceDirMatch![1].trim();
 
     // Verify trace.json exists
-    const traceJson = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceJson = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     // Should have Write events from the console.log call
@@ -426,8 +427,8 @@ console.error("error message");
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    const traceJson = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceJson = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     const writeEvents = traceJson.filter(
@@ -473,8 +474,8 @@ console.log("value is", 42);
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    const traceJson = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceJson = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     const writeEvents = traceJson.filter(

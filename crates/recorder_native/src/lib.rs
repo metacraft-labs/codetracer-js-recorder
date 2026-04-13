@@ -101,7 +101,10 @@ enum TypeKind {
 }
 
 impl Serialize for TypeKind {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         serializer.serialize_u8(*self as u8)
     }
 }
@@ -130,7 +133,10 @@ enum EventLogKind {
 }
 
 impl Serialize for EventLogKind {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         serializer.serialize_u8(*self as u8)
     }
 }
@@ -208,14 +214,39 @@ struct FullValueRecord {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind")]
 enum ValueRecord {
-    Int { i: i64, type_id: usize },
-    Float { f: String, type_id: usize },
-    Bool { b: bool, type_id: usize },
-    String { text: String, type_id: usize },
-    Struct { field_values: Vec<ValueRecord>, type_id: usize },
-    Sequence { elements: Vec<ValueRecord>, is_slice: bool, type_id: usize },
-    Raw { r: String, type_id: usize },
-    None { type_id: usize },
+    Int {
+        i: i64,
+        type_id: usize,
+    },
+    Float {
+        f: String,
+        type_id: usize,
+    },
+    Bool {
+        b: bool,
+        type_id: usize,
+    },
+    String {
+        text: String,
+        type_id: usize,
+    },
+    Struct {
+        field_values: Vec<ValueRecord>,
+        field_names: Vec<String>,
+        type_id: usize,
+    },
+    Sequence {
+        elements: Vec<ValueRecord>,
+        is_slice: bool,
+        type_id: usize,
+    },
+    Raw {
+        r: String,
+        type_id: usize,
+    },
+    None {
+        type_id: usize,
+    },
 }
 
 /// Mirrors `codetracer_trace_types::TraceLowLevelEvent`.
@@ -391,7 +422,8 @@ fn encoded_to_value_record(
                                 .get("typeKind")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("Raw");
-                            let inner_value = obj.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                            let inner_value =
+                                obj.get("value").cloned().unwrap_or(serde_json::Value::Null);
                             let inner_ev = EncodedValue {
                                 value: inner_value,
                                 type_kind: inner_kind.to_string(),
@@ -420,35 +452,25 @@ fn encoded_to_value_record(
             }
         }
         TypeKind::Struct => {
-            let field_values = if let Some(obj) = ev.value.as_object() {
+            let mut field_values: Vec<ValueRecord> = Vec::new();
+            let mut field_names: Vec<String> = Vec::new();
+            if let Some(obj) = ev.value.as_object() {
                 if let Some(fields) = obj.get("fields").and_then(|f| f.as_array()) {
-                    fields
-                        .iter()
-                        .filter_map(|field| {
-                            let field_obj = field.as_object()?;
-                            let _name = field_obj.get("name")?.as_str()?;
-                            let value = field_obj.get("value")?;
-                            let inner_kind = if let Some(obj) = value.as_object() {
-                                obj.get("typeKind")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("Raw")
-                            } else {
-                                field_obj
-                                    .get("typeKind")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| {
-                                        if s == "Struct" {
-                                            // The value itself is the struct-like object
-                                            return s;
-                                        }
-                                        s
-                                    })
-                                    .unwrap_or("Raw")
+                    for field in fields {
+                        if let Some(field_obj) = field.as_object() {
+                            let name = field_obj
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let value = match field_obj.get("value") {
+                                Some(v) => v,
+                                None => continue,
                             };
                             // For nested structs/sequences, the value contains
                             // {typeKind, value} structure; for simple types it's
                             // just a plain JSON value.
-                            let inner_value = if let Some(inner_obj) = value.as_object() {
+                            let record = if let Some(inner_obj) = value.as_object() {
                                 if inner_obj.contains_key("typeKind") {
                                     // It's a nested encoded value
                                     let nested_ev = EncodedValue {
@@ -462,39 +484,43 @@ fn encoded_to_value_record(
                                             .unwrap_or("Raw")
                                             .to_string(),
                                     };
-                                    return Some(encoded_to_value_record(
+                                    encoded_to_value_record(
                                         &nested_ev,
                                         type_registry,
                                         pending_events,
-                                    ));
+                                    )
+                                } else {
+                                    // Regular object value -- serialize as raw
+                                    let (raw_tid, raw_te) =
+                                        type_registry.get_or_register(TypeKind::Raw);
+                                    if let Some(te) = raw_te {
+                                        pending_events.push(te);
+                                    }
+                                    ValueRecord::Raw {
+                                        r: value.to_string(),
+                                        type_id: raw_tid,
+                                    }
                                 }
-                                // Regular object value -- serialize as raw
-                                let (raw_tid, raw_te) = type_registry.get_or_register(TypeKind::Raw);
-                                if let Some(te) = raw_te {
-                                    pending_events.push(te);
-                                }
-                                return Some(ValueRecord::Raw {
-                                    r: value.to_string(),
-                                    type_id: raw_tid,
-                                });
                             } else {
-                                value.clone()
+                                let inner_kind = field_obj
+                                    .get("typeKind")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Raw");
+                                let field_ev = EncodedValue {
+                                    value: value.clone(),
+                                    type_kind: inner_kind.to_string(),
+                                };
+                                encoded_to_value_record(&field_ev, type_registry, pending_events)
                             };
-                            let field_ev = EncodedValue {
-                                value: inner_value,
-                                type_kind: inner_kind.to_string(),
-                            };
-                            Some(encoded_to_value_record(&field_ev, type_registry, pending_events))
-                        })
-                        .collect()
-                } else {
-                    vec![]
+                            field_names.push(name);
+                            field_values.push(record);
+                        }
+                    }
                 }
-            } else {
-                vec![]
-            };
+            }
             ValueRecord::Struct {
                 field_values,
+                field_names,
                 type_id,
             }
         }
@@ -561,7 +587,7 @@ pub fn start_recording(opts: JsObject) -> Result<u32> {
     let manifest: Manifest = serde_json::from_str(&manifest_json).map_err(|e| {
         Error::new(
             Status::InvalidArg,
-            format!("Failed to parse manifest JSON: {}", e),
+            format!("Failed to parse manifest JSON: {e}"),
         )
     })?;
 
@@ -569,7 +595,7 @@ pub fn start_recording(opts: JsObject) -> Result<u32> {
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::SeqCst);
 
     // Create trace directory
-    let trace_dir = Path::new(&out_dir).join(format!("trace-{}", handle));
+    let trace_dir = Path::new(&out_dir).join(format!("trace-{handle}"));
     fs::create_dir_all(&trace_dir).map_err(|e| {
         Error::new(
             Status::GenericFailure,
@@ -632,7 +658,7 @@ pub fn start_recording(opts: JsObject) -> Result<u32> {
 
     recorder_map()
         .lock()
-        .map_err(|e| Error::new(Status::GenericFailure, format!("Lock poisoned: {}", e)))?
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Lock poisoned: {e}")))?
         .insert(handle, state);
 
     Ok(handle)
@@ -648,12 +674,12 @@ pub fn append_events(
 ) -> Result<()> {
     let mut map = recorder_map()
         .lock()
-        .map_err(|e| Error::new(Status::GenericFailure, format!("Lock poisoned: {}", e)))?;
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Lock poisoned: {e}")))?;
 
     let state = map.get_mut(&handle).ok_or_else(|| {
         Error::new(
             Status::InvalidArg,
-            format!("Invalid recorder handle: {}", handle),
+            format!("Invalid recorder handle: {handle}"),
         )
     })?;
 
@@ -723,7 +749,7 @@ pub fn append_events(
                                 let name = param_names
                                     .get(j)
                                     .cloned()
-                                    .unwrap_or_else(|| format!("_param{}", j));
+                                    .unwrap_or_else(|| format!("_param{j}"));
                                 let (var_id, var_event) =
                                     state.var_name_registry.get_or_register(&name);
                                 if let Some(ve) = var_event {
@@ -766,19 +792,14 @@ pub fn append_events(
                         if let Some(te) = none_te {
                             pending_events.push(te);
                         }
-                        ValueRecord::None {
-                            type_id: none_tid,
-                        }
+                        ValueRecord::None { type_id: none_tid }
                     }
                 } else {
-                    let (none_tid, none_te) =
-                        state.type_registry.get_or_register(TypeKind::None);
+                    let (none_tid, none_te) = state.type_registry.get_or_register(TypeKind::None);
                     if let Some(te) = none_te {
                         pending_events.push(te);
                     }
-                    ValueRecord::None {
-                        type_id: none_tid,
-                    }
+                    ValueRecord::None { type_id: none_tid }
                 };
 
                 state.events.extend(pending_events);
@@ -798,7 +819,7 @@ pub fn append_events(
                     };
                     state.events.push(TraceEvent::Event(RecordEvent {
                         kind: EventLogKind::Write,
-                        metadata: String::new(),
+                        metadata: write_entry.kind.clone(),
                         content: write_entry.content.clone(),
                     }));
                 }
@@ -828,12 +849,12 @@ pub fn append_events(
 pub fn flush_and_stop(handle: u32) -> Result<String> {
     let mut map = recorder_map()
         .lock()
-        .map_err(|e| Error::new(Status::GenericFailure, format!("Lock poisoned: {}", e)))?;
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Lock poisoned: {e}")))?;
 
     let state = map.remove(&handle).ok_or_else(|| {
         Error::new(
             Status::InvalidArg,
-            format!("Invalid recorder handle: {}", handle),
+            format!("Invalid recorder handle: {handle}"),
         )
     })?;
 
@@ -841,13 +862,13 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
     let trace_json = serde_json::to_string_pretty(&state.events).map_err(|e| {
         Error::new(
             Status::GenericFailure,
-            format!("Failed to serialize trace events: {}", e),
+            format!("Failed to serialize trace events: {e}"),
         )
     })?;
     fs::write(state.trace_dir.join("trace.json"), &trace_json).map_err(|e| {
         Error::new(
             Status::GenericFailure,
-            format!("Failed to write trace.json: {}", e),
+            format!("Failed to write trace.json: {e}"),
         )
     })?;
 
@@ -866,13 +887,13 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
     let metadata_json = serde_json::to_string_pretty(&metadata).map_err(|e| {
         Error::new(
             Status::GenericFailure,
-            format!("Failed to serialize metadata: {}", e),
+            format!("Failed to serialize metadata: {e}"),
         )
     })?;
     fs::write(state.trace_dir.join("trace_metadata.json"), &metadata_json).map_err(|e| {
         Error::new(
             Status::GenericFailure,
-            format!("Failed to write trace_metadata.json: {}", e),
+            format!("Failed to write trace_metadata.json: {e}"),
         )
     })?;
 
@@ -880,13 +901,13 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
     let paths_json = serde_json::to_string_pretty(&state.manifest.paths).map_err(|e| {
         Error::new(
             Status::GenericFailure,
-            format!("Failed to serialize paths: {}", e),
+            format!("Failed to serialize paths: {e}"),
         )
     })?;
     fs::write(state.trace_dir.join("trace_paths.json"), &paths_json).map_err(|e| {
         Error::new(
             Status::GenericFailure,
-            format!("Failed to write trace_paths.json: {}", e),
+            format!("Failed to write trace_paths.json: {e}"),
         )
     })?;
 
@@ -895,7 +916,7 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
     fs::create_dir_all(&files_dir).map_err(|e| {
         Error::new(
             Status::GenericFailure,
-            format!("Failed to create files directory: {}", e),
+            format!("Failed to create files directory: {e}"),
         )
     })?;
 
@@ -907,7 +928,11 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
         let relative = relative
             .get(1..)
             .filter(|_| relative.as_bytes().get(1) == Some(&b':'))
-            .map(|s| s.strip_prefix('\\').or_else(|| s.strip_prefix('/')).unwrap_or(s))
+            .map(|s| {
+                s.strip_prefix('\\')
+                    .or_else(|| s.strip_prefix('/'))
+                    .unwrap_or(s)
+            })
             .unwrap_or(relative);
         let dest = files_dir.join(relative);
         if let Some(parent) = dest.parent() {

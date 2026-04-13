@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
+import { parseTraceEvents } from "../helpers/parse-trace.js";
 
 // Resolve paths relative to the project root
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
@@ -227,8 +228,8 @@ describe("e2e_record_simple_program", () => {
     const traceDir = traceDirMatch![1].trim();
 
     // Verify trace.json exists and has content
-    const traceJson = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceJson = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
     expect(traceJson.length).toBeGreaterThan(0);
 
@@ -297,8 +298,8 @@ describe("e2e_record_simple_program", () => {
     const traceDirMatch = stdout.match(/Trace written to:\s*(.+)/);
     const traceDir = traceDirMatch![1].trim();
 
-    const traceJson = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceJson = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     // Runtime events are everything after Path and Function declarations
@@ -347,8 +348,8 @@ describe("e2e_record_multi_file", () => {
     const traceDir = traceDirMatch![1].trim();
 
     // Verify all function names appear in the trace
-    const traceJson = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceJson = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     const funcEvents = traceJson.filter(
@@ -379,8 +380,8 @@ describe("e2e_record_multi_file", () => {
     const traceDirMatch = stdout.match(/Trace written to:\s*(.+)/);
     const traceDir = traceDirMatch![1].trim();
 
-    const traceJson = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceJson = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     // Should have many step events from the loops
@@ -411,8 +412,8 @@ describe("e2e_record_multi_file", () => {
     const traceDirMatch = stdout.match(/Trace written to:\s*(.+)/);
     const traceDir = traceDirMatch![1].trim();
 
-    const traceJson = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8"),
+    const traceJson = parseTraceEvents(
+      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
     );
 
     const callCount = traceJson.filter(

@@ -17,6 +17,7 @@ import {
 } from "@codetracer/runtime";
 import type { TraceManifest } from "@codetracer/runtime";
 import { instrument } from "@codetracer/instrumenter";
+import { parseTraceEvents } from "../helpers/parse-trace.js";
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
 const EXAMPLES_DIR = path.join(PROJECT_ROOT, "examples");
@@ -237,7 +238,7 @@ var r5 = work(200);
       // Read trace and measure
       const traceJsonPath = path.join(traceDir, "trace.json");
       const traceContent = fs.readFileSync(traceJsonPath, "utf-8");
-      const traceEvents = JSON.parse(traceContent);
+      const traceEvents = parseTraceEvents(JSON.parse(traceContent));
 
       const totalEvents = traceEvents.length;
       const stepEvents = traceEvents.filter(
