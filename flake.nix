@@ -87,6 +87,7 @@
 
                 # For trace format serialization
                 capnproto
+                zstd
 
                 # Build automation and dev tools
                 just
@@ -173,11 +174,11 @@
             postPatch = lib.optionalString hasTraceFormatDeps ''
               substituteInPlace crates/recorder_native/Cargo.toml \
                 --replace-fail \
-                  'path = "../../../codetracer/libs/codetracer-trace-format/codetracer_trace_types"' \
+                  'path = "../../../codetracer-trace-format/codetracer_trace_types"' \
                   'path = "${codetracer-trace-format}/codetracer_trace_types"' \
                 --replace-fail \
-                  'path = "../../../codetracer/libs/codetracer-trace-format/codetracer_trace_writer"' \
-                  'path = "${codetracer-trace-format}/codetracer_trace_writer"'
+                  'path = "../../../codetracer-trace-format/codetracer_trace_writer_nim"' \
+                  'path = "${codetracer-trace-format}/codetracer_trace_writer_nim"'
             '';
 
             buildPhase = ''

@@ -13,6 +13,12 @@ napi-derive = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# CodeTracer trace format — used to write binary .ct traces via the Nim-backed writer.
+# The path assumes the codetracer-trace-format repo is a sibling of codetracer-js-recorder
+# in the workspace (managed by `repo`).
+codetracer_trace_types = { path = "../../../codetracer-trace-format/codetracer_trace_types" }
+codetracer_trace_writer_nim = { path = "../../../codetracer-trace-format/codetracer_trace_writer_nim" }
+
 [build-dependencies]
 napi-build = "2"
 

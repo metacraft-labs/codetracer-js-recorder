@@ -9,6 +9,52 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
+// Nim-backed binary trace writer (produces .ct files).
+// We alias the upstream types to avoid name clashes with the local mirror types.
+use codetracer_trace_writer_nim::{NimTraceWriter, TraceEventsFileFormat as NimTraceFormat};
+
+// ── Stub FFI functions ─────────��───────────────────────────────────────
+//
+// The `codetracer_trace_writer_nim` crate declares `extern "C"` for several
+// Nim C library functions that are not yet implemented in the current Nim
+// library build (CBOR-based compound value registration). Since the Rust
+// compiler generates code for all match arms in `NimTraceWriter` methods
+// that reference these symbols, they show up as undefined in our cdylib
+// even though our code never takes those paths (we convert compound values
+// to Raw before passing them to the writer).
+//
+// These stubs satisfy the linker. If they are ever called due to a bug,
+// they panic immediately with a clear message.
+
+#[no_mangle]
+pub extern "C" fn trace_writer_register_return_cbor(
+    _handle: *mut std::ffi::c_void,
+    _cbor_data: *const u8,
+    _cbor_len: usize,
+) {
+    panic!("trace_writer_register_return_cbor: stub called — compound values should be flattened to Raw before reaching the Nim writer");
+}
+
+#[no_mangle]
+pub extern "C" fn trace_writer_register_variable_cbor(
+    _handle: *mut std::ffi::c_void,
+    _name: *const std::os::raw::c_char,
+    _cbor_data: *const u8,
+    _cbor_len: usize,
+) {
+    panic!("trace_writer_register_variable_cbor: stub called — compound values should be flattened to Raw before reaching the Nim writer");
+}
+
+#[no_mangle]
+pub extern "C" fn ct_value_write_error(
+    _h: *mut std::ffi::c_void,
+    _data: *const u8,
+    _len: usize,
+    _type_id: u64,
+) -> i32 {
+    panic!("ct_value_write_error: stub called — Error values are not produced by the JS recorder");
+}
+
 // ── Manifest types (deserialized from JSON) ─────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -845,6 +891,267 @@ pub fn append_events(
     Ok(())
 }
 
+// ── Nim trace writer integration ────────────────────────────────────
+//
+// These helpers convert the JS recorder's local mirror types to the
+// upstream `codetracer_trace_types` types consumed by `NimTraceWriter`.
+
+/// Map the local `TypeKind` discriminant to the upstream `codetracer_trace_types::TypeKind`.
+///
+/// The local enum uses explicit `repr(u8)` discriminants that were intended
+/// to match upstream, but some values diverge (Bool, Raw, FunctionKind, None).
+/// This function maps by *semantic meaning*, not by numeric value.
+fn local_type_kind_to_upstream(k: TypeKind) -> codetracer_trace_types::TypeKind {
+    match k {
+        TypeKind::Seq => codetracer_trace_types::TypeKind::Seq,
+        TypeKind::Struct => codetracer_trace_types::TypeKind::Struct,
+        TypeKind::Int => codetracer_trace_types::TypeKind::Int,
+        TypeKind::Float => codetracer_trace_types::TypeKind::Float,
+        TypeKind::String => codetracer_trace_types::TypeKind::String,
+        TypeKind::Bool => codetracer_trace_types::TypeKind::Bool,
+        TypeKind::Raw => codetracer_trace_types::TypeKind::Raw,
+        TypeKind::FunctionKind => codetracer_trace_types::TypeKind::FunctionKind,
+        TypeKind::None => codetracer_trace_types::TypeKind::None,
+    }
+}
+
+/// Convert a local `ValueRecord` to an upstream `codetracer_trace_types::ValueRecord`,
+/// using the `NimTraceWriter` to allocate type IDs on the fly.
+fn local_value_to_upstream(
+    local: &ValueRecord,
+    writer: &mut NimTraceWriter,
+) -> codetracer_trace_types::ValueRecord {
+    match local {
+        ValueRecord::Int { i, type_id: _ } => {
+            let tid = writer.ensure_type_id(codetracer_trace_types::TypeKind::Int, "number");
+            codetracer_trace_types::ValueRecord::Int {
+                i: *i,
+                type_id: tid,
+            }
+        }
+        ValueRecord::Float { f, type_id: _ } => {
+            let tid = writer.ensure_type_id(codetracer_trace_types::TypeKind::Float, "number");
+            // Parse back to f64 — the local type stores the float as a String
+            let fval = f.parse::<f64>().unwrap_or(0.0);
+            codetracer_trace_types::ValueRecord::Float {
+                f: fval,
+                type_id: tid,
+            }
+        }
+        ValueRecord::Bool { b, type_id: _ } => {
+            let tid = writer.ensure_type_id(codetracer_trace_types::TypeKind::Bool, "boolean");
+            codetracer_trace_types::ValueRecord::Bool {
+                b: *b,
+                type_id: tid,
+            }
+        }
+        ValueRecord::String { text, type_id: _ } => {
+            let tid = writer.ensure_type_id(codetracer_trace_types::TypeKind::String, "string");
+            codetracer_trace_types::ValueRecord::String {
+                text: text.clone(),
+                type_id: tid,
+            }
+        }
+        ValueRecord::Struct {
+            field_values: _,
+            field_names: _,
+            type_id: _,
+        } => {
+            // The Nim C library does not yet export CBOR-based compound value
+            // registration functions (trace_writer_register_*_cbor). Until
+            // those are available, we flatten compound types to a Raw string
+            // representation. This loses structural detail but is safe and
+            // matches the `_raw` FFI path.
+            let tid = writer.ensure_type_id(codetracer_trace_types::TypeKind::Struct, "object");
+            codetracer_trace_types::ValueRecord::Raw {
+                r: "{...}".to_string(),
+                type_id: tid,
+            }
+        }
+        ValueRecord::Sequence {
+            elements: _,
+            is_slice: _,
+            type_id: _,
+        } => {
+            let tid = writer.ensure_type_id(codetracer_trace_types::TypeKind::Seq, "array");
+            codetracer_trace_types::ValueRecord::Raw {
+                r: "[...]".to_string(),
+                type_id: tid,
+            }
+        }
+        ValueRecord::Raw { r, type_id: _ } => {
+            let tid = writer.ensure_type_id(codetracer_trace_types::TypeKind::Raw, "raw");
+            codetracer_trace_types::ValueRecord::Raw {
+                r: r.clone(),
+                type_id: tid,
+            }
+        }
+        ValueRecord::None { type_id: _ } => {
+            let tid = writer.ensure_type_id(codetracer_trace_types::TypeKind::None, "undefined");
+            codetracer_trace_types::ValueRecord::None { type_id: tid }
+        }
+    }
+}
+
+/// Replay the collected `TraceEvent` list through a `NimTraceWriter` to
+/// produce a binary trace in the given output directory.
+///
+/// This writes three stream files (metadata, events, paths) plus the
+/// final `.ct` container via `writer.close()`.
+fn write_binary_trace(
+    state: &RecorderState,
+    trace_dir: &Path,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let format = match state.format.as_str() {
+        "json" => NimTraceFormat::Json,
+        _ => NimTraceFormat::Binary,
+    };
+    let mut writer = NimTraceWriter::new(&state.program, format);
+
+    // Set the working directory for the trace metadata.
+    let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    writer.set_workdir(&workdir);
+
+    // Begin writing the three streams.
+    writer.begin_writing_trace_metadata(&trace_dir.join("trace_metadata.ct"))?;
+    writer.begin_writing_trace_events(&trace_dir.join("trace.ct"))?;
+    writer.begin_writing_trace_paths(&trace_dir.join("trace_paths.ct"))?;
+
+    // We need to track whether we've called `start()` yet — the Nim writer
+    // requires a `start()` call before registering steps/calls.
+    let mut started = false;
+
+    for event in &state.events {
+        match event {
+            TraceEvent::Path(p) => {
+                writer.register_path(p);
+            }
+            TraceEvent::Type(tr) => {
+                let upstream_kind = local_type_kind_to_upstream(tr.kind);
+                writer.register_type(upstream_kind, &tr.lang_type);
+            }
+            TraceEvent::VariableName(name) => {
+                writer.register_variable_name(name);
+            }
+            TraceEvent::Function(fr) => {
+                // Look up the path from the manifest by path_id index.
+                let path = state
+                    .manifest
+                    .paths
+                    .get(fr.path_id)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("<unknown>"));
+                writer.register_function(&fr.name, &path, codetracer_trace_types::Line(fr.line));
+            }
+            TraceEvent::Step(sr) => {
+                let path = state
+                    .manifest
+                    .paths
+                    .get(sr.path_id)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("<unknown>"));
+
+                // The Nim writer requires a start() call before the first step.
+                if !started {
+                    writer.start(&path, codetracer_trace_types::Line(sr.line));
+                    started = true;
+                }
+
+                writer.register_step(&path, codetracer_trace_types::Line(sr.line));
+            }
+            TraceEvent::Call(cr) => {
+                // Look up function info from the manifest to ensure the function
+                // is registered in the Nim writer.
+                let func = state.manifest.functions.get(cr.function_id);
+                let (func_path, func_line, func_name) = match func {
+                    Some(f) => {
+                        let p = state
+                            .manifest
+                            .paths
+                            .get(f.path_index)
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| PathBuf::from("<unknown>"));
+                        (p, f.line as i64, f.name.as_str())
+                    }
+                    None => (PathBuf::from("<unknown>"), 0, "<unknown>"),
+                };
+
+                if !started {
+                    writer.start(&func_path, codetracer_trace_types::Line(func_line));
+                    started = true;
+                }
+
+                let fid = writer.ensure_function_id(
+                    func_name,
+                    &func_path,
+                    codetracer_trace_types::Line(func_line),
+                );
+
+                // Convert args
+                let upstream_args: Vec<codetracer_trace_types::FullValueRecord> = cr
+                    .args
+                    .iter()
+                    .map(|a| {
+                        let v = local_value_to_upstream(&a.value, &mut writer);
+                        codetracer_trace_types::FullValueRecord {
+                            variable_id: codetracer_trace_types::VariableId(a.variable_id),
+                            value: v,
+                        }
+                    })
+                    .collect();
+
+                writer.register_call(fid, upstream_args);
+            }
+            TraceEvent::Return(rr) => {
+                let v = local_value_to_upstream(&rr.return_value, &mut writer);
+                writer.register_return(v);
+            }
+            TraceEvent::Value(fvr) => {
+                // Look up variable name — we need the name string, not just the ID.
+                // The var_name_registry maps name->id; we need the reverse lookup.
+                // Since we don't have the reverse map readily available during
+                // replay, we store the variable name as "var_{id}". A more precise
+                // approach would be to store a reverse map, but the Nim writer
+                // handles variable IDs internally.
+                let var_name = state
+                    .var_name_registry
+                    .map
+                    .iter()
+                    .find(|(_, &id)| id == fvr.variable_id)
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| format!("var_{}", fvr.variable_id));
+                let v = local_value_to_upstream(&fvr.value, &mut writer);
+                writer.register_variable_with_full_value(&var_name, v);
+            }
+            TraceEvent::Event(re) => {
+                // Map local EventLogKind to upstream — the only variant we produce is Write(0).
+                writer.register_special_event(
+                    codetracer_trace_types::EventLogKind::Write,
+                    &re.metadata,
+                    &re.content,
+                );
+            }
+            TraceEvent::ThreadStart(_)
+            | TraceEvent::ThreadSwitch(_)
+            | TraceEvent::ThreadExit(_) => {
+                // Thread events are not yet supported by the Nim writer — skip.
+            }
+        }
+    }
+
+    // Finish writing streams and close the writer to produce the final output.
+    writer.finish_writing_trace_events()?;
+    writer.finish_writing_trace_metadata()?;
+    writer.finish_writing_trace_paths()?;
+
+    // Write binary meta.dat
+    writer.write_meta_dat("codetracer-js-recorder")?;
+
+    writer.close()?;
+
+    Ok(())
+}
+
 #[napi]
 pub fn flush_and_stop(handle: u32) -> Result<String> {
     let mut map = recorder_map()
@@ -858,7 +1165,18 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
         )
     })?;
 
-    // Write trace.json
+    // Write binary trace via the Nim-backed writer.
+    // This must happen before the JSON metadata construction below because
+    // that step moves fields out of `state`.
+    if let Err(e) = write_binary_trace(&state, &state.trace_dir.clone()) {
+        // Binary trace writing is best-effort during the transition period.
+        // Log the error but continue to produce JSON output for backward
+        // compatibility.
+        eprintln!("[codetracer-js-recorder] warning: failed to write binary trace: {e}");
+    }
+
+    // Write trace.json (kept for backward compatibility during the transition
+    // to binary .ct output).
     let trace_json = serde_json::to_string_pretty(&state.events).map_err(|e| {
         Error::new(
             Status::GenericFailure,
