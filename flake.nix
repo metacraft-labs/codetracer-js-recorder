@@ -85,9 +85,12 @@
                 pkg-config
                 libiconv
 
-                # Nim compiler — needed to build the trace writer static library
-                # from codetracer-trace-format-nim before cargo can link it.
+                # Nim compiler and package manager — needed to build the trace
+                # writer static library from codetracer-trace-format-nim before
+                # cargo can link it.  nimble is required to install the `results`
+                # and `stew` nimble packages that the trace writer depends on.
                 nim
+                nimble
 
                 # For trace format serialization
                 capnproto
