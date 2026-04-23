@@ -16,7 +16,7 @@
     # can resolve those paths. When the addon has no trace-format path
     # deps (e.g. on older branches), the input is unused but harmless.
     codetracer-trace-format = {
-      url = "github:metacraft-labs/codetracer-trace-format/ffi-crate-and-format-fixes";
+      url = "github:metacraft-labs/codetracer-trace-format/main";
       flake = false;
     };
   };

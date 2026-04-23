@@ -3,16 +3,16 @@
     "codetracer-trace-format": {
       "flake": false,
       "locked": {
-        "lastModified": 1773220650,
-        "narHash": "sha256-vYaqyBhbNc3I2pSJI9h00vE9PcJUTsR1oOuG89hj9gc=",
+        "lastModified": 1776875322,
+        "narHash": "sha256-oZ9eldtMcWD1doqsjy4YBzh2qBeLdQSu7mbnoligYI8=",
         "owner": "metacraft-labs",
         "repo": "codetracer-trace-format",
-        "rev": "549b859962bbc8405b04f59c0585edee0780655c",
+        "rev": "92eb000c9987a9bc78ee148c635c36cf39b1e1b1",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
-        "ref": "ffi-crate-and-format-fixes",
+        "ref": "main",
         "repo": "codetracer-trace-format",
         "type": "github"
       }
