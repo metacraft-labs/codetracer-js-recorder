@@ -44,6 +44,9 @@ jobs:
             git -C "${GITHUB_WORKSPACE}/../codetracer-trace-format" checkout "${TF_REF}"
           fi
 
+      - name: Install zstd headers
+        run: sudo apt-get update && sudo apt-get install -y libzstd-dev
+
       - name: Build Nim trace writer library
         run: |
           PINS=".github/sibling-pins"
