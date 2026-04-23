@@ -91,6 +91,31 @@ jobs:
       - name: Run tests
         run: nix develop --command just test
 
+  windows-build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build native addon
+        run: npx napi build --release --manifest-path crates/recorder_native/Cargo.toml --output-dir crates/recorder_native/
+
+      - name: Build TypeScript packages
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
+
   nix-build:
     name: Verify nix flake packages build
     runs-on: ubuntu-latest

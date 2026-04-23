@@ -5,6 +5,9 @@ node_modules/
 dist/
 *.node
 
+# napi-rs generated type declarations
+crates/*/index.d.ts
+
 # Rust build artifacts
 target/
 
