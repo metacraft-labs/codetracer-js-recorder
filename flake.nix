@@ -109,7 +109,11 @@
               ]
               ++ preCommit.enabledPackages;
 
-            inherit (preCommit) shellHook;
+            shellHook = preCommit.shellHook + ''
+              # Default CODETRACER_NIM_LIB_DIR to the sibling repo when not
+              # already set (e.g. in CI where the env var is passed explicitly).
+              export CODETRACER_NIM_LIB_DIR="''${CODETRACER_NIM_LIB_DIR:-../codetracer-trace-format-nim}"
+            '';
           };
         }
       );

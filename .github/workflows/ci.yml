@@ -77,7 +77,8 @@ jobs:
         run: nix develop --command npm install
 
       - name: Build native addon
-        run: nix develop --command just build-native
+        run: |
+          nix develop --command bash -c "CODETRACER_NIM_LIB_DIR='${{ github.workspace }}/../codetracer-trace-format-nim' just build-native"
 
       - name: Build TypeScript packages
         run: nix develop --command npm run build
