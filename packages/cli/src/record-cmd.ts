@@ -138,7 +138,7 @@ function parseArgs(args: string[]): {
 } {
   let entryFile: string | undefined;
   let outDir = "./ct-traces/";
-  let format = "json";
+  let format = "binary";
   const appArgs: string[] = [];
   const include: string[] = [];
   const exclude: string[] = [];

@@ -43,7 +43,7 @@ Instrument options:
 
 Record options:
   --out-dir <dir>         Trace output directory (default: ./ct-traces/)
-  --format json|binary    Trace format (default: json)
+  --format json|binary    Trace format (default: binary)
   --include <glob>        Include glob pattern (repeatable)
   --exclude <glob>        Exclude glob pattern (repeatable)
   --help                  Show this help message
