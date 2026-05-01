@@ -97,12 +97,7 @@ describe("HCR (Hot Code Reload) validation", () => {
 
     // Pass the workdir directory so the recorder collects all JS files
     // (index.js, mymodule.js, mymodule_v2.js) into the instrumented temp dir.
-    const { stdout, stderr } = runCLI([
-      "record",
-      workdir,
-      "--out-dir",
-      outDir,
-    ]);
+    const { stdout, stderr } = runCLI(["record", workdir, "--out-dir", outDir]);
 
     // Parse program output lines (filter out recorder metadata)
     const lines = stdout
@@ -129,12 +124,7 @@ describe("HCR (Hot Code Reload) validation", () => {
     const workdir = prepareWorkdir();
     const outDir = path.join(tmpDir, "traces");
 
-    const { stdout } = runCLI([
-      "record",
-      workdir,
-      "--out-dir",
-      outDir,
-    ]);
+    const { stdout } = runCLI(["record", workdir, "--out-dir", outDir]);
 
     const lines = stdout
       .split("\n")
@@ -159,12 +149,7 @@ describe("HCR (Hot Code Reload) validation", () => {
     const workdir = prepareWorkdir();
     const outDir = path.join(tmpDir, "traces");
 
-    const { stdout } = runCLI([
-      "record",
-      workdir,
-      "--out-dir",
-      outDir,
-    ]);
+    const { stdout } = runCLI(["record", workdir, "--out-dir", outDir]);
 
     const lines = stdout
       .split("\n")
@@ -190,12 +175,7 @@ describe("HCR (Hot Code Reload) validation", () => {
     const workdir = prepareWorkdir();
     const outDir = path.join(tmpDir, "traces");
 
-    const { stdout } = runCLI([
-      "record",
-      workdir,
-      "--out-dir",
-      outDir,
-    ]);
+    const { stdout } = runCLI(["record", workdir, "--out-dir", outDir]);
 
     // Extract trace directory from output
     const traceDirMatch = stdout.match(/Trace written to:\s*(.+)/);
@@ -205,18 +185,15 @@ describe("HCR (Hot Code Reload) validation", () => {
 
       // Check for trace.json or .ct files
       const traceJson = path.join(traceDir, "trace.json");
-      const ctFiles = fs
-        .readdirSync(traceDir)
-        .filter((f) => f.endsWith(".ct"));
+      const ctFiles = fs.readdirSync(traceDir).filter((f) => f.endsWith(".ct"));
 
-      const hasTrace =
-        fs.existsSync(traceJson) || ctFiles.length > 0;
+      const hasTrace = fs.existsSync(traceJson) || ctFiles.length > 0;
       expect(hasTrace).toBe(true);
 
       if (fs.existsSync(traceJson)) {
         const trace = JSON.parse(fs.readFileSync(traceJson, "utf-8"));
         // Should have events (array or object with events)
-        const events = Array.isArray(trace) ? trace : trace.events ?? [];
+        const events = Array.isArray(trace) ? trace : (trace.events ?? []);
         expect(events.length).toBeGreaterThan(0);
       }
     }

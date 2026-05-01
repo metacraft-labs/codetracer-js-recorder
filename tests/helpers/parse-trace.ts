@@ -257,15 +257,23 @@ export function parseTraceEvents(
 
       case "Event": {
         // RecordEvent { kind: EventLogKind, metadata, content }
-        // EventLogKind::Write = 0
+        // The JS recorder produces EventLogKind::Write (0) for stdout-style
+        // sinks and EventLogKind::WriteOther (2) for stderr-style sinks.
+        // See crates/recorder_native/src/lib.rs `EventLogKind` and the Python
+        // / Ruby recorder mapping referenced in handoff entry 1.27.  Both
+        // kinds surface as `type: "Write"` for the test API and the original
+        // sink (stdout / stderr) is preserved in the `kind` field so tests
+        // can distinguish them.
         const eventObj = payload as Record<string, unknown>;
         const kindNum = eventObj.kind as number;
-        // Currently only Write events exist
-        if (kindNum === 0) {
-          // Determine stdout/stderr from metadata if available,
-          // otherwise default to "stdout"
+        if (kindNum === 0 || kindNum === 2) {
           const metadata = (eventObj.metadata as string) || "";
-          const writeKind = metadata || "stdout";
+          // Default to stdout for plain Write, stderr for WriteOther, when
+          // metadata happens to be empty.  The recorder always sets metadata
+          // (`stdout` / `stderr` / `log` / `warn` / `error` / `info`), so the
+          // fallback is purely defensive.
+          const fallback = kindNum === 2 ? "stderr" : "stdout";
+          const writeKind = metadata || fallback;
           result.push({
             type: "Write",
             kind: writeKind,

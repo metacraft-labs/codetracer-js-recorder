@@ -25,8 +25,17 @@ const EXAMPLES_DIR = path.join(PROJECT_ROOT, "examples");
 /** CTFS magic bytes: [0xC0, 0xDE, 0x72, 0xAC, 0xE2] */
 const CTFS_MAGIC = Buffer.from([0xc0, 0xde, 0x72, 0xac, 0xe2]);
 
-/** Expected CTFS format version. */
-const CTFS_VERSION = 3;
+/** Expected CTFS format version.
+ *
+ * Tracks `CtfsVersion` in
+ * codetracer-trace-format-nim/src/codetracer_ctfs/types.nim — bump this
+ * when the upstream container format version is incremented.  The Nim
+ * reader at `container.nim::hasValidVersion` accepts the current version
+ * plus one or two prior versions, so the .ct files this recorder writes
+ * remain readable across upstream bumps even before this constant is
+ * updated.
+ */
+const CTFS_VERSION = 4;
 
 /** Expected default block size (4096 as u32 LE). */
 const CTFS_BLOCK_SIZE = 4096;

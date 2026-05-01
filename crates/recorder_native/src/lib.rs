@@ -13,47 +13,16 @@ use std::sync::Mutex;
 // We alias the upstream types to avoid name clashes with the local mirror types.
 use codetracer_trace_writer_nim::{NimTraceWriter, TraceEventsFileFormat as NimTraceFormat};
 
-// ── Stub FFI functions ─────────��───────────────────────────────────────
-//
-// The `codetracer_trace_writer_nim` crate declares `extern "C"` for several
-// Nim C library functions that are not yet implemented in the current Nim
-// library build (CBOR-based compound value registration). Since the Rust
-// compiler generates code for all match arms in `NimTraceWriter` methods
-// that reference these symbols, they show up as undefined in our cdylib
-// even though our code never takes those paths (we convert compound values
-// to Raw before passing them to the writer).
-//
-// These stubs satisfy the linker. If they are ever called due to a bug,
-// they panic immediately with a clear message.
-
-#[no_mangle]
-pub extern "C" fn trace_writer_register_return_cbor(
-    _handle: *mut std::ffi::c_void,
-    _cbor_data: *const u8,
-    _cbor_len: usize,
-) {
-    panic!("trace_writer_register_return_cbor: stub called — compound values should be flattened to Raw before reaching the Nim writer");
-}
-
-#[no_mangle]
-pub extern "C" fn trace_writer_register_variable_cbor(
-    _handle: *mut std::ffi::c_void,
-    _name: *const std::os::raw::c_char,
-    _cbor_data: *const u8,
-    _cbor_len: usize,
-) {
-    panic!("trace_writer_register_variable_cbor: stub called — compound values should be flattened to Raw before reaching the Nim writer");
-}
-
-#[no_mangle]
-pub extern "C" fn ct_value_write_error(
-    _h: *mut std::ffi::c_void,
-    _data: *const u8,
-    _len: usize,
-    _type_id: u64,
-) -> i32 {
-    panic!("ct_value_write_error: stub called — Error values are not produced by the JS recorder");
-}
+// Historical note: this file used to define `#[no_mangle]` stub
+// implementations of `trace_writer_register_return_cbor`,
+// `trace_writer_register_variable_cbor` and `ct_value_write_error` because
+// the upstream Nim library did not yet export those symbols.  They are now
+// real exports of `libcodetracer_trace_writer.a` (see
+// codetracer-trace-format-nim `multi_stream_writer.nim`), so the stubs
+// would collide with the canonical implementations at link time and were
+// removed.  The Nim implementations are the canonical CBOR-encoded value
+// path used by `register_call_arg`, `register_variable_with_full_value`,
+// and `register_return` for compound values.
 
 // ── Manifest types (deserialized from JSON) ─────────────────────────
 
@@ -172,10 +141,17 @@ impl TypeKind {
 }
 
 /// Mirrors `codetracer_trace_types::EventLogKind` — serialized as `repr(u8)`.
+///
+/// Only the variants the JS recorder actually emits are listed.  Discriminants
+/// match the upstream `codetracer_trace_types::EventLogKind` so the JSON
+/// trace's numeric `kind` survives round-tripping through db-backend.
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 enum EventLogKind {
+    /// `Write` — stdout-style program output (console.log / console.info).
     Write = 0,
+    /// `WriteOther` — stderr-style program output (console.warn / console.error).
+    WriteOther = 2,
 }
 
 impl Serialize for EventLogKind {
@@ -856,15 +832,19 @@ pub fn append_events(
             // write (console output) -> Event(RecordEvent)
             3 => {
                 if let Some(write_entry) = write_map.get(&i) {
-                    // Map JS write kinds to EventLogKind
-                    let _kind = match write_entry.kind.as_str() {
-                        "stdout" | "stderr" | "log" | "warn" | "error" | "info" | "debug" => {
-                            EventLogKind::Write
-                        }
+                    // Map JS console-write kinds to EventLogKind.  stdout-style
+                    // sinks (`console.log`, `console.info` — tagged "stdout"
+                    // by io-capture.ts) become `Write`; stderr-style sinks
+                    // (`console.warn`, `console.error` — tagged "stderr")
+                    // become `WriteOther`.  This matches the canonical Python
+                    // / Ruby recorder mapping (see handoff entry 1.27 for the
+                    // Python `register_special_event` pattern).
+                    let kind = match write_entry.kind.as_str() {
+                        "stderr" | "warn" | "error" => EventLogKind::WriteOther,
                         _ => EventLogKind::Write,
                     };
                     state.events.push(TraceEvent::Event(RecordEvent {
-                        kind: EventLogKind::Write,
+                        kind,
                         metadata: write_entry.kind.clone(),
                         content: write_entry.content.clone(),
                     }));
@@ -1087,20 +1067,34 @@ fn write_binary_trace(
                     codetracer_trace_types::Line(func_line),
                 );
 
-                // Convert args
-                let upstream_args: Vec<codetracer_trace_types::FullValueRecord> = cr
-                    .args
-                    .iter()
-                    .map(|a| {
-                        let v = local_value_to_upstream(&a.value, &mut writer);
-                        codetracer_trace_types::FullValueRecord {
-                            variable_id: codetracer_trace_types::VariableId(a.variable_id),
-                            value: v,
-                        }
-                    })
-                    .collect();
+                // Stage each call argument via `writer.arg(name, value)` BEFORE
+                // calling `register_call`.  The Nim multi-stream writer pairs
+                // each `register_call_arg` (which `arg` invokes internally)
+                // with the *next* `register_call` — the staged args are
+                // consumed and cleared from the writer's pending-args buffer.
+                //
+                // Passing `args` as the second positional argument to
+                // `register_call` is a no-op on the Nim backend (the parameter
+                // is named `_args`); the Ruby recorder hit exactly this gap
+                // (handoff entry 1.22).  We resolve the variable_id back into
+                // its registered name so `arg()` can stage a (name, CBOR) pair.
+                for a in &cr.args {
+                    let var_name = state
+                        .var_name_registry
+                        .map
+                        .iter()
+                        .find(|(_, &id)| id == a.variable_id)
+                        .map(|(name, _)| name.clone())
+                        .unwrap_or_else(|| format!("_param{}", a.variable_id));
+                    let v = local_value_to_upstream(&a.value, &mut writer);
+                    // `arg` registers the variable on the current step AND
+                    // stages it for the upcoming call record's args field.
+                    writer.arg(&var_name, v);
+                }
 
-                writer.register_call(fid, upstream_args);
+                // The second parameter is intentionally empty: the Nim writer
+                // consumes the pending-args buffer staged via `arg()` above.
+                writer.register_call(fid, Vec::new());
             }
             TraceEvent::Return(rr) => {
                 let v = local_value_to_upstream(&rr.return_value, &mut writer);
@@ -1124,17 +1118,29 @@ fn write_binary_trace(
                 writer.register_variable_with_full_value(&var_name, v);
             }
             TraceEvent::Event(re) => {
-                // Map local EventLogKind to upstream — the only variant we produce is Write(0).
-                writer.register_special_event(
-                    codetracer_trace_types::EventLogKind::Write,
-                    &re.metadata,
-                    &re.content,
-                );
+                // Map local EventLogKind to upstream.  We produce Write
+                // (stdout) and WriteOther (stderr) — see append_events
+                // case 3 above for the JS console-method classification.
+                let upstream_kind = match re.kind {
+                    EventLogKind::Write => codetracer_trace_types::EventLogKind::Write,
+                    EventLogKind::WriteOther => codetracer_trace_types::EventLogKind::WriteOther,
+                };
+                writer.register_special_event(upstream_kind, &re.metadata, &re.content);
             }
-            TraceEvent::ThreadStart(_)
-            | TraceEvent::ThreadSwitch(_)
-            | TraceEvent::ThreadExit(_) => {
-                // Thread events are not yet supported by the Nim writer — skip.
+            // Thread-lifecycle events route through the dedicated FFI entry
+            // points added in handoff entry 1.30 (codetracer-trace-format-nim
+            // commit bc560ea + codetracer-trace-format commit fa444d8).  The
+            // JS recorder uses async-context tracking (executionAsyncId) to
+            // synthesize per-async-context thread IDs (see
+            // packages/runtime/src/async-context.ts).
+            TraceEvent::ThreadStart(tid) => {
+                writer.register_thread_start(*tid);
+            }
+            TraceEvent::ThreadSwitch(tid) => {
+                writer.register_thread_switch(*tid);
+            }
+            TraceEvent::ThreadExit(tid) => {
+                writer.register_thread_exit(*tid);
             }
         }
     }
