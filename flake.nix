@@ -189,7 +189,10 @@
                   'path = "${codetracer-trace-format}/codetracer_trace_types"' \
                 --replace-fail \
                   'path = "../../../codetracer-trace-format/codetracer_trace_writer_nim"' \
-                  'path = "${codetracer-trace-format}/codetracer_trace_writer_nim"'
+                  'path = "${codetracer-trace-format}/codetracer_trace_writer_nim"' \
+                --replace-fail \
+                  'path = "../../../codetracer-trace-format/codetracer_ctfs"' \
+                  'path = "${codetracer-trace-format}/codetracer_ctfs"'
             '';
 
             buildPhase = ''

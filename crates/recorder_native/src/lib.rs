@@ -13,6 +13,23 @@ use std::sync::Mutex;
 // We alias the upstream types to avoid name clashes with the local mirror types.
 use codetracer_trace_writer_nim::{NimTraceWriter, TraceEventsFileFormat as NimTraceFormat};
 
+#[cfg(test)]
+mod shared_trace_storage_adapter_tests {
+    use codetracer_ctfs::trace_storage::{TraceStorageConfig, TRACE_STORAGE_SCHEMA};
+
+    #[test]
+    fn javascript_recorder_binds_shared_trace_storage_config() {
+        let config = TraceStorageConfig::from_json(include_str!(
+            "../../../../codetracer-trace-format/codetracer_ctfs/tests/fixtures/trace_storage/storage_config.full.json"
+        ))
+        .expect("shared trace-storage fixture parses through codetracer_ctfs");
+
+        assert_eq!(config.schema, TRACE_STORAGE_SCHEMA);
+        assert_eq!(config.storage_servers.len(), 2);
+        assert_eq!(config.retention.delete_after_days, 90);
+    }
+}
+
 // Historical note: this file used to define `#[no_mangle]` stub
 // implementations of `trace_writer_register_return_cbor`,
 // `trace_writer_register_variable_cbor` and `ct_value_write_error` because

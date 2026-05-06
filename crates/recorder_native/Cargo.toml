@@ -18,6 +18,7 @@ serde_json = "1"
 # in the workspace (managed by `repo`).
 codetracer_trace_types = { path = "../../../codetracer-trace-format/codetracer_trace_types" }
 codetracer_trace_writer_nim = { path = "../../../codetracer-trace-format/codetracer_trace_writer_nim" }
+codetracer_ctfs = { path = "../../../codetracer-trace-format/codetracer_ctfs" }
 
 [build-dependencies]
 napi-build = "2"
