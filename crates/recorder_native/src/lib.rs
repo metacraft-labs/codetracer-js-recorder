@@ -1292,6 +1292,23 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
         )
     })?;
 
+    if std::env::var("CODETRACER_MANAGED_UPLOAD_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some()
+    {
+        codetracer_ctfs::trace_storage::upload_materialized_artifacts_from_env(
+            &state.trace_dir,
+            "javascript",
+        )
+        .map_err(|error| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to upload materialized trace: {}", error.message),
+            )
+        })?;
+    }
+
     // Write trace_metadata.json
     let workdir = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
