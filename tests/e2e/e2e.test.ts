@@ -5,8 +5,11 @@ import * as os from "node:os";
 import { execFileSync } from "node:child_process";
 import {
   ctPrintAvailable,
+  ctPrintFull,
   ctPrintJson,
   findCtFile,
+  type CtFullBundle,
+  type CtFullEvent,
   type CtPrintBundle,
 } from "../helpers/ct-print.js";
 
@@ -223,11 +226,39 @@ describe("e2e_record_simple_program", () => {
   });
 
   it("test_recorded_trace_via_ct_print_json", () => {
-    // This test mirrors the cairo precedent (commit 2710b5e) — record a
-    // real program, then convert the produced CTFS bundle through
-    // `ct-print --json` and assert on the textual representation.
-    // See `Recorder-CLI-Conventions.md` §4 — CTFS-only output, with
-    // `ct print` as the canonical conversion tool.
+    // This test mirrors the cairo / cardano / circom / flow / fuel /
+    // leo / miden / move / polkavm / solana / ton (Int round-trip) and
+    // evm (Raw byte) precedents — record a real program, then convert
+    // the produced CTFS bundle through `ct-print` and assert on the
+    // textual representation.  See `Recorder-CLI-Conventions.md` §4 —
+    // CTFS-only output, with `ct print` as the canonical conversion
+    // tool.
+    //
+    // Two layers of assertions:
+    //
+    //   1. **Structural anchors** (legacy `--json` layer): paths /
+    //      functions / steps / ioEvents are present.  This is a safety
+    //      net so a regression in the textual rendering is caught even
+    //      if --full's JSON shape evolves.
+    //
+    //   2. **Exact decoded values** (the layer enabled by
+    //      `ct-print --full`): the canonical fixture `examples/hello.js`
+    //      executes
+    //          function greet(name)            // line 4
+    //            var message = "Hello, " + name + "!";   // line 5
+    //            return message;               // line 6
+    //          var result = greet("World");    // line 9
+    //          console.log(result);            // line 10
+    //      Each binding must surface in the trace as a step / call_entry
+    //      event with a decoded ValueRecord.  In particular:
+    //        - greet's call_entry args carry `name = "World"` decoded
+    //          as `ValueRecord::String { text: "World" }`.
+    //        - greet's call_exit return_value is the concatenated
+    //          string `"Hello, World!"` decoded as `ValueRecord::Raw`
+    //          (the JS recorder snapshots step-level / return values
+    //          using the textual `Raw` form rather than the typed
+    //          `String` variant — this is current recorder behaviour;
+    //          if it changes, the strict invariant below fires).
     if (!ctPrintAvailable()) {
       // Skip when ct-print is not reachable (out-of-workspace CI run).
       // The verify-cli-convention-no-silent-skip.sh guard ensures the
@@ -251,11 +282,12 @@ describe("e2e_record_simple_program", () => {
     const traceDir = traceDirMatch![1].trim();
 
     const ctFile = findCtFile(traceDir);
+
+    // -----------------------------------------------------------------
+    // Layer 1 (legacy): ct-print --json — substring presence checks.
+    // -----------------------------------------------------------------
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
-    // Structural anchors: paths, functions, steps, ioEvents.  We do NOT
-    // assert on exact internal record IDs — those are owned by
-    // codetracer-trace-format-nim and may evolve.
     expect(bundle.paths).toBeDefined();
     expect(bundle.paths!.length).toBeGreaterThanOrEqual(1);
     expect(bundle.paths!.some((p) => p.endsWith("hello.js"))).toBe(true);
@@ -293,6 +325,195 @@ describe("e2e_record_simple_program", () => {
     // Verify files/ directory has source copied
     const filesDir = path.join(traceDir, "files");
     expect(fs.existsSync(filesDir)).toBe(true);
+
+    // -----------------------------------------------------------------
+    // Layer 2 (the upgrade): ct-print --full — exact decoded values.
+    // -----------------------------------------------------------------
+    const full: CtFullBundle = ctPrintFull(ctFile);
+
+    // ----- Function table: <module> + greet ---------------------------
+    expect(full.functions).toContain("<module>");
+    expect(full.functions).toContain("greet");
+
+    // The `greet` function name surfaces as a bare identifier — the JS
+    // recorder does not prefix it with a module path.  Use ends_with to
+    // stay tolerant of any future decorator / namespace prefixing
+    // (mirrors the cairo `::compute` / `::main` precedent).
+    expect(full.functions.some((f) => f.endsWith("greet"))).toBe(true);
+    expect(full.functions.some((f) => f.endsWith("<module>"))).toBe(true);
+
+    // ----- Path table: the canonical fixture path must appear ---------
+    // Node.js path equivalent of cairo's `ends_with(".cairo")` —
+    // assert the bundle records `examples/hello.js` somewhere.
+    expect(full.paths.some((p) => p.endsWith("examples/hello.js"))).toBe(true);
+
+    // ----- Step / call counts -----------------------------------------
+    // hello.js produces a stable number of recorder events:
+    //   - 7 step events (1 thread-start synthetic, 1 module prologue,
+    //     1 line 4 (greet entry), 1 line 9 (greet body), 1 line 5
+    //     (return), 1 line 6 (post-call), 1 line 10 (console.log))
+    //   - 2 call entries (synthetic <module> wrapper + greet)
+    //   - 1 io event (the console.log("Hello, World!") write to stdout)
+    // These are stable properties of the canonical fixture under the
+    // current JS recorder — if they change, that's a real regression
+    // to investigate, not a flake.
+    expect(full.counts.steps).toBe(7);
+    expect(full.counts.calls).toBe(2);
+    expect(full.counts.io_events).toBe(1);
+
+    // ----- Call sequence: <module> first, then greet ------------------
+    const callSequence: string[] = full.events
+      .filter(
+        (e): e is Extract<CtFullEvent, { kind: "call_entry" }> =>
+          e.kind === "call_entry",
+      )
+      .map((e) => e.function);
+    expect(callSequence).toHaveLength(2);
+    // The synthetic <module> frame is always entered first (it wraps
+    // every JS program the recorder instruments).
+    expect(callSequence[0].endsWith("<module>")).toBe(true);
+    expect(callSequence[1].endsWith("greet")).toBe(true);
+
+    // ----- Strict ValueRecord variant invariant -----------------------
+    // Every step var / call arg / return value that surfaces must carry
+    // a `value.kind` field.  For the JS recorder today, values decode
+    // as one of: String / Raw / Int / Bool / Float / None / Void /
+    // Sequence / Struct.  We don't pin a single kind globally because
+    // the JS recorder uses `String` for typed string args (call_entry)
+    // but the textual `Raw` form for step-var snapshots and return
+    // values — both are valid current behaviour.  Instead we assert
+    // that EVERY value belongs to the expected, finite set of kinds.
+    // If a brand-new variant appears (e.g. BigInt support lands), this
+    // assertion fires loudly so the test author can extend the
+    // exact-value layer rather than silently weakening the check.
+    const allowedKinds = new Set([
+      "Int",
+      "Float",
+      "String",
+      "Bool",
+      "Raw",
+      "None",
+      "Void",
+      "Sequence",
+      "Struct",
+    ]);
+    for (const ev of full.events) {
+      if (ev.kind === "step") {
+        for (const v of ev.vars) {
+          expect(
+            allowedKinds.has(v.value.kind),
+            `step ${ev.step_index} var \`${v.varname}\` has unknown ` +
+              `value.kind=${v.value.kind}; if a new ValueRecord variant ` +
+              `has landed for the JS recorder, extend this test to assert ` +
+              `on it explicitly rather than weakening the check`,
+          ).toBe(true);
+        }
+      } else if (ev.kind === "call_entry") {
+        for (const a of ev.args) {
+          expect(
+            allowedKinds.has(a.value.kind),
+            `call_entry to \`${ev.function}\` arg \`${a.varname}\` has ` +
+              `unknown value.kind=${a.value.kind}`,
+          ).toBe(true);
+        }
+      } else if (ev.kind === "call_exit") {
+        expect(
+          allowedKinds.has(ev.return_value.kind),
+          `call_exit from \`${ev.function}\` has unknown ` +
+            `return_value.kind=${ev.return_value.kind}`,
+        ).toBe(true);
+      }
+    }
+
+    // ----- Exact decoded call-arg values ------------------------------
+    // The greet("World") call must surface its `name` argument with
+    // the `String` ValueRecord variant decoded back to the literal
+    // "World".  The JS recorder uses ValueRecord::String for typed
+    // call arguments (ct-print --full decodes it to
+    // `{"kind":"String","text":"World",...}`).  This is the JS
+    // analogue of cairo's `(a, 10)` Int round-trip.
+    const greetCall = full.events.find(
+      (e): e is Extract<CtFullEvent, { kind: "call_entry" }> =>
+        e.kind === "call_entry" && e.function.endsWith("greet"),
+    );
+    expect(greetCall).toBeDefined();
+    const nameArg = greetCall!.args.find((a) => a.varname === "name");
+    expect(nameArg).toBeDefined();
+    expect(nameArg!.value.kind).toBe("String");
+    expect(nameArg!.value.text).toBe("World");
+
+    // ----- Exact decoded return value ---------------------------------
+    // greet("World") returns the concatenated string "Hello, World!".
+    // The JS recorder snapshots return values via ValueRecord::Raw
+    // (textual rendering) — the strict `kind === "Raw"` invariant
+    // means: if a future recorder upgrade emits ValueRecord::String
+    // (or any other variant), this test fails loudly and the next
+    // maintainer extends the assertion to the new variant rather than
+    // silently accepting it.
+    const greetExit = full.events.find(
+      (e): e is Extract<CtFullEvent, { kind: "call_exit" }> =>
+        e.kind === "call_exit" && e.function.endsWith("greet"),
+    );
+    expect(greetExit).toBeDefined();
+    expect(greetExit!.return_value.kind).toBe("Raw");
+    expect(greetExit!.return_value.r).toBe("Hello, World!");
+
+    // ----- Exact (varname, value) step-var pairs ----------------------
+    // Collect every (varname, value-text) pair surfaced by step events.
+    // The JS recorder snapshots `name` inside greet's body at line 9
+    // as `ValueRecord::Raw { r: "World" }` — this is the JS analogue
+    // of the cairo `a=10, b=32, sum_val=42, ...` round-trip.  If a
+    // future recorder upgrade emits ValueRecord::String here instead,
+    // the strict kind invariant above (and the explicit assertion
+    // below) fires loudly.
+    interface StepVarObservation {
+      name: string;
+      kind: string;
+      text: string | undefined;
+    }
+    const observedStepVars: StepVarObservation[] = [];
+    for (const ev of full.events) {
+      if (ev.kind !== "step") continue;
+      for (const v of ev.vars) {
+        observedStepVars.push({
+          name: v.varname,
+          kind: v.value.kind,
+          // Both `String.text` and `Raw.r` carry textual payload — the
+          // recorder picks one or the other.  Accept whichever is
+          // populated so the assertion stays readable.
+          text: v.value.text ?? v.value.r,
+        });
+      }
+    }
+
+    // The canonical (var, kind, value) tuples for hello.js — these
+    // anchor the JS recorder's exact-value contract:
+    //   * `name = "World"` inside greet's body (Raw form).
+    const expectedStepVars: StepVarObservation[] = [
+      { name: "name", kind: "Raw", text: "World" },
+    ];
+    for (const want of expectedStepVars) {
+      const found = observedStepVars.some(
+        (o) =>
+          o.name === want.name && o.kind === want.kind && o.text === want.text,
+      );
+      expect(
+        found,
+        `expected step variable \`${want.name}\` = ${want.kind} ` +
+          `\`${want.text}\` in --full output; observed = ` +
+          JSON.stringify(observedStepVars),
+      ).toBe(true);
+    }
+
+    // ----- IO event: console.log("Hello, World!") --------------------
+    // The single io event must be a stdout write of "Hello, World!".
+    const ioEvents = full.events.filter(
+      (e): e is Extract<CtFullEvent, { kind: "io" }> => e.kind === "io",
+    );
+    expect(ioEvents).toHaveLength(1);
+    expect(ioEvents[0].io_kind).toBe("ioStdout");
+    expect(ioEvents[0].text).toBe("Hello, World!");
+    expect(ioEvents[0].bytes_len).toBe("Hello, World!".length);
   });
 
   it("recorded CTFS trace contains Call frames for greet + module", () => {
