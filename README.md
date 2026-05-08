@@ -123,3 +123,37 @@ record.
 
 [cli-conventions]: ../codetracer-specs/Recorder-CLI-Conventions.md
 [trace-format-nim]: ../codetracer-trace-format-nim
+
+## Direct-storage upload (Enterprise on-prem)
+
+For Enterprise on-prem deployments, the recorder produces a
+materialized CTFS bundle on the local filesystem and a separate
+`codetracer-managed-upload direct-materialized-finalize` invocation
+PUTs it directly to the customer's storage server, then posts a
+metadata-only finalize to codetracer-ci. Trace bytes never traverse
+the codetracer-ci control plane.
+
+After the recorder produces the materialized artifact set:
+
+```bash
+codetracer-managed-upload direct-materialized-finalize \
+  --storage-config /etc/codetracer/trace-storage.json \
+  --recording-id "${SESSION_ID}" \
+  --object-key-prefix "traces/${TENANT_ID}/${SESSION_ID}/javascript-direct" \
+  --idempotency-key "${SESSION_ID}-javascript" \
+  --artifact-dir "${RECORDER_OUT_DIR}" \
+  --language javascript
+```
+
+The full data-path overview, the static-config schema, and the
+Enterprise lease lifecycle are documented at
+[`codetracer-specs/Observability-Platform/docs/direct-storage-data-path.md`](../codetracer-specs/Observability-Platform/docs/direct-storage-data-path.md).
+The HTTP endpoint reference is at
+[`codetracer-ci/rewrite-docs/04-apis-events/http-api.md`](../codetracer-ci/rewrite-docs/04-apis-events/http-api.md)
+section 4.10.
+
+End-to-end coverage:
+`StoragePolicyModelTests.e2e_js_recorder_materialized_direct_upload_with_static_config`
+(M38 slice 5C) and the M39 NixOS test
+`codetracer-ci-rewrite-multitenant-infra-materialized-recorders-incus`
+(live recorder running inside an Incus container per tenant).
