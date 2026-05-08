@@ -5,6 +5,13 @@ alias fmt := format
 test:
     npm run build
     npm test
+    just verify-cli-convention
+
+# Verify CLI convention compliance (Recorder-CLI-Conventions.md §4 / §5).
+# This is a no-silent-skip shell guard — every assertion either passes
+# or fails loudly.  Wired into both `just lint` and `just test`.
+verify-cli-convention:
+    bash tests/verify-cli-convention-no-silent-skip.sh
 
 # Build the Rust native addon via napi-rs
 build-native:
@@ -51,6 +58,7 @@ lint:
     just lint-rust
     just lint-js
     just lint-nix
+    just verify-cli-convention
 
 # Bump version across all package.json files (usage: just bump-version 0.2.0)
 bump-version version:

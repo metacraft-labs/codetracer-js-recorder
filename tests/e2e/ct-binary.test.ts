@@ -1,11 +1,13 @@
 /**
- * Tests for .ct binary output produced alongside JSON traces.
+ * Tests for the canonical CTFS multi-stream `.ct` output.
  *
- * The JS recorder now writes both JSON and binary .ct output for every
- * recording. These tests verify:
+ * The JS recorder is CTFS-only per
+ * `codetracer-specs/Recorder-CLI-Conventions.md` §4 — there is no
+ * `--format` flag, no `CODETRACER_FORMAT` env var, and no JSON events
+ * sidecar.  These tests verify:
  *   - A .ct file is produced when recording a simple JS program
  *   - The .ct file has valid CTFS magic bytes (0xC0 0xDE 0x72 0xAC 0xE2)
- *   - The .ct file has the expected CTFS version (3)
+ *   - The .ct file has the expected CTFS version
  *   - The .ct file has the expected block size (4096)
  *
  * See: Trace-Files/CTFS-Container-Format.md in codetracer-specs for the
@@ -105,7 +107,7 @@ describe("ct binary output", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("recording produces at least one .ct file alongside JSON output", () => {
+  it("recording produces at least one .ct file (CTFS-only output)", () => {
     const outDir = path.join(tmpDir, "traces");
     const stdout = runCLI([
       "record",
@@ -116,8 +118,9 @@ describe("ct binary output", () => {
 
     const traceDir = extractTraceDir(stdout);
 
-    // JSON files should exist (backward compat)
-    expect(fs.existsSync(path.join(traceDir, "trace.json"))).toBe(true);
+    // The recorder is CTFS-only — the legacy `trace.json` events sidecar
+    // must NOT be written (Recorder-CLI-Conventions.md §4).
+    expect(fs.existsSync(path.join(traceDir, "trace.json"))).toBe(false);
 
     // At least one .ct file should exist. The name is derived from the
     // program (e.g. "hello.ct" from "hello.js").
@@ -169,32 +172,37 @@ describe("ct binary output", () => {
     expect(blockSize).toBe(CTFS_BLOCK_SIZE);
   });
 
-  it(".ct file is produced even with explicit --format json", () => {
+  it("--format flag is rejected (CTFS-only contract, §4)", () => {
+    // Pre-2026-05-08 the recorder accepted `--format json|binary` and
+    // wrote both formats.  The convention now mandates CTFS-only output;
+    // `--format` must be rejected loudly so accidental use of legacy
+    // invocations fails fast rather than silently being interpreted.
     const outDir = path.join(tmpDir, "traces");
-    const stdout = runCLI([
-      "record",
-      path.join(EXAMPLES_DIR, "hello.js"),
-      "--out-dir",
-      outDir,
-      "--format",
-      "json",
-    ]);
-
-    const traceDir = extractTraceDir(stdout);
-
-    // Even with --format json, the binary .ct is produced as secondary output
-    const ctFiles = findCtFiles(traceDir);
-    expect(ctFiles.length).toBeGreaterThanOrEqual(1);
-
-    // Verify magic bytes on the first .ct file found
-    const header = Buffer.alloc(5);
-    const fd = fs.openSync(ctFiles[0], "r");
+    let exitCode: number | undefined;
+    let stderr = "";
     try {
-      fs.readSync(fd, header, 0, 5, 0);
-    } finally {
-      fs.closeSync(fd);
+      execFileSync(
+        process.execPath,
+        [
+          CLI_PATH,
+          "record",
+          path.join(EXAMPLES_DIR, "hello.js"),
+          "--out-dir",
+          outDir,
+          "--format",
+          "json",
+        ],
+        { cwd: PROJECT_ROOT, encoding: "utf-8", timeout: 30000 },
+      );
+      exitCode = 0;
+    } catch (err: unknown) {
+      const e = err as { status?: number; stderr?: string };
+      exitCode = e.status;
+      stderr = e.stderr ?? "";
     }
-    expect(header.equals(CTFS_MAGIC)).toBe(true);
+
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain("--format");
   });
 
   it("functions.js recording also produces .ct output with valid magic", () => {

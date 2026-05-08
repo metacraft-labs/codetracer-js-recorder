@@ -17,7 +17,12 @@ import {
 } from "@codetracer/runtime";
 import type { TraceManifest } from "@codetracer/runtime";
 import { instrument } from "@codetracer/instrumenter";
-import { parseTraceEvents } from "../helpers/parse-trace.js";
+import {
+  ctPrintAvailable,
+  ctPrintJson,
+  findCtFile,
+  type CtPrintBundle,
+} from "../helpers/ct-print.js";
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
 const EXAMPLES_DIR = path.join(PROJECT_ROOT, "examples");
@@ -235,35 +240,32 @@ var r5 = work(200);
       expect(traceDirMatch).not.toBeNull();
       const traceDir = traceDirMatch![1].trim();
 
-      // Read trace and measure
-      const traceJsonPath = path.join(traceDir, "trace.json");
-      const traceContent = fs.readFileSync(traceJsonPath, "utf-8");
-      const traceEvents = parseTraceEvents(JSON.parse(traceContent));
+      // Measure the produced CTFS bundle.
+      if (!ctPrintAvailable()) {
+        console.warn("SKIP benchmark size analysis: ct-print not found");
+        return;
+      }
+      const ctFile = findCtFile(traceDir);
+      const bundle = ctPrintJson(ctFile) as CtPrintBundle;
+      const stepEvents = (bundle.steps ?? []).length;
+      const ctSize = fs.statSync(ctFile).size;
 
-      const totalEvents = traceEvents.length;
-      const stepEvents = traceEvents.filter(
-        (e: { type: string }) => e.type === "Step",
-      ).length;
-      const callEvents = traceEvents.filter(
-        (e: { type: string }) => e.type === "Call",
-      ).length;
-      const returnEvents = traceEvents.filter(
-        (e: { type: string }) => e.type === "Return",
-      ).length;
-      const traceSize = Buffer.byteLength(traceContent, "utf-8");
-
-      console.log(`\n--- Trace Size Benchmark ---`);
-      console.log(`  Total events: ${totalEvents}`);
+      console.log(`\n--- Trace Size Benchmark (CTFS) ---`);
       console.log(`  Step events: ${stepEvents}`);
-      console.log(`  Call events: ${callEvents}`);
-      console.log(`  Return events: ${returnEvents}`);
-      console.log(`  trace.json size: ${(traceSize / 1024).toFixed(1)} KB`);
-      console.log(`  Bytes per event: ${(traceSize / totalEvents).toFixed(1)}`);
+      console.log(`  Functions: ${(bundle.functions ?? []).length}`);
+      console.log(`  Values: ${(bundle.values ?? []).length}`);
+      console.log(`  .ct container size: ${(ctSize / 1024).toFixed(1)} KB`);
+      if (stepEvents > 0) {
+        console.log(`  Bytes per step: ${(ctSize / stepEvents).toFixed(1)}`);
+      }
 
       // Sanity checks
       expect(stepEvents).toBeGreaterThan(500); // Should have many step events
-      expect(callEvents).toBeGreaterThanOrEqual(6); // 5 work() + 1 <module>
-      expect(callEvents).toBe(returnEvents); // Balanced calls/returns
+      // Cannot assert call/return balance without a CTFS reader at this
+      // layer; the structural anchor of a well-populated container with
+      // many steps + functions is the strongest claim we can make
+      // through ct-print's public surface.
+      expect((bundle.functions ?? []).length).toBeGreaterThanOrEqual(2);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

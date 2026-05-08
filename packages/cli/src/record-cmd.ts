@@ -1,7 +1,7 @@
 /**
  * CLI `record` command implementation.
  *
- * Usage: codetracer-js-recorder record <file> [--out-dir <dir>] [--format json|binary] [-- app-args...]
+ * Usage: codetracer-js-recorder record <file> [-o|--out-dir <dir>] [-- app-args...]
  *
  * 1. Instruments the entry file (and directory siblings if entry is a dir).
  * 2. Creates a temp directory with:
@@ -10,6 +10,18 @@
  *    - __ct_runner.js — a bootstrap script that sets up the runtime + addon
  * 3. Executes __ct_runner.js with Node.js as a child process.
  * 4. Reports the trace directory path on completion.
+ *
+ * The recorder always writes the canonical CTFS multi-stream container into
+ * --out-dir.  There is no `--format` flag and no `CODETRACER_FORMAT` env
+ * var — see codetracer-specs/Recorder-CLI-Conventions.md §4.  For
+ * human-readable conversion of the produced bundle, use `ct print` from
+ * codetracer-trace-format-nim.
+ *
+ * Environment variables (per Recorder-CLI-Conventions.md §5):
+ *   CODETRACER_JS_RECORDER_OUT_DIR    Fallback for --out-dir.
+ *   CODETRACER_JS_RECORDER_DISABLED   When set to "1" / "true", skip recording
+ *                                     entirely and exit 0 without running the
+ *                                     target program.
  */
 
 import * as fs from "node:fs";
@@ -127,18 +139,25 @@ function mergeManifestSlices(
 
 /**
  * Parse command-line arguments for the record command.
+ *
+ * Output-directory resolution order (per Recorder-CLI-Conventions.md §5):
+ *   1. `--out-dir` / `-o` CLI flag (highest precedence)
+ *   2. `CODETRACER_JS_RECORDER_OUT_DIR` env var
+ *   3. `./ct-traces/` (default)
+ *
+ * Unknown flags (including the now-removed `--format`) are rejected with a
+ * "unexpected argument" diagnostic so accidental use of legacy invocations
+ * fails loudly rather than silently being interpreted as the entry file.
  */
 function parseArgs(args: string[]): {
   entryFile: string;
   outDir: string;
-  format: string;
   appArgs: string[];
   include: string[];
   exclude: string[];
 } {
   let entryFile: string | undefined;
-  let outDir = "./ct-traces/";
-  let format = "binary";
+  let outDirFromFlag: string | undefined;
   const appArgs: string[] = [];
   const include: string[] = [];
   const exclude: string[] = [];
@@ -157,21 +176,44 @@ function parseArgs(args: string[]): {
       continue;
     }
 
-    if (arg === "--out-dir" && i + 1 < args.length) {
-      outDir = args[++i];
-    } else if (arg === "--format" && i + 1 < args.length) {
-      format = args[++i];
+    if ((arg === "--out-dir" || arg === "-o") && i + 1 < args.length) {
+      outDirFromFlag = args[++i];
     } else if (arg === "--include" && i + 1 < args.length) {
       include.push(args[++i]);
     } else if (arg === "--exclude" && i + 1 < args.length) {
       exclude.push(args[++i]);
     } else if (arg === "--help" || arg === "-h") {
+      // Per Recorder-CLI-Conventions.md §4 the recorder is CTFS-only:
+      // there is no `--format` flag and no `CODETRACER_FORMAT` env var.
+      // Use `ct print` from codetracer-trace-format-nim to convert the
+      // produced .ct bundle to JSON / text.
       console.log(
-        `Usage: codetracer-js-recorder record <file> [--out-dir <dir>] [--format json|binary] [--include <glob>] [--exclude <glob>] [-- app-args...]`,
+        `Usage: codetracer-js-recorder record <file> [-o|--out-dir <dir>] [--include <glob>] [--exclude <glob>] [-- app-args...]
+
+Options:
+  -o, --out-dir <dir>     Trace output directory (default: ./ct-traces/)
+  --include <glob>        Include glob pattern (repeatable)
+  --exclude <glob>        Exclude glob pattern (repeatable)
+
+Environment variables:
+  CODETRACER_JS_RECORDER_OUT_DIR    Output directory (overridden by --out-dir)
+  CODETRACER_JS_RECORDER_DISABLED   Set to "true" / "1" to disable recording
+
+The recorder always writes the canonical CTFS multi-stream container.
+Use 'ct print' from codetracer-trace-format-nim for human-readable
+JSON / text conversion of the produced bundle.`,
       );
       process.exit(0);
     } else if (!entryFile && !arg.startsWith("-")) {
       entryFile = arg;
+    } else if (arg.startsWith("-")) {
+      // Reject unknown flags loudly — protects the CTFS-only contract by
+      // preventing the legacy `--format` from being silently consumed as
+      // the positional <file> argument.
+      console.error(
+        `Error: unexpected argument '${arg}' (use --help for usage).`,
+      );
+      process.exit(2);
     }
   }
 
@@ -180,7 +222,13 @@ function parseArgs(args: string[]): {
     process.exit(1);
   }
 
-  return { entryFile: entryFile!, outDir, format, appArgs, include, exclude };
+  // Resolve --out-dir with env-var fallback per convention §5.
+  const envOutDir = process.env.CODETRACER_JS_RECORDER_OUT_DIR;
+  const outDir =
+    outDirFromFlag ??
+    (envOutDir && envOutDir.length > 0 ? envOutDir : "./ct-traces/");
+
+  return { entryFile: entryFile!, outDir, appArgs, include, exclude };
 }
 
 /**
@@ -201,11 +249,12 @@ function generateRunner(opts: {
   outDir: string;
   program: string;
   appArgs: string[];
-  format: string;
 }): string {
   // Escape paths for embedding in JS strings (handle backslashes on Windows)
   const esc = (s: string) => JSON.stringify(s);
 
+  // The recorder always writes CTFS — no `format` parameter is passed to
+  // the addon (see Recorder-CLI-Conventions.md §4).
   return `// Auto-generated CodeTracer runner script.
 // This file is created by "codetracer-js-recorder record" and is not meant to be edited.
 "use strict";
@@ -224,7 +273,6 @@ var handle = addon.startRecording({
   program: ${esc(opts.program)},
   args: ${JSON.stringify(opts.appArgs)},
   manifestJson: manifestJson,
-  format: ${esc(opts.format)},
 });
 
 // Deep value encoding with depth/circular/size limits
@@ -475,11 +523,56 @@ require(${esc(opts.instrumentedEntry)});
 }
 
 /**
+ * Returns true when CODETRACER_JS_RECORDER_DISABLED is set to a truthy
+ * value ("1" or "true", case-insensitive).  Per
+ * Recorder-CLI-Conventions.md §5 this skips trace emission entirely
+ * but still runs the target program (so a CI pipeline that opts out of
+ * recording still sees the program's exit code and stdout/stderr —
+ * mirrors the Python / Ruby runtime-disable semantics).  We achieve
+ * that by spawning the target via `node` directly without
+ * instrumentation, rather than going through the instrument →
+ * runner-script pipeline.
+ */
+function recordingDisabledByEnv(): boolean {
+  const v = process.env.CODETRACER_JS_RECORDER_DISABLED;
+  if (!v) return false;
+  const lc = v.toLowerCase();
+  return lc === "1" || lc === "true";
+}
+
+/**
  * Entry point for the `record` command.
  */
 export function recordCommand(args: string[]): void {
-  const { entryFile, outDir, format, appArgs, include, exclude } =
-    parseArgs(args);
+  const { entryFile, outDir, appArgs, include, exclude } = parseArgs(args);
+
+  if (recordingDisabledByEnv()) {
+    // §5: when recording is disabled via env, the recorder must not
+    // write any trace artefacts but should still run the target
+    // program (so CI pipelines that opt out still see the program's
+    // exit code, stdout and stderr).  We bypass the instrument →
+    // runner-script pipeline and exec the program directly via Node,
+    // mirroring `node <entry> <appArgs...>`.
+    const directPath = path.resolve(entryFile);
+    if (!fs.existsSync(directPath)) {
+      console.error(`Error: entry file '${directPath}' does not exist.`);
+      process.exit(1);
+    }
+    process.stderr.write(
+      "[codetracer-js-recorder] recording disabled by CODETRACER_JS_RECORDER_DISABLED — running target without instrumentation\n",
+    );
+    try {
+      execFileSync(process.execPath, [directPath, ...appArgs], {
+        stdio: "inherit",
+        cwd: process.cwd(),
+        env: process.env,
+      });
+      process.exit(0);
+    } catch (err: unknown) {
+      const exitErr = err as { status?: number };
+      process.exit(exitErr.status ?? 0);
+    }
+  }
 
   const entryPath = path.resolve(entryFile);
   if (!fs.existsSync(entryPath)) {
@@ -596,7 +689,6 @@ export function recordCommand(args: string[]): void {
       outDir: traceOutDir,
       program: path.resolve(mainEntry),
       appArgs,
-      format,
     });
 
     const runnerPath = path.join(tmpDir, "__ct_runner.js");

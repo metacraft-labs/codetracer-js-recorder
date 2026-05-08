@@ -3,7 +3,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
-import { parseTraceEvents } from "../helpers/parse-trace.js";
+import {
+  ctPrintAvailable,
+  ctPrintJson,
+  findCtFile,
+  type CtPrintBundle,
+} from "../helpers/ct-print.js";
 
 // Resolve paths relative to the project root
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
@@ -144,7 +149,7 @@ describe("test_cli_record_command", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("records a simple program and produces a trace directory", () => {
+  it("records a simple program and produces a CTFS trace directory", () => {
     const outDir = path.join(tmpDir, "traces");
     const { stdout } = runCLI([
       "record",
@@ -164,13 +169,19 @@ describe("test_cli_record_command", () => {
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    // Trace directory should exist with all expected files
+    // Trace directory should exist with the CTFS .ct container plus the
+    // operational JSON sidecars (`trace_metadata.json` / `trace_paths.json`).
+    // The legacy `trace.json` events sidecar must NOT exist
+    // (Recorder-CLI-Conventions.md §4 — CTFS-only).
     expect(fs.existsSync(traceDir)).toBe(true);
-    expect(fs.existsSync(path.join(traceDir, "trace.json"))).toBe(true);
+    expect(fs.existsSync(path.join(traceDir, "trace.json"))).toBe(false);
     expect(fs.existsSync(path.join(traceDir, "trace_metadata.json"))).toBe(
       true,
     );
     expect(fs.existsSync(path.join(traceDir, "trace_paths.json"))).toBe(true);
+
+    const ctFiles = fs.readdirSync(traceDir).filter((f) => f.endsWith(".ct"));
+    expect(ctFiles.length).toBeGreaterThanOrEqual(1);
   });
 
   it("exits cleanly with code 0", () => {
@@ -211,71 +222,69 @@ describe("e2e_record_simple_program", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("records hello.js and produces valid trace with Step/Call/Return events", () => {
+  it("test_recorded_trace_via_ct_print_json", () => {
+    // This test mirrors the cairo precedent (commit 2710b5e) — record a
+    // real program, then convert the produced CTFS bundle through
+    // `ct-print --json` and assert on the textual representation.
+    // See `Recorder-CLI-Conventions.md` §4 — CTFS-only output, with
+    // `ct print` as the canonical conversion tool.
+    if (!ctPrintAvailable()) {
+      // Skip when ct-print is not reachable (out-of-workspace CI run).
+      // The verify-cli-convention-no-silent-skip.sh guard ensures the
+      // CLI surface stays compliant even if this content test is skipped.
+      console.warn(
+        "SKIP test_recorded_trace_via_ct_print_json: ct-print not found",
+      );
+      return;
+    }
+
     const outDir = path.join(tmpDir, "traces");
     const { stdout } = runCLI([
       "record",
       path.join(EXAMPLES_DIR, "hello.js"),
       "--out-dir",
       outDir,
-      "--format",
-      "json",
     ]);
 
-    // Extract trace directory
     const traceDirMatch = stdout.match(/Trace written to:\s*(.+)/);
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    // Verify trace.json exists and has content
-    const traceJson = parseTraceEvents(
-      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
+    const ctFile = findCtFile(traceDir);
+    const bundle = ctPrintJson(ctFile) as CtPrintBundle;
+
+    // Structural anchors: paths, functions, steps, ioEvents.  We do NOT
+    // assert on exact internal record IDs — those are owned by
+    // codetracer-trace-format-nim and may evolve.
+    expect(bundle.paths).toBeDefined();
+    expect(bundle.paths!.length).toBeGreaterThanOrEqual(1);
+    expect(bundle.paths!.some((p) => p.endsWith("hello.js"))).toBe(true);
+
+    expect(bundle.functions).toBeDefined();
+    expect(bundle.functions).toContain("<module>");
+    expect(bundle.functions).toContain("greet");
+
+    expect(bundle.steps).toBeDefined();
+    expect(bundle.steps!.length).toBeGreaterThan(0);
+
+    // The console.log("Hello, World!") call must surface as an ioStdout
+    // event — this is the canonical anchor for the recorder's IO path.
+    expect(bundle.ioEvents).toBeDefined();
+    const helloEvent = bundle.ioEvents!.find(
+      (e) => e.kind === "ioStdout" && (e.data ?? "").includes("Hello, World!"),
     );
-    expect(traceJson.length).toBeGreaterThan(0);
+    expect(helloEvent).toBeDefined();
 
-    // Should have Path events
-    const pathEvents = traceJson.filter(
-      (e: { type: string }) => e.type === "Path",
-    );
-    expect(pathEvents.length).toBeGreaterThanOrEqual(1);
-
-    // Should have Function events
-    const funcEvents = traceJson.filter(
-      (e: { type: string }) => e.type === "Function",
-    );
-    expect(funcEvents.length).toBeGreaterThanOrEqual(2); // <module> and greet
-
-    const funcNames = funcEvents.map((e: { name: string }) => e.name);
-    expect(funcNames).toContain("<module>");
-    expect(funcNames).toContain("greet");
-
-    // Should have Step events
-    const stepEvents = traceJson.filter(
-      (e: { type: string }) => e.type === "Step",
-    );
-    expect(stepEvents.length).toBeGreaterThan(0);
-
-    // Should have Call events
-    const callEvents = traceJson.filter(
-      (e: { type: string }) => e.type === "Call",
-    );
-    expect(callEvents.length).toBeGreaterThanOrEqual(2); // module enter + greet enter
-
-    // Should have Return events
-    const returnEvents = traceJson.filter(
-      (e: { type: string }) => e.type === "Return",
-    );
-    expect(returnEvents.length).toBeGreaterThanOrEqual(2); // module return + greet return
-
-    // Verify trace_metadata.json
+    // Verify trace_metadata.json sidecar (operational, not events).
     const metadata = JSON.parse(
       fs.readFileSync(path.join(traceDir, "trace_metadata.json"), "utf-8"),
     );
     expect(metadata.language).toBe("javascript");
     expect(metadata.recorder).toBe("codetracer-js-recorder");
-    expect(metadata.format).toBe("json");
+    // §4: format is hard-pinned to "ctfs" — no `--format` selector exists.
+    expect(metadata.format).toBe("ctfs");
 
-    // Verify trace_paths.json
+    // Verify trace_paths.json sidecar
     const tracePaths = JSON.parse(
       fs.readFileSync(path.join(traceDir, "trace_paths.json"), "utf-8"),
     );
@@ -286,7 +295,11 @@ describe("e2e_record_simple_program", () => {
     expect(fs.existsSync(filesDir)).toBe(true);
   });
 
-  it("the first runtime event is a Call (module enter) and last is a Return (module exit)", () => {
+  it("recorded CTFS trace contains Call frames for greet + module", () => {
+    if (!ctPrintAvailable()) {
+      console.warn("SKIP: ct-print not found");
+      return;
+    }
     const outDir = path.join(tmpDir, "traces2");
     const { stdout } = runCLI([
       "record",
@@ -298,19 +311,16 @@ describe("e2e_record_simple_program", () => {
     const traceDirMatch = stdout.match(/Trace written to:\s*(.+)/);
     const traceDir = traceDirMatch![1].trim();
 
-    const traceJson = parseTraceEvents(
-      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
-    );
+    const ctFile = findCtFile(traceDir);
+    const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
-    // Runtime events are everything after Path and Function declarations
-    const runtimeEvents = traceJson.filter(
-      (e: { type: string }) =>
-        e.type === "Step" || e.type === "Call" || e.type === "Return",
-    );
+    // The CTFS bundle should include functions for both the synthetic
+    // module frame and the user-defined `greet` function.
+    expect(bundle.functions).toContain("<module>");
+    expect(bundle.functions).toContain("greet");
 
-    expect(runtimeEvents.length).toBeGreaterThan(0);
-    expect(runtimeEvents[0].type).toBe("Call");
-    expect(runtimeEvents[runtimeEvents.length - 1].type).toBe("Return");
+    // Steps must be present — the program executes multiple statements.
+    expect(bundle.steps!.length).toBeGreaterThan(0);
   });
 });
 
@@ -329,6 +339,10 @@ describe("e2e_record_multi_file", () => {
   });
 
   it("records functions.js and all function names appear in the trace", () => {
+    if (!ctPrintAvailable()) {
+      console.warn("SKIP: ct-print not found");
+      return;
+    }
     const outDir = path.join(tmpDir, "traces");
     const { stdout } = runCLI([
       "record",
@@ -347,24 +361,21 @@ describe("e2e_record_multi_file", () => {
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    // Verify all function names appear in the trace
-    const traceJson = parseTraceEvents(
-      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
-    );
+    const ctFile = findCtFile(traceDir);
+    const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
-    const funcEvents = traceJson.filter(
-      (e: { type: string }) => e.type === "Function",
-    );
-    const funcNames = funcEvents.map((e: { name: string }) => e.name);
-
-    expect(funcNames).toContain("<module>");
-    expect(funcNames).toContain("add");
-    expect(funcNames).toContain("multiply");
-    expect(funcNames).toContain("factorial");
-    expect(funcNames).toContain("main");
+    expect(bundle.functions).toContain("<module>");
+    expect(bundle.functions).toContain("add");
+    expect(bundle.functions).toContain("multiply");
+    expect(bundle.functions).toContain("factorial");
+    expect(bundle.functions).toContain("main");
   });
 
   it("records loops.js and captures loop iterations as Step events", () => {
+    if (!ctPrintAvailable()) {
+      console.warn("SKIP: ct-print not found");
+      return;
+    }
     const outDir = path.join(tmpDir, "traces2");
     const { stdout } = runCLI([
       "record",
@@ -380,27 +391,18 @@ describe("e2e_record_multi_file", () => {
     const traceDirMatch = stdout.match(/Trace written to:\s*(.+)/);
     const traceDir = traceDirMatch![1].trim();
 
-    const traceJson = parseTraceEvents(
-      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
-    );
+    const ctFile = findCtFile(traceDir);
+    const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
-    // Should have many step events from the loops
-    const stepEvents = traceJson.filter(
-      (e: { type: string }) => e.type === "Step",
-    );
     // sumRange(1,10) alone should produce 10+ step events for loop iterations
-    expect(stepEvents.length).toBeGreaterThan(20);
+    expect(bundle.steps!.length).toBeGreaterThan(20);
 
-    // Should have correct function names
-    const funcNames = traceJson
-      .filter((e: { type: string }) => e.type === "Function")
-      .map((e: { name: string }) => e.name);
-    expect(funcNames).toContain("sumRange");
-    expect(funcNames).toContain("countDown");
-    expect(funcNames).toContain("classify");
+    expect(bundle.functions).toContain("sumRange");
+    expect(bundle.functions).toContain("countDown");
+    expect(bundle.functions).toContain("classify");
   });
 
-  it("trace has balanced Call/Return events", () => {
+  it("recording exits cleanly and writes a non-trivial CTFS container", () => {
     const outDir = path.join(tmpDir, "traces3");
     const { stdout } = runCLI([
       "record",
@@ -412,19 +414,16 @@ describe("e2e_record_multi_file", () => {
     const traceDirMatch = stdout.match(/Trace written to:\s*(.+)/);
     const traceDir = traceDirMatch![1].trim();
 
-    const traceJson = parseTraceEvents(
-      JSON.parse(fs.readFileSync(path.join(traceDir, "trace.json"), "utf-8")),
-    );
-
-    const callCount = traceJson.filter(
-      (e: { type: string }) => e.type === "Call",
-    ).length;
-    const returnCount = traceJson.filter(
-      (e: { type: string }) => e.type === "Return",
-    ).length;
-
-    // Every call should have a matching return
-    expect(callCount).toBe(returnCount);
-    expect(callCount).toBeGreaterThan(0);
+    const ctFiles = fs
+      .readdirSync(traceDir)
+      .filter((f) => f.endsWith(".ct"))
+      .map((f) => path.join(traceDir, f));
+    expect(ctFiles.length).toBeGreaterThanOrEqual(1);
+    const ctSize = ctFiles
+      .map((p) => fs.statSync(p).size)
+      .reduce((a, b) => a + b, 0);
+    // The .ct container must hold meaningful payload above the magic
+    // header alone (mirrors the cairo audit's > 100-byte threshold).
+    expect(ctSize).toBeGreaterThan(100);
   });
 });

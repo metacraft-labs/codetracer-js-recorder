@@ -27,13 +27,18 @@ if (command === "--version" || command === "-V") {
 }
 
 if (!command || command === "--help" || command === "-h") {
+  // The recorder always writes the canonical CTFS multi-stream container.
+  // There is no `--format` flag and no `CODETRACER_FORMAT` env var — see
+  // codetracer-specs/Recorder-CLI-Conventions.md §4.  For human-readable
+  // conversion of the produced `.ct` bundle, use `ct print` shipped with
+  // codetracer-trace-format-nim.
   console.log(`Usage:
   codetracer-js-recorder instrument <src> --out <dir>
   codetracer-js-recorder record <file> [-- app-args...]
 
 Commands:
   instrument    Instrument source files and write to output directory
-  record        Instrument and run a program, producing a trace
+  record        Instrument and run a program, producing a CTFS trace
 
 Instrument options:
   --out <dir>             Output directory for instrumented files (required)
@@ -42,12 +47,20 @@ Instrument options:
   --exclude <glob>        Exclude glob pattern (repeatable)
 
 Record options:
-  --out-dir <dir>         Trace output directory (default: ./ct-traces/)
-  --format json|binary    Trace format (default: binary)
+  -o, --out-dir <dir>     Trace output directory (default: ./ct-traces/)
   --include <glob>        Include glob pattern (repeatable)
   --exclude <glob>        Exclude glob pattern (repeatable)
   --help                  Show this help message
-  --version               Print version and exit`);
+  --version               Print version and exit
+
+Environment variables:
+  CODETRACER_JS_RECORDER_OUT_DIR    Output directory (overridden by --out-dir)
+  CODETRACER_JS_RECORDER_DISABLED   Set to "true" / "1" to disable recording
+
+Output:
+  The recorder always writes the canonical CTFS multi-stream container
+  (.ct files) into --out-dir.  Use 'ct print' from codetracer-trace-format-nim
+  for human-readable JSON / text conversion of the recorded bundle.`);
   process.exit(0);
 }
 

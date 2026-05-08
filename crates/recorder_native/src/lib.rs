@@ -387,6 +387,11 @@ enum TraceEvent {
 }
 
 // ── Trace metadata ──────────────────────────────────────────────────
+//
+// Operational sidecar consumed by the `ct` CLI to register the recorded
+// trace.  The recorder is CTFS-only (Recorder-CLI-Conventions.md §4) so
+// `format` is fixed to "ctfs" — there is no `--format` flag and no
+// `CODETRACER_FORMAT` env var.
 
 #[derive(Debug, Clone, Serialize)]
 struct TraceMetadata {
@@ -394,6 +399,7 @@ struct TraceMetadata {
     program: String,
     args: Vec<String>,
     recorder: String,
+    /// Always "ctfs" — recorder is CTFS-only per §4.
     format: String,
     workdir: String,
 }
@@ -482,7 +488,6 @@ struct RecorderState {
     events: Vec<TraceEvent>,
     program: String,
     args: Vec<String>,
-    format: String,
     type_registry: TypeRegistry,
     var_name_registry: VariableNameRegistry,
 }
@@ -695,11 +700,8 @@ pub fn start_recording(opts: JsObject) -> Result<u32> {
         .into_utf8()?
         .as_str()?
         .to_string();
-    let format: String = opts
-        .get_named_property::<napi::JsString>("format")?
-        .into_utf8()?
-        .as_str()?
-        .to_string();
+    // The recorder is CTFS-only (Recorder-CLI-Conventions.md §4) — there is
+    // no `format` parameter on the addon's `startRecording` call.
 
     // Parse manifest
     let manifest: Manifest = serde_json::from_str(&manifest_json).map_err(|e| {
@@ -769,7 +771,6 @@ pub fn start_recording(opts: JsObject) -> Result<u32> {
         events,
         program,
         args,
-        format,
         type_registry,
         var_name_registry,
     };
@@ -1070,19 +1071,20 @@ fn local_value_to_upstream(
 }
 
 /// Replay the collected `TraceEvent` list through a `NimTraceWriter` to
-/// produce a binary trace in the given output directory.
+/// produce a CTFS multi-stream `.ct` container in the given output
+/// directory.
 ///
 /// This writes three stream files (metadata, events, paths) plus the
-/// final `.ct` container via `writer.close()`.
+/// final `.ct` container via `writer.close()`.  The writer is hard-pinned
+/// to `NimTraceFormat::Binary` (the underlying Nim writer treats this as
+/// CTFS — see `codetracer_trace_writer_nim/src/lib.rs:297`).  Per
+/// `Recorder-CLI-Conventions.md` §4 the recorder is CTFS-only — there is
+/// no JSON output dispatch.
 fn write_binary_trace(
     state: &RecorderState,
     trace_dir: &Path,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let format = match state.format.as_str() {
-        "json" => NimTraceFormat::Json,
-        _ => NimTraceFormat::Binary,
-    };
-    let mut writer = NimTraceWriter::new(&state.program, format);
+    let mut writer = NimTraceWriter::new(&state.program, NimTraceFormat::Binary);
 
     // Set the working directory for the trace metadata.
     let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1267,28 +1269,18 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
         )
     })?;
 
-    // Write binary trace via the Nim-backed writer.
-    // This must happen before the JSON metadata construction below because
-    // that step moves fields out of `state`.
-    if let Err(e) = write_binary_trace(&state, &state.trace_dir.clone()) {
-        // Binary trace writing is best-effort during the transition period.
-        // Log the error but continue to produce JSON output for backward
-        // compatibility.
-        eprintln!("[codetracer-js-recorder] warning: failed to write binary trace: {e}");
-    }
-
-    // Write trace.json (kept for backward compatibility during the transition
-    // to binary .ct output).
-    let trace_json = serde_json::to_string_pretty(&state.events).map_err(|e| {
+    // Write the canonical CTFS multi-stream `.ct` container via the
+    // Nim-backed writer.  This is the only on-disk shape produced by the
+    // recorder per Recorder-CLI-Conventions.md §4 — the legacy
+    // `trace.json` events sidecar (kept during the binary-output
+    // transition) was removed on 2026-05-08 along with the `--format` /
+    // `CODETRACER_FORMAT` surface area.  Use `ct print` from
+    // `codetracer-trace-format-nim` to convert the produced `.ct` bundle
+    // to JSON / text.
+    write_binary_trace(&state, &state.trace_dir.clone()).map_err(|e| {
         Error::new(
             Status::GenericFailure,
-            format!("Failed to serialize trace events: {e}"),
-        )
-    })?;
-    fs::write(state.trace_dir.join("trace.json"), &trace_json).map_err(|e| {
-        Error::new(
-            Status::GenericFailure,
-            format!("Failed to write trace.json: {e}"),
+            format!("Failed to write CTFS trace: {e}"),
         )
     })?;
 
@@ -1318,7 +1310,8 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
         program: state.program,
         args: state.args,
         recorder: "codetracer-js-recorder".to_string(),
-        format: state.format,
+        // Hard-pinned: recorder is CTFS-only per §4.
+        format: "ctfs".to_string(),
         workdir,
     };
     let metadata_json = serde_json::to_string_pretty(&metadata).map_err(|e| {

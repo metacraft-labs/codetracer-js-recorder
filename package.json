@@ -10,8 +10,9 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "vitest run && npm run test:verify-cli-convention",
+    "test:watch": "vitest",
+    "test:verify-cli-convention": "bash tests/verify-cli-convention-no-silent-skip.sh"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.5.1",

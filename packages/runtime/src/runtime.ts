@@ -347,7 +347,12 @@ const _require = createRequire(__filename);
 
 // ── Native addon interface ──────────────────────────────────────────
 
-/** Shape of the Rust N-API addon exports. */
+/**
+ * Shape of the Rust N-API addon exports.
+ *
+ * Per `codetracer-specs/Recorder-CLI-Conventions.md` §4 the addon is
+ * CTFS-only — there is no `format` parameter on `startRecording`.
+ */
 export interface NativeAddon {
   version(): string;
   startRecording(opts: {
@@ -355,7 +360,6 @@ export interface NativeAddon {
     program: string;
     args: string[];
     manifestJson: string;
-    format: string;
   }): number;
   appendEvents(
     handle: number,
@@ -379,8 +383,6 @@ export interface StartRecordingOptions {
   program: string;
   /** Program arguments. */
   args?: string[];
-  /** Trace format: "binary" or "json". */
-  format?: "binary" | "json";
   /** When true, do NOT register process.on('exit') for auto flush+stop. */
   skipProcessHooks?: boolean;
 }
@@ -669,7 +671,6 @@ export function startRecording(
     outDir,
     program,
     args = [],
-    format = "json",
     skipProcessHooks = false,
   } = opts;
 
@@ -700,7 +701,6 @@ export function startRecording(
       program,
       args,
       manifestJson,
-      format,
     });
   } catch (err) {
     process.stderr.write(
