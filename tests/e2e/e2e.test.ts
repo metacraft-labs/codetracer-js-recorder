@@ -172,16 +172,18 @@ describe("test_cli_record_command", () => {
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    // Trace directory should exist with the CTFS .ct container plus the
-    // operational JSON sidecars (`trace_metadata.json` / `trace_paths.json`).
-    // The legacy `trace.json` events sidecar must NOT exist
-    // (Recorder-CLI-Conventions.md §4 — CTFS-only).
+    // Trace directory should exist with the CTFS .ct container.  Legacy
+    // `trace.json` events sidecar must NOT exist (Recorder-CLI-
+    // Conventions.md §4 — CTFS-only).  Legacy `trace_metadata.json` and
+    // `trace_paths.json` operational sidecars were retired with the v3
+    // CTFS rollout (follow-up #254 phase 2); program / paths metadata
+    // now lives in `meta.dat` inside the `.ct` container.
     expect(fs.existsSync(traceDir)).toBe(true);
     expect(fs.existsSync(path.join(traceDir, "trace.json"))).toBe(false);
     expect(fs.existsSync(path.join(traceDir, "trace_metadata.json"))).toBe(
-      true,
+      false,
     );
-    expect(fs.existsSync(path.join(traceDir, "trace_paths.json"))).toBe(true);
+    expect(fs.existsSync(path.join(traceDir, "trace_paths.json"))).toBe(false);
 
     const ctFiles = fs.readdirSync(traceDir).filter((f) => f.endsWith(".ct"));
     expect(ctFiles.length).toBeGreaterThanOrEqual(1);
@@ -307,20 +309,11 @@ describe("e2e_record_simple_program", () => {
     );
     expect(helloEvent).toBeDefined();
 
-    // Verify trace_metadata.json sidecar (operational, not events).
-    const metadata = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace_metadata.json"), "utf-8"),
-    );
-    expect(metadata.language).toBe("javascript");
-    expect(metadata.recorder).toBe("codetracer-js-recorder");
-    // §4: format is hard-pinned to "ctfs" — no `--format` selector exists.
-    expect(metadata.format).toBe("ctfs");
-
-    // Verify trace_paths.json sidecar
-    const tracePaths = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace_paths.json"), "utf-8"),
-    );
-    expect(tracePaths.length).toBeGreaterThanOrEqual(1);
+    // Legacy `trace_metadata.json` and `trace_paths.json` operational
+    // sidecars were retired with the v3 CTFS rollout (follow-up #254
+    // phase 2); program / paths metadata now lives in `meta.dat`
+    // inside the `.ct` container and is asserted via the ct-print
+    // bundle below (`full.functions`, `full.paths`).
 
     // Verify files/ directory has source copied
     const filesDir = path.join(traceDir, "files");

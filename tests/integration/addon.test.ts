@@ -92,22 +92,34 @@ describe("test_addon_start_recording", () => {
     expect(typeof session.stop).toBe("function");
 
     // The trace directory should exist with the canonical CTFS .ct
-    // container plus operational JSON sidecars.  The legacy `trace.json`
-    // events sidecar must NOT exist (Recorder-CLI-Conventions.md §4 —
-    // CTFS-only).
+    // container.  The legacy `trace.json` events sidecar must NOT exist
+    // (Recorder-CLI-Conventions.md §4 — CTFS-only).  The legacy
+    // `trace_metadata.json` / `trace_paths.json` operational sidecars
+    // were retired with the v3 CTFS rollout (follow-up #254 phase 2);
+    // program / paths metadata now lives in `meta.dat` inside the `.ct`
+    // container.
     const traceDir = session.stop();
     expect(fs.existsSync(traceDir)).toBe(true);
     expect(fs.existsSync(path.join(traceDir, "trace.json"))).toBe(false);
     expect(fs.existsSync(path.join(traceDir, "trace_metadata.json"))).toBe(
-      true,
+      false,
     );
-    expect(fs.existsSync(path.join(traceDir, "trace_paths.json"))).toBe(true);
+    expect(fs.existsSync(path.join(traceDir, "trace_paths.json"))).toBe(false);
     const ctFiles = fs.readdirSync(traceDir).filter((f) => f.endsWith(".ct"));
     expect(ctFiles.length).toBeGreaterThanOrEqual(1);
   });
 
-  it("writes correct trace_metadata.json", () => {
-    const manifest = makeManifest();
+  // Legacy `trace_metadata.json` and `trace_paths.json` operational
+  // sidecars were retired with the v3 CTFS rollout (follow-up #254 phase
+  // 2).  The original tests that asserted on their content via JSON
+  // parsing have been removed; equivalent metadata is now embedded in
+  // `meta.dat` inside the `.ct` container and should be asserted via
+  // ct-print / the Nim reader.  Stop running the manifest-bound recorder
+  // setup so the suite still exercises the underlying record/stop path.
+  it("starts and stops the recorder without writing JSON sidecars", () => {
+    const manifest = makeManifest({
+      paths: ["src/main.js", "src/utils.js", "lib/helpers.js"],
+    });
     const manifestPath = writeManifest(tmpDir, manifest);
 
     const rt = createRuntime({
@@ -128,47 +140,11 @@ describe("test_addon_start_recording", () => {
     });
 
     const traceDir = session.stop();
-
-    const metadata = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace_metadata.json"), "utf-8"),
+    expect(fs.existsSync(traceDir)).toBe(true);
+    expect(fs.existsSync(path.join(traceDir, "trace_metadata.json"))).toBe(
+      false,
     );
-    expect(metadata.language).toBe("javascript");
-    expect(metadata.program).toBe("my-app.js");
-    expect(metadata.args).toEqual(["--verbose", "input.txt"]);
-    expect(metadata.recorder).toBe("codetracer-js-recorder");
-    // §4: format is hard-pinned to "ctfs" — no `--format` selector exists.
-    expect(metadata.format).toBe("ctfs");
-  });
-
-  it("writes correct trace_paths.json from manifest", () => {
-    const manifest = makeManifest({
-      paths: ["src/main.js", "src/utils.js", "lib/helpers.js"],
-    });
-    const manifestPath = writeManifest(tmpDir, manifest);
-
-    const rt = createRuntime({
-      bufferCapacity: 1024,
-      skipProcessHooks: true,
-    });
-    rt.init(manifestPath);
-
-    const outDir = path.join(tmpDir, "traces");
-
-    const session = startRecording({
-      runtime: rt,
-      addonPath: ADDON_PATH,
-      outDir,
-      program: "app.js",
-      args: [],
-      skipProcessHooks: true,
-    });
-
-    const traceDir = session.stop();
-
-    const paths = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace_paths.json"), "utf-8"),
-    );
-    expect(paths).toEqual(["src/main.js", "src/utils.js", "lib/helpers.js"]);
+    expect(fs.existsSync(path.join(traceDir, "trace_paths.json"))).toBe(false);
   });
 });
 
@@ -450,19 +426,11 @@ greet("World");
     expect(bundle.steps).toBeDefined();
     expect(bundle.steps!.length).toBeGreaterThan(0);
 
-    // Verify trace_metadata.json sidecar.
-    const metadata = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace_metadata.json"), "utf-8"),
-    );
-    expect(metadata.language).toBe("javascript");
-    expect(metadata.program).toBe(filename);
-    expect(metadata.recorder).toBe("codetracer-js-recorder");
-    expect(metadata.format).toBe("ctfs");
-
-    // Verify trace_paths.json sidecar.
-    const tracePaths = JSON.parse(
-      fs.readFileSync(path.join(traceDir, "trace_paths.json"), "utf-8"),
-    );
-    expect(tracePaths).toEqual(manifest.paths);
+    // Legacy `trace_metadata.json` and `trace_paths.json` operational
+    // sidecars were retired with the v3 CTFS rollout (follow-up #254
+    // phase 2); program / paths metadata now lives in `meta.dat`
+    // inside the `.ct` container and should be asserted via ct-print
+    // / the Nim reader.
+    const _ = { traceDir, manifest };
   });
 });

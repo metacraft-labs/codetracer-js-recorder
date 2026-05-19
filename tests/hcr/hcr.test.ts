@@ -271,14 +271,15 @@ describe("HCR trace content assertions", () => {
     expect(bundle.steps!.length).toBeGreaterThan(0);
 
     // The legacy `trace.json` events sidecar must NOT exist (CTFS-only).
+    // The legacy `trace_metadata.json` / `trace_paths.json` operational
+    // sidecars were retired with the v3 CTFS rollout (follow-up #254
+    // phase 2); program / paths metadata now lives in `meta.dat`
+    // inside the `.ct` container.
     expect(fs.existsSync(path.join(traceDir, "trace.json"))).toBe(false);
-
-    // Should also have trace_metadata.json sidecar (operational only).
-    const metadataPath = path.join(traceDir, "trace_metadata.json");
-    expect(fs.existsSync(metadataPath)).toBe(true);
-    const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf-8"));
-    expect(metadata.language).toBe("javascript");
-    expect(metadata.format).toBe("ctfs");
+    expect(fs.existsSync(path.join(traceDir, "trace_metadata.json"))).toBe(
+      false,
+    );
+    expect(fs.existsSync(path.join(traceDir, "trace_paths.json"))).toBe(false);
   });
 
   it("trace contains Step events from the HCR program", () => {

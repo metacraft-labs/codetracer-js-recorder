@@ -386,23 +386,9 @@ enum TraceEvent {
     ThreadExit(u64),
 }
 
-// ── Trace metadata ──────────────────────────────────────────────────
-//
-// Operational sidecar consumed by the `ct` CLI to register the recorded
-// trace.  The recorder is CTFS-only (Recorder-CLI-Conventions.md §4) so
-// `format` is fixed to "ctfs" — there is no `--format` flag and no
-// `CODETRACER_FORMAT` env var.
-
-#[derive(Debug, Clone, Serialize)]
-struct TraceMetadata {
-    language: String,
-    program: String,
-    args: Vec<String>,
-    recorder: String,
-    /// Always "ctfs" — recorder is CTFS-only per §4.
-    format: String,
-    workdir: String,
-}
+// Trace metadata previously serialised to `trace_metadata.json` is now
+// embedded in `meta.dat` by the CTFS writer; the sidecar struct was
+// retired with the v3 rollout.
 
 // ── Type registry ───────────────────────────────────────────────────
 
@@ -487,6 +473,9 @@ struct RecorderState {
     manifest: Manifest,
     events: Vec<TraceEvent>,
     program: String,
+    /// Original command-line arguments.  Kept for diagnostic purposes;
+    /// the trace itself ships argv through the CTFS `meta.dat` block.
+    #[allow(dead_code)]
     args: Vec<String>,
     type_registry: TypeRegistry,
     var_name_registry: VariableNameRegistry,
@@ -1090,10 +1079,10 @@ fn write_binary_trace(
     let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     writer.set_workdir(&workdir);
 
-    // Begin writing the three streams.
-    writer.begin_writing_trace_metadata(&trace_dir.join("trace_metadata.ct"))?;
+    // Begin writing the events stream — the Nim multi-stream writer
+    // derives the `.ct` container path from the events path and emits
+    // metadata + paths streams into the container on close.
     writer.begin_writing_trace_events(&trace_dir.join("trace.ct"))?;
-    writer.begin_writing_trace_paths(&trace_dir.join("trace_paths.ct"))?;
 
     // We need to track whether we've called `start()` yet — the Nim writer
     // requires a `start()` call before registering steps/calls.
@@ -1245,8 +1234,6 @@ fn write_binary_trace(
 
     // Finish writing streams and close the writer to produce the final output.
     writer.finish_writing_trace_events()?;
-    writer.finish_writing_trace_metadata()?;
-    writer.finish_writing_trace_paths()?;
 
     // Write binary meta.dat
     writer.write_meta_dat("codetracer-js-recorder")?;
@@ -1301,45 +1288,9 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
         })?;
     }
 
-    // Write trace_metadata.json
-    let workdir = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let metadata = TraceMetadata {
-        language: "javascript".to_string(),
-        program: state.program,
-        args: state.args,
-        recorder: "codetracer-js-recorder".to_string(),
-        // Hard-pinned: recorder is CTFS-only per §4.
-        format: "ctfs".to_string(),
-        workdir,
-    };
-    let metadata_json = serde_json::to_string_pretty(&metadata).map_err(|e| {
-        Error::new(
-            Status::GenericFailure,
-            format!("Failed to serialize metadata: {e}"),
-        )
-    })?;
-    fs::write(state.trace_dir.join("trace_metadata.json"), &metadata_json).map_err(|e| {
-        Error::new(
-            Status::GenericFailure,
-            format!("Failed to write trace_metadata.json: {e}"),
-        )
-    })?;
-
-    // Write trace_paths.json
-    let paths_json = serde_json::to_string_pretty(&state.manifest.paths).map_err(|e| {
-        Error::new(
-            Status::GenericFailure,
-            format!("Failed to serialize paths: {e}"),
-        )
-    })?;
-    fs::write(state.trace_dir.join("trace_paths.json"), &paths_json).map_err(|e| {
-        Error::new(
-            Status::GenericFailure,
-            format!("Failed to write trace_paths.json: {e}"),
-        )
-    })?;
+    // trace_metadata.json and trace_paths.json sidecars retired with the
+    // v3 CTFS rollout — that information now lives in `meta.dat` inside
+    // the `.ct` container produced by `write_binary_trace` above.
 
     // Copy source files to files/ directory
     let files_dir = state.trace_dir.join("files");
