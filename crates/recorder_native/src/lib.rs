@@ -1306,8 +1306,11 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
         // Strip leading '/' from absolute paths so join() doesn't replace the base.
         let relative = source_path.strip_prefix('/').unwrap_or(source_path);
         // On Windows, also strip leading drive letters like "D:\" so join() works.
+        // Drop the whole "X:" prefix (2 chars): dropping only the letter
+        // would leave ":\path", an invalid Windows path component, which
+        // makes the subsequent fs::copy silently fail.
         let relative = relative
-            .get(1..)
+            .get(2..)
             .filter(|_| relative.as_bytes().get(1) == Some(&b':'))
             .map(|s| {
                 s.strip_prefix('\\')

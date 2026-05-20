@@ -319,11 +319,19 @@ describe("test_addon_source_file_copying", () => {
     const filesDir = path.join(traceDir, "files");
     expect(fs.existsSync(filesDir)).toBe(true);
 
-    // Both source files should be copied (absolute paths have leading / stripped)
-    const stripLeadingSlash = (p: string) =>
-      p.startsWith("/") ? p.slice(1) : p;
-    const copiedMain = path.join(filesDir, stripLeadingSlash(mainPath));
-    const copiedUtil = path.join(filesDir, stripLeadingSlash(utilPath));
+    // Both source files should be copied. The recorder maps an absolute
+    // source path into files/ by stripping the leading '/' and, on Windows,
+    // the drive-letter prefix ("D:\\..." becomes "..."). Mirror that here
+    // (see recorder_native/src/lib.rs, "Copy source files to files/").
+    const toTraceRelative = (p: string) => {
+      let rel = p.startsWith("/") ? p.slice(1) : p;
+      if (rel.length > 1 && rel[1] === ":") {
+        rel = rel.slice(2).replace(/^[\\/]/, "");
+      }
+      return rel;
+    };
+    const copiedMain = path.join(filesDir, toTraceRelative(mainPath));
+    const copiedUtil = path.join(filesDir, toTraceRelative(utilPath));
     expect(fs.existsSync(copiedMain)).toBe(true);
     expect(fs.existsSync(copiedUtil)).toBe(true);
 
