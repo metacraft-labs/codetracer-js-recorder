@@ -1,0 +1,70 @@
+name: launcher-integration
+
+# Single-edge cross-repo CI: when codetracer-js-recorder changes,
+# verify the launcher's bundled-tarball build still works against
+# this recorder's source. Mirrors the pattern in
+# codetracer-specs/Testing/Cross-Repo-CI-Integration.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  npm-bundling:
+    runs-on: ubuntu-latest
+    name: npm bundling smoke-test
+    steps:
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - uses: actions/checkout@v4
+        with:
+          path: codetracer-js-recorder
+
+      - uses: metacraft-labs/metacraft-github-actions/clone-repo@main
+        with:
+          repo: metacraft-labs/codetracer-launcher
+          ref: main
+          path: codetracer-launcher
+          gh-token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.4"
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build launcher
+        working-directory: codetracer-launcher
+        run: bash ./build.sh --target linux-musl-x86_64 --out launcher
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build bundled tarball
+        working-directory: codetracer-launcher/packaging/npm
+        env:
+          CT_LAUNCHER_VERSION: 0.1.0
+          CT_LAUNCHER_BIN: ${{ github.workspace }}/codetracer-launcher/out/launcher
+          CT_LAUNCHER_TARGET: linux-musl-x86_64
+          CT_RECORDER_SRC: ${{ github.workspace }}/codetracer-js-recorder/packages
+        run: node build_npm.mjs
+
+      - name: Smoke-test the tarball
+        run: |
+          mkdir -p /tmp/m9-npm && cd /tmp/m9-npm
+          npm init -y > /dev/null
+          npm install --no-save "${GITHUB_WORKSPACE}/codetracer-launcher/packaging/npm/dist"/*.tgz
+          out=$(./node_modules/.bin/ct --version)
+          echo "$out"
+          echo "$out" | grep -qE "^ct [0-9]+\.[0-9]+"
