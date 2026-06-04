@@ -1,6 +1,7 @@
 {
   "name": "codetracer-js-recorder",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "private": true,
   "description": "CodeTracer JavaScript/TypeScript recorder — full-state recording via compile-time SWC instrumentation",
   "workspaces": [
