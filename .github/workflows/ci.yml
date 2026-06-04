@@ -10,6 +10,14 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
       - uses: actions/checkout@v4
 
       - uses: cachix/install-nix-action@v30
@@ -30,7 +38,7 @@ jobs:
             PIN="$(grep '^codetracer-trace-format ' "${PINS}" | cut -d' ' -f2)" || true
             [ -n "${PIN}" ] && TF_REF="${PIN}"
           fi
-          TOKEN="${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}"
+          TOKEN="${{ steps.app-token.outputs.token }}"
           if [ -n "${TOKEN}" ]; then
             CLONE_URL="https://x-access-token:${TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git"
           else
@@ -55,7 +63,7 @@ jobs:
             PIN="$(grep '^codetracer-trace-format-nim ' "${PINS}" | cut -d' ' -f2)" || true
             [ -n "${PIN}" ] && TFN_REF="${PIN}"
           fi
-          TOKEN="${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}"
+          TOKEN="${{ steps.app-token.outputs.token }}"
           if [ -n "${TOKEN}" ]; then
             CLONE_URL="https://x-access-token:${TOKEN}@github.com/metacraft-labs/codetracer-trace-format-nim.git"
           else
