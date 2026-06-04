@@ -1,0 +1,73 @@
+name: publish-npm
+
+# Publishes codetracer-js-recorder to npm. Fires on `v*` tag pushes
+# (the primary release path) and also accepts a manual
+# workflow_dispatch (the fallback for manually re-running a single
+# channel after a transient registry outage, per
+# Repo-Requirements.md §2.8.4).
+#
+# Required secrets:
+#   NPM_TOKEN          npm access token with publish permission on
+#                      the `codetracer-js-recorder` package.
+#
+# When NPM_TOKEN is unset the workflow performs a dry-run (npm pack
+# + verification only) without publishing.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semver to publish (overrides tag for manual runs)'
+        required: true
+        default: '0.1.0'
+      dry_run:
+        description: 'Build the tarball but skip the upload'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: ver
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: extractions/setup-just@v2
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: just build
+
+      - name: Verify package
+        run: |
+          npm pack --dry-run
+
+      - name: Publish to npm
+        if: ${{ github.event_name == 'push' || inputs.dry_run != true }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [[ -z "$NODE_AUTH_TOKEN" ]]; then
+            echo "::warning::NPM_TOKEN not set; skipping publish (dry-run)."
+            exit 0
+          fi
+          npm publish --access public

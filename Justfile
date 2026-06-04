@@ -60,11 +60,82 @@ lint:
     just lint-nix
     just verify-cli-convention
 
-# Bump version across all package.json files (usage: just bump-version 0.2.0)
+# Bump version across all package.json files
+# (usage: just bump-version 0.2.0  or  just bump-version patch / minor / major)
 bump-version version:
+    #!/usr/bin/env python3
+    import json, re, sys
+    from pathlib import Path
+    raw = "{{version}}"
+    pkgs = [Path(p) for p in [
+        "package.json",
+        "packages/cli/package.json",
+        "packages/instrumenter/package.json",
+        "packages/runtime/package.json",
+    ] if Path(p).exists()]
+    if not pkgs:
+        sys.exit("no package.json found")
+    cur = json.loads(pkgs[0].read_text()).get("version", "0.1.0")
+    if re.match(r"^\d+\.\d+\.\d+$", raw):
+        new = raw
+    else:
+        a, b, p = map(int, cur.split("."))
+        if raw == "major": new = f"{a+1}.0.0"
+        elif raw == "minor": new = f"{a}.{b+1}.0"
+        elif raw == "patch": new = f"{a}.{b}.{p+1}"
+        else: sys.exit(f"unknown bump component: {raw!r}")
+    for f in pkgs:
+        data = json.loads(f.read_text())
+        data["version"] = new
+        f.write_text(json.dumps(data, indent=2) + "\n")
+        print(f"{f} -> {new}")
+
+# --- M13: Packaging UX Standardization ---
+# Implements Repo-Requirements.md §2.8 packaging UX for the JS
+# language-ecosystem recorder. Single channel: npm.
+
+# Build a release artifact for the given channel.
+# Supported channels: npm
+build-package channel:
     #!/usr/bin/env bash
     set -euo pipefail
-    for f in package.json packages/cli/package.json packages/instrumenter/package.json packages/runtime/package.json; do
-        node -e "const fs=require('fs'); const p=JSON.parse(fs.readFileSync('$f','utf8')); p.version='{{version}}'; fs.writeFileSync('$f',JSON.stringify(p,null,2)+'\n');"
-        echo "$f → {{version}}"
-    done
+    case "{{channel}}" in
+        npm)
+            just build
+            npm pack --pack-destination dist
+            ;;
+        *)
+            echo "::error::unknown channel '{{channel}}'. JS recorder only supports 'npm'." >&2
+            exit 1
+            ;;
+    esac
+
+# Verify the artifact produced by `build-package <channel>`.
+verify-package channel:
+    #!/usr/bin/env python3
+    import os, sys, tarfile
+    from pathlib import Path
+    ch = "{{channel}}"
+    strict = os.environ.get("CT_VERIFY_STRICT") == "1"
+    if ch != "npm":
+        print(f"::error::unknown channel {ch!r}; JS recorder only supports 'npm'")
+        sys.exit(1)
+    dist = Path("dist")
+    tgzs = list(dist.glob("*.tgz")) if dist.exists() else []
+    if not tgzs:
+        print(f"[verify] no .tgz in {dist} — run `just build-package npm` first")
+        sys.exit(0 if not strict else 1)
+    for t in tgzs:
+        with tarfile.open(t, "r:gz") as tf:
+            names = tf.getnames()
+        if not any(n.endswith("package.json") for n in names):
+            print(f"::error::tgz {t.name} missing package.json")
+            sys.exit(1)
+        print(f"[verify] tgz {t.name} OK")
+
+# Per-channel shortcut.
+build-npm:
+    just build-package npm
+
+verify-npm:
+    just verify-package npm
