@@ -279,21 +279,46 @@ function classifyAssignmentRhs(rhs: Expression): AssignmentRValue {
         computed?: boolean;
       };
       const obj = me.object as unknown as { type: string; value?: string };
+      // SWC MemberExpression carries no `computed` flag when it is a
+      // plain `obj.field` access; computed access lands as
+      // `property.type === "Computed"` instead.  Be defensive and
+      // accept both shapes.
+      const propType = me.property?.type;
       if (obj.type === "Identifier" && obj.value) {
-        // Static field access: `obj.field` (or `obj["field"]`).
-        if (
-          !me.computed &&
-          me.property.type === "Identifier" &&
-          me.property.value
-        ) {
+        // Static field access: `obj.field`.
+        if (propType === "Identifier" && me.property.value) {
           return {
             kind: "FieldAccess",
             source: obj.value,
             field: me.property.value,
           };
         }
-        // Static integer index: `arr[42]`.
-        if (me.computed && me.property.type === "NumericLiteral") {
+        // Computed access (M16b): `arr[42]` or `obj["field"]`.
+        if (propType === "Computed") {
+          const inner = (me.property as unknown as { expression: Expression })
+            .expression;
+          const innerT = (inner as { type: string }).type;
+          if (innerT === "NumericLiteral") {
+            const idx = (inner as unknown as { value: number }).value;
+            if (Number.isInteger(idx)) {
+              return {
+                kind: "IndexAccess",
+                source: obj.value,
+                index: idx,
+              };
+            }
+          }
+          if (innerT === "StringLiteral") {
+            const field = (inner as unknown as { value: string }).value;
+            return {
+              kind: "FieldAccess",
+              source: obj.value,
+              field,
+            };
+          }
+        }
+        // Legacy `me.computed === true` shape (some older SWC builds).
+        if (me.computed && propType === "NumericLiteral") {
           const idx = (me.property as unknown as { value: number }).value;
           if (Number.isInteger(idx)) {
             return {
@@ -308,9 +333,29 @@ function classifyAssignmentRhs(rhs: Expression): AssignmentRValue {
     }
     case "CallExpression":
     case "NewExpression":
-    case "OptionalChainingExpression":
     case "TaggedTemplateExpression":
       return { kind: "FunctionReturn" };
+    case "OptionalChainingExpression": {
+      // M16b: `x = obj?.field` — desugars to a guarded MemberExpression.
+      // We classify the underlying base shape so the chain still surfaces
+      // as `FieldAccess` (or `IndexAccess` / `FunctionReturn`) when the
+      // guard does not fire.  The runtime sees `undefined` for the
+      // short-circuit case which the db-backend correlates against the
+      // emitted `RValue` via the value snapshot.
+      const oce = rhs as unknown as { base: Expression };
+      return classifyAssignmentRhs(oce.base);
+    }
+    case "BinaryExpression": {
+      // M16b: nullish coalescing (`a ?? b`) and logical assignment shorts
+      // (`a || b`, `a && b`) carry two dependencies.  The M14 vocabulary
+      // surfaces this as `Compound` — the precise per-branch
+      // classification is left to the db-backend (it observes the
+      // post-store value snapshot which tells it which branch was
+      // taken).
+      const be = rhs as unknown as { operator: string };
+      void be;
+      return { kind: "Compound" };
+    }
     case "ParenthesisExpression": {
       const pe = rhs as unknown as { expression: Expression };
       return classifyAssignmentRhs(pe.expression);
@@ -331,8 +376,8 @@ function classifyAssignmentRhs(rhs: Expression): AssignmentRValue {
 /**
  * Extract the target identifier from a simple LHS pattern.
  * Returns `null` if the pattern is destructured / computed / not
- * a single bare identifier (those shapes are M16b territory and
- * the visitor falls back to no write-site emission for them).
+ * a single bare identifier (those shapes are handled by
+ * `collectDestructuringWriteSites` per the M16b deliverables).
  */
 function extractAssignmentTarget(pat: unknown): string | null {
   if (!pat || typeof pat !== "object") return null;
@@ -341,6 +386,273 @@ function extractAssignmentTarget(pat: unknown): string | null {
     return p.value;
   }
   return null;
+}
+
+// ---------- M16b: destructuring pattern decomposition ----------
+
+/**
+ * A single per-element write produced by a destructuring pattern.
+ *
+ * The recorder lowers `const { a, b } = obj;` into two
+ * `__ct.write(siteId)` calls, one per unpacked element.  Each call
+ * resolves through the manifest to the `(target, rvalue)` pair
+ * described here.
+ */
+interface DestructuringWrite {
+  target: string;
+  rvalue: AssignmentRValue;
+}
+
+/**
+ * Walk a destructuring LHS pattern and emit one `DestructuringWrite`
+ * per unpacked element.
+ *
+ * The classifier handles:
+ *
+ *   * `ObjectPattern` — `const { a, b } = obj;`, `const { a: x } = obj;`,
+ *     nested object/array patterns, defaults (`const { a = 10 } = obj;`).
+ *     The `rvalueSource` is taken from the top-level RHS identifier
+ *     (when known); the per-element `RValue` is `FieldAccess { source,
+ *     field }` keyed on the property name.  Nested patterns recurse with
+ *     `rvalue.kind === "Compound"` because the actual sub-expression
+ *     read is itself a `FieldAccess` chain the runtime captures via
+ *     value snapshots.
+ *
+ *   * `ArrayPattern` — `const [a, b] = arr;`, holes (`const [, b] = arr;`),
+ *     defaults (`const [a, b = 10] = arr;`), and `RestElement`
+ *     (`const [a, ...rest] = arr;`).  Element index drives the
+ *     `IndexAccess { source, index }` RValue; the rest element is
+ *     `Compound` because it carries a synthesised sub-array.
+ *
+ *   * `RestElement` and `AssignmentPattern` are unwrapped inline.
+ *
+ * The walker uses the `rhsSource` parameter (the top-level RHS
+ * identifier name when the RHS is a bare `Identifier`) to populate
+ * the `source` field on `FieldAccess` / `IndexAccess`.  When the RHS
+ * is not a bare identifier, `source` is left undefined and the
+ * db-backend correlates via the value snapshot.
+ *
+ * Computed property keys (`const { [k]: val } = obj;`) surface as
+ * `Compound` because the key cannot be resolved statically.
+ *
+ * Reference: M16b deliverable 1.
+ */
+function collectDestructuringWrites(
+  pat: unknown,
+  rhsSource: string | undefined,
+): DestructuringWrite[] {
+  const writes: DestructuringWrite[] = [];
+  collectDestructuringWritesInto(pat, rhsSource, writes);
+  return writes;
+}
+
+function collectDestructuringWritesInto(
+  pat: unknown,
+  rhsSource: string | undefined,
+  out: DestructuringWrite[],
+): void {
+  if (!pat || typeof pat !== "object") return;
+  const p = pat as { type: string };
+
+  switch (p.type) {
+    case "Identifier": {
+      // Bare identifier as a sub-pattern is handled by the caller
+      // (object/array property walkers know the field/index and
+      // construct the `RValue` themselves).
+      return;
+    }
+    case "AssignmentPattern": {
+      // `const { a = 10 } = obj` / `const [a = 10] = arr` —
+      // the default is irrelevant for write-site bookkeeping;
+      // recurse into the left-hand pattern.
+      const ap = pat as { left: unknown };
+      collectDestructuringWritesInto(ap.left, rhsSource, out);
+      return;
+    }
+    case "ObjectPattern": {
+      const op = pat as {
+        properties: Array<{
+          type: string;
+          key?: { type: string; value?: string; expression?: Expression };
+          value?: unknown;
+        }>;
+      };
+      for (const prop of op.properties) {
+        if (prop.type === "AssignmentPatternProperty") {
+          // Shorthand: `{ a }` or `{ a = 10 }` (key.value is the name).
+          const keyName = prop.key?.value;
+          if (!keyName) continue;
+          out.push({
+            target: keyName,
+            rvalue: {
+              kind: "FieldAccess",
+              source: rhsSource,
+              field: keyName,
+            },
+          });
+        } else if (prop.type === "KeyValuePatternProperty") {
+          // Renaming: `{ a: x }` — the key is the field, value is the
+          // sub-pattern (identifier or nested pattern).  Computed
+          // property keys (`{ [k]: val }`) fall back to Compound
+          // because the key is not statically known.
+          const keyType = prop.key?.type;
+          const field = prop.key?.value;
+          const sub = prop.value as { type?: string; value?: string };
+
+          if (keyType === "Computed") {
+            // Computed key: target name comes from the value
+            // sub-pattern (identifier), RValue is Compound.
+            if (sub && sub.type === "Identifier" && sub.value) {
+              out.push({
+                target: sub.value,
+                rvalue: { kind: "Compound" },
+              });
+            } else {
+              // Nested pattern under computed key — recurse with
+              // no source-field bookkeeping.
+              collectDestructuringWritesInto(sub, undefined, out);
+            }
+            continue;
+          }
+
+          if (!field) continue;
+
+          if (sub && sub.type === "Identifier" && sub.value) {
+            // `{ a: x }` — `x` is bound to `obj.a`.
+            out.push({
+              target: sub.value,
+              rvalue: {
+                kind: "FieldAccess",
+                source: rhsSource,
+                field,
+              },
+            });
+          } else if (sub && sub.type === "AssignmentPattern") {
+            // `{ a: x = 10 }` — unwrap.
+            const apSub = sub as unknown as { left: unknown };
+            const left = apSub.left as { type?: string; value?: string };
+            if (left && left.type === "Identifier" && left.value) {
+              out.push({
+                target: left.value,
+                rvalue: {
+                  kind: "FieldAccess",
+                  source: rhsSource,
+                  field,
+                },
+              });
+            } else {
+              collectDestructuringWritesInto(left, undefined, out);
+            }
+          } else {
+            // Nested pattern: `{ a: { b } } = obj` — recurse without
+            // a known sub-source identifier (the nested RHS is
+            // `obj.a`, not a top-level bare identifier).
+            collectDestructuringWritesInto(sub, undefined, out);
+          }
+        } else if (prop.type === "RestElement") {
+          // `const { a, ...rest } = obj` — rest binds to a fresh
+          // object containing the remaining own enumerable keys.
+          const restArg = (prop as unknown as { argument: unknown }).argument;
+          const ra = restArg as { type?: string; value?: string };
+          if (ra && ra.type === "Identifier" && ra.value) {
+            out.push({
+              target: ra.value,
+              rvalue: { kind: "Compound", source: rhsSource },
+            });
+          }
+        }
+      }
+      return;
+    }
+    case "ArrayPattern": {
+      const ap = pat as { elements: Array<unknown | null> };
+      for (let i = 0; i < ap.elements.length; i++) {
+        const el = ap.elements[i];
+        if (el === null || el === undefined) continue;
+        const elTyped = el as { type: string; value?: string };
+        if (elTyped.type === "Identifier" && elTyped.value) {
+          out.push({
+            target: elTyped.value,
+            rvalue: {
+              kind: "IndexAccess",
+              source: rhsSource,
+              index: i,
+            },
+          });
+        } else if (elTyped.type === "AssignmentPattern") {
+          // `const [a = 10] = arr` — unwrap.
+          const apEl = el as unknown as { left: unknown };
+          const left = apEl.left as { type?: string; value?: string };
+          if (left && left.type === "Identifier" && left.value) {
+            out.push({
+              target: left.value,
+              rvalue: {
+                kind: "IndexAccess",
+                source: rhsSource,
+                index: i,
+              },
+            });
+          } else {
+            collectDestructuringWritesInto(left, undefined, out);
+          }
+        } else if (elTyped.type === "RestElement") {
+          // `const [a, ...rest] = arr` — rest is a fresh array slice.
+          // The M16b spec calls this out specifically: emit a write
+          // event with `Compound` because the slice is a derived
+          // composite, not a single index lookup.
+          const restArg = (el as unknown as { argument: unknown }).argument;
+          const ra = restArg as { type?: string; value?: string };
+          if (ra && ra.type === "Identifier" && ra.value) {
+            out.push({
+              target: ra.value,
+              rvalue: { kind: "Compound", source: rhsSource },
+            });
+          }
+        } else if (
+          elTyped.type === "ObjectPattern" ||
+          elTyped.type === "ArrayPattern"
+        ) {
+          // Nested destructuring inside array: `const [a, [b, c]] = nested`.
+          // The nested sub-RHS is `nested[1]`; we do not have a bare
+          // identifier name for that, so recurse without a source.
+          collectDestructuringWritesInto(el, undefined, out);
+        }
+      }
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+/**
+ * Detect whether an LHS pattern is a destructuring pattern (and thus
+ * needs `collectDestructuringWrites` rather than the simple-target path).
+ */
+function isDestructuringPattern(pat: unknown): boolean {
+  if (!pat || typeof pat !== "object") return false;
+  const p = pat as { type: string };
+  return p.type === "ObjectPattern" || p.type === "ArrayPattern";
+}
+
+/**
+ * Best-effort: pull a bare identifier source name out of an expression
+ * for use as the `RValue.source` field on destructuring writes.
+ * Returns `undefined` for anything that is not a bare identifier so the
+ * destructuring walker leaves the source unresolved (the db-backend
+ * falls back to the value-snapshot correlation in that case).
+ */
+function extractBareIdentifier(
+  expr: Expression | undefined,
+): string | undefined {
+  if (!expr || typeof expr !== "object") return undefined;
+  const e = expr as { type: string; value?: string };
+  if (e.type === "Identifier" && e.value) return e.value;
+  if (e.type === "ParenthesisExpression") {
+    const pe = expr as unknown as { expression: Expression };
+    return extractBareIdentifier(pe.expression);
+  }
+  return undefined;
 }
 
 // ---------- line/column mapper ----------
@@ -963,6 +1275,39 @@ function collectAssignmentSitesFromStatement(
 ): number[] {
   const siteIds: number[] = [];
 
+  /**
+   * Helper: register every destructuring write produced by an LHS
+   * pattern against the RHS init expression.  Returns the list of
+   * siteIds registered.  M16b deliverable 2 — runtime-dynamic
+   * destructuring widths surface as one write site per unpacked
+   * element.
+   */
+  const emitDestructuringWriteSites = (
+    pat: unknown,
+    init: Expression,
+    span: Span,
+  ): void => {
+    const rhsSource = extractBareIdentifier(init);
+    const writes = collectDestructuringWrites(pat, rhsSource);
+    if (writes.length === 0) return;
+    const resolved = resolveSpan(span.start, ctx);
+    for (const w of writes) {
+      const id = ctx.manifest.addWriteSite(
+        resolved.pathIndex,
+        resolved.line,
+        resolved.col,
+        w.target,
+        w.rvalue.kind,
+        {
+          source: w.rvalue.source,
+          field: w.rvalue.field,
+          index: w.rvalue.index,
+        },
+      );
+      siteIds.push(id);
+    }
+  };
+
   if (stmt.type === "VariableDeclaration") {
     const vd = stmt as unknown as {
       declarations: Array<{
@@ -974,12 +1319,21 @@ function collectAssignmentSitesFromStatement(
     };
     for (const decl of vd.declarations) {
       if (!decl.init) continue;
-      const target = extractAssignmentTarget(decl.id);
-      if (target === null) continue;
-      const rvalue = classifyAssignmentRhs(decl.init);
       const span =
         (decl as { span?: Span }).span ??
         (stmt as unknown as { span: Span }).span;
+
+      // M16b: destructuring LHS — emit one write site per unpacked
+      // element.  The runtime sees runtime-dynamic widths via the
+      // per-element manifest entry rather than a single packed site.
+      if (isDestructuringPattern(decl.id)) {
+        emitDestructuringWriteSites(decl.id, decl.init, span);
+        continue;
+      }
+
+      const target = extractAssignmentTarget(decl.id);
+      if (target === null) continue;
+      const rvalue = classifyAssignmentRhs(decl.init);
       const resolved = resolveSpan(span.start, ctx);
       const siteId = ctx.manifest.addWriteSite(
         resolved.pathIndex,
@@ -1000,7 +1354,11 @@ function collectAssignmentSitesFromStatement(
 
   if (stmt.type === "ExpressionStatement") {
     const es = stmt as unknown as { expression: Expression };
-    const expr = es.expression;
+    let expr = es.expression;
+    // Unwrap parenthesised assignment: `({ a, b } = obj);`.
+    if (expr && (expr as { type: string }).type === "ParenthesisExpression") {
+      expr = (expr as unknown as { expression: Expression }).expression;
+    }
     if (expr && (expr as { type: string }).type === "AssignmentExpression") {
       const ae = expr as unknown as {
         operator?: string;
@@ -1008,6 +1366,18 @@ function collectAssignmentSitesFromStatement(
         right: Expression;
         span?: Span;
       };
+      const span = ae.span ?? (stmt as unknown as { span: Span }).span;
+
+      // M16b: destructuring assignment expression — `({ a, b } = obj)`
+      // or `[a, b] = arr` — emit one write site per unpacked element.
+      if (
+        (ae.operator === undefined || ae.operator === "=") &&
+        isDestructuringPattern(ae.left)
+      ) {
+        emitDestructuringWriteSites(ae.left, ae.right, span);
+        return siteIds;
+      }
+
       const target = extractAssignmentTarget(ae.left);
       if (target !== null) {
         // Compound-assignment operators (`+=` etc.) carry an implicit
@@ -1018,7 +1388,6 @@ function collectAssignmentSitesFromStatement(
           ae.operator && ae.operator !== "="
             ? { kind: "Compound" }
             : classifyAssignmentRhs(ae.right);
-        const span = ae.span ?? (stmt as unknown as { span: Span }).span;
         const resolved = resolveSpan(span.start, ctx);
         const siteId = ctx.manifest.addWriteSite(
           resolved.pathIndex,
