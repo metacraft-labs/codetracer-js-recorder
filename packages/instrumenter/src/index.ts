@@ -50,9 +50,44 @@ export interface FunctionEntry {
 }
 
 export interface SiteEntry {
-  kind: "step" | "call" | "return";
+  kind: "step" | "call" | "return" | "write";
   pathIndex: number;
   line: number;
   col: number;
   fnId?: number;
+  /**
+   * M16a: write-site metadata.
+   *
+   * For sites with `kind === "write"`, these fields describe the assignment
+   * the runtime should serialise into a `BindVariable + Assignment` pair
+   * (see `codetracer-specs/Trace-Files/Trace-Event-Types.md`).  The fields
+   * are populated by the SWC visitor when it recognises a simple
+   * assignment shape:
+   *
+   *   * `target`         — the LHS identifier the runtime should bind.
+   *   * `rvalueKind`     — one of `"Literal" | "Simple" | "FieldAccess" |
+   *                        "IndexAccess" | "FunctionReturn" | "Compound"`
+   *                        matching the `RValue` variants defined in
+   *                        `codetracer_trace_types`.
+   *   * `rvalueSource`   — the source-identifier name for `Simple`,
+   *                        `FieldAccess`, and `IndexAccess` shapes; the
+   *                        runtime resolves it back to a `VariableId`.
+   *   * `rvalueField`    — the field name for `FieldAccess`.
+   *   * `rvalueIndex`    — the static integer index for `IndexAccess`.
+   *
+   * For non-write sites these fields are omitted to keep the JSON
+   * manifest byte-for-byte compatible with pre-M16a recorders that
+   * don't know about write-site metadata.
+   */
+  target?: string;
+  rvalueKind?:
+    | "Literal"
+    | "Simple"
+    | "FieldAccess"
+    | "IndexAccess"
+    | "FunctionReturn"
+    | "Compound";
+  rvalueSource?: string;
+  rvalueField?: string;
+  rvalueIndex?: number;
 }

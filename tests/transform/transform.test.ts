@@ -11,6 +11,12 @@ function inst(code: string, filename = "test.js") {
 
 /**
  * Create a no-op __ct mock for semantic equivalence testing.
+ *
+ * Mirrors the runtime API the SWC visitor injects calls against —
+ * `step`, `enter`, `ret`, and (M16a) `write`.  Any new method the
+ * runtime exposes must be added here, otherwise the instrumented
+ * sample programs throw at `__ct.<method> is not a function` when
+ * the semantic-equivalence harness runs them.
  */
 function createNoopCt() {
   return {
@@ -19,6 +25,7 @@ function createNoopCt() {
     ret(_fnId: number, value?: unknown) {
       return value;
     },
+    write(_siteId: number) {},
   };
 }
 
@@ -368,6 +375,7 @@ function main() {
         step: function(_siteId) {},
         enter: function(_fnId, _args) {},
         ret: function(_fnId, value) { return value; },
+        write: function(_siteId) {},
       };
       ${instrumentedCode}
       return main();
@@ -399,6 +407,7 @@ const add = (a, b) => { return a + b; };
         step: function(_siteId) {},
         enter: function(_fnId, _args) {},
         ret: function(_fnId, value) { return value; },
+        write: function(_siteId) {},
       };
       ${instrumentedCode}
       return [double(5), add(3, 4)];
@@ -434,6 +443,7 @@ function classify(n) {
         step: function(_siteId) {},
         enter: function(_fnId, _args) {},
         ret: function(_fnId, value) { return value; },
+        write: function(_siteId) {},
       };
       ${code}
       return [classify(-5), classify(0), classify(4), classify(7)];

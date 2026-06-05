@@ -9,10 +9,15 @@
  *   0 = step
  *   1 = enter
  *   2 = ret
- *   3 = write
+ *   3 = write (console output capture — `process.stdout.write` etc.)
  *   4 = thread_start
  *   5 = thread_switch
  *   6 = thread_exit
+ *   7 = assignment (M16a: synthetic `__ct.write(siteId)` event for a
+ *                   recognised simple-assignment shape; the native
+ *                   addon resolves it to the manifest's write-site
+ *                   metadata and synthesises a `BindVariable +
+ *                   Assignment` pair into the trace stream)
  */
 
 /** Numeric event kind codes matching the instrumenter output. */
@@ -23,6 +28,7 @@ export const EVENT_WRITE = 3 as const;
 export const EVENT_THREAD_START = 4 as const;
 export const EVENT_THREAD_SWITCH = 5 as const;
 export const EVENT_THREAD_EXIT = 6 as const;
+export const EVENT_ASSIGNMENT = 7 as const;
 
 export type EventKind =
   | typeof EVENT_STEP
@@ -31,7 +37,8 @@ export type EventKind =
   | typeof EVENT_WRITE
   | typeof EVENT_THREAD_START
   | typeof EVENT_THREAD_SWITCH
-  | typeof EVENT_THREAD_EXIT;
+  | typeof EVENT_THREAD_EXIT
+  | typeof EVENT_ASSIGNMENT;
 
 /** Encoded representation of a JS value for tracing. */
 export interface EncodedValue {

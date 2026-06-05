@@ -87,6 +87,59 @@ export class ManifestBuilder {
   }
 
   /**
+   * M16a: register a write site and return its siteId.
+   *
+   * Write sites are the source-side description of a simple-assignment
+   * shape the visitor recognised.  Each write site carries a target
+   * identifier name (LHS) plus an `RValue` description (RHS) so the
+   * runtime can synthesise the `BindVariable + Assignment` pair the
+   * trace-format vocabulary expects.  See
+   * `codetracer-specs/Trace-Files/Trace-Event-Types.md` §RValue for the
+   * shape set.
+   */
+  addWriteSite(
+    pathIndex: number,
+    line: number,
+    col: number,
+    target: string,
+    rvalueKind:
+      | "Literal"
+      | "Simple"
+      | "FieldAccess"
+      | "IndexAccess"
+      | "FunctionReturn"
+      | "Compound",
+    rvalueExtras?: {
+      source?: string;
+      field?: string;
+      index?: number;
+    },
+  ): number {
+    const siteId = this.sites.length;
+    const entry: SiteEntry = {
+      kind: "write",
+      pathIndex,
+      line,
+      col,
+      target,
+      rvalueKind,
+    };
+    if (rvalueExtras) {
+      if (rvalueExtras.source !== undefined) {
+        entry.rvalueSource = rvalueExtras.source;
+      }
+      if (rvalueExtras.field !== undefined) {
+        entry.rvalueField = rvalueExtras.field;
+      }
+      if (rvalueExtras.index !== undefined) {
+        entry.rvalueIndex = rvalueExtras.index;
+      }
+    }
+    this.sites.push(entry);
+    return siteId;
+  }
+
+  /**
    * Build the final manifest slice.
    */
   build(): ManifestSlice {

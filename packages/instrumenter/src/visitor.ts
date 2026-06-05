@@ -183,6 +183,166 @@ function mkRetExpr(fnId: number, value?: Expression): Expression {
   return mkCallExpr(mkMemberExpr("__ct", "ret"), args);
 }
 
+// ---------- M16a: write-call builder ----------
+
+/**
+ * Build a synthetic `__ct.write(siteId)` statement.
+ *
+ * The runtime resolves the metadata for `siteId` from the manifest
+ * (target name + RValue description) and emits the corresponding
+ * `BindVariable` + `Assignment` pair into its event buffer.  The
+ * single-argument shape keeps the bytecode-level call cost minimal
+ * and matches the existing `__ct.step(siteId)` pattern.
+ */
+function mkWriteCall(siteId: number): Statement {
+  return mkExprStmt(
+    mkCallExpr(mkMemberExpr("__ct", "write"), [mkNumericLiteral(siteId)]),
+  );
+}
+
+// ---------- M16a: assignment classifier ----------
+
+/**
+ * Describes a recognised simple-assignment shape on the RHS of an
+ * assignment expression / variable declarator.  Mirrors the
+ * `RValue` enum in `codetracer_trace_types` — see the M14 trace-format
+ * extension for the canonical wire shape.
+ *
+ * The visitor emits one of these for every assignment shape it
+ * recognises; unknown shapes default to `Compound`.
+ */
+interface AssignmentRValue {
+  kind:
+    | "Literal"
+    | "Simple"
+    | "FieldAccess"
+    | "IndexAccess"
+    | "FunctionReturn"
+    | "Compound";
+  source?: string;
+  field?: string;
+  index?: number;
+}
+
+/**
+ * Classify an SWC AST expression into an `AssignmentRValue` shape.
+ *
+ * Recognises the M16a-scoped simple shapes:
+ *
+ *   * Literals (number / string / bool / null / template literals
+ *     without interpolation) -> `Literal`.
+ *   * Bare identifiers (`b = a`) -> `Simple { source: "a" }`.
+ *   * `obj.field` member access -> `FieldAccess { source: "obj", field: "field" }`.
+ *   * `arr[42]` with integer literal index -> `IndexAccess { source: "arr", index: 42 }`.
+ *   * `foo(...)` or `obj.method(...)` -> `FunctionReturn`.
+ *   * Anything else -> `Compound` (the M14 reader-side compatibility
+ *     fallback per the spec).
+ *
+ * The shapes covered here intentionally match the M16a verification
+ * tests; the more elaborate destructuring / spread / nullish / etc.
+ * shapes are M16b territory.
+ */
+function classifyAssignmentRhs(rhs: Expression): AssignmentRValue {
+  if (!rhs || typeof rhs !== "object") {
+    return { kind: "Compound" };
+  }
+  const t = (rhs as { type: string }).type;
+  switch (t) {
+    case "NumericLiteral":
+    case "BigIntLiteral":
+    case "StringLiteral":
+    case "BooleanLiteral":
+    case "NullLiteral":
+      return { kind: "Literal" };
+    case "TemplateLiteral": {
+      // Template literal with no interpolation is a literal; with
+      // interpolation it's Compound (each `${expr}` contributes a
+      // dependency).  The Compound dependencies are surfaced as
+      // best-effort by the runtime side which inspects the live
+      // bindings, not the visitor.
+      const tl = rhs as unknown as { expressions: Expression[] };
+      return tl.expressions.length === 0
+        ? { kind: "Literal" }
+        : { kind: "Compound" };
+    }
+    case "Identifier": {
+      const id = rhs as unknown as { value?: string };
+      if (id.value) {
+        return { kind: "Simple", source: id.value };
+      }
+      return { kind: "Compound" };
+    }
+    case "MemberExpression": {
+      const me = rhs as unknown as {
+        object: Expression;
+        property: { type: string; value?: string };
+        computed?: boolean;
+      };
+      const obj = me.object as unknown as { type: string; value?: string };
+      if (obj.type === "Identifier" && obj.value) {
+        // Static field access: `obj.field` (or `obj["field"]`).
+        if (
+          !me.computed &&
+          me.property.type === "Identifier" &&
+          me.property.value
+        ) {
+          return {
+            kind: "FieldAccess",
+            source: obj.value,
+            field: me.property.value,
+          };
+        }
+        // Static integer index: `arr[42]`.
+        if (me.computed && me.property.type === "NumericLiteral") {
+          const idx = (me.property as unknown as { value: number }).value;
+          if (Number.isInteger(idx)) {
+            return {
+              kind: "IndexAccess",
+              source: obj.value,
+              index: idx,
+            };
+          }
+        }
+      }
+      return { kind: "Compound" };
+    }
+    case "CallExpression":
+    case "NewExpression":
+    case "OptionalChainingExpression":
+    case "TaggedTemplateExpression":
+      return { kind: "FunctionReturn" };
+    case "ParenthesisExpression": {
+      const pe = rhs as unknown as { expression: Expression };
+      return classifyAssignmentRhs(pe.expression);
+    }
+    case "TsAsExpression":
+    case "TsSatisfiesExpression":
+    case "TsTypeAssertion":
+    case "TsConstAssertion":
+    case "TsNonNullExpression": {
+      const tse = rhs as unknown as { expression: Expression };
+      return classifyAssignmentRhs(tse.expression);
+    }
+    default:
+      return { kind: "Compound" };
+  }
+}
+
+/**
+ * Extract the target identifier from a simple LHS pattern.
+ * Returns `null` if the pattern is destructured / computed / not
+ * a single bare identifier (those shapes are M16b territory and
+ * the visitor falls back to no write-site emission for them).
+ */
+function extractAssignmentTarget(pat: unknown): string | null {
+  if (!pat || typeof pat !== "object") return null;
+  const p = pat as { type: string; value?: string };
+  if (p.type === "Identifier" && p.value) {
+    return p.value;
+  }
+  return null;
+}
+
 // ---------- line/column mapper ----------
 
 export class LineColMapper {
@@ -460,6 +620,18 @@ export function transformModule(module: Module, ctx: TransformContext): void {
     }
 
     newBody.push(item);
+
+    // M16a: emit one __ct.write call per recognised simple-assignment
+    // shape in the top-level statement.  Module-level `const`/`let`
+    // declarations are the common case here (entry-point scripts).
+    if ("type" in item) {
+      for (const siteId of collectAssignmentSitesFromStatement(
+        item as unknown as Statement,
+        ctx,
+      )) {
+        newBody.push(mkWriteCall(siteId) as unknown as ModuleItem);
+      }
+    }
   }
 
   // Add __ct.ret at module end
@@ -719,6 +891,12 @@ function transformStatement(stmt: Statement, ctx: TransformContext): void {
 /**
  * Transform statements inside a block, inserting step calls.
  * Modifies the array in-place.
+ *
+ * M16a: after the original statement we also emit one
+ * `__ct.write(siteId)` call per recognised simple-assignment shape
+ * (see `collectAssignmentSitesFromStatement`).  The write call lands
+ * *after* the statement so the runtime observes the post-store
+ * value when it inspects the live binding.
  */
 function transformBlockBody(stmts: Statement[], ctx: TransformContext): void {
   const newStmts: Statement[] = [];
@@ -738,11 +916,128 @@ function transformBlockBody(stmts: Statement[], ctx: TransformContext): void {
       newStmts.push(mkStepCall(siteId));
     }
     newStmts.push(stmt);
+
+    // M16a: emit __ct.write calls for any simple-assignment shapes
+    // recognised in this statement.  We do this AFTER the statement
+    // so the runtime sees the post-store value when it inspects the
+    // live binding via the manifest's target name.
+    for (const siteId of collectAssignmentSitesFromStatement(stmt, ctx)) {
+      newStmts.push(mkWriteCall(siteId));
+    }
   }
 
   // Replace contents in-place
   stmts.length = 0;
   stmts.push(...newStmts);
+}
+
+/**
+ * M16a: walk a statement's AST and register write-site manifest
+ * entries for every recognised simple-assignment shape.  Returns the
+ * list of `siteId`s the caller should emit `__ct.write` calls for.
+ *
+ * Recognised shapes (see `classifyAssignmentRhs` for the RHS
+ * variants):
+ *
+ *   * `VariableDeclaration` with a single identifier binder:
+ *     `let x = expr`, `const b = a`.  We register one write site per
+ *     declarator with a non-destructuring identifier LHS — the M14
+ *     spec carries one Assignment event per LHS bind, so multiple
+ *     declarators in `let a = 1, b = 2;` get two write sites.
+ *   * `AssignmentExpression` with an Identifier LHS:
+ *     `a = expr`, `a += expr`, `a -= expr`, `a *= expr`, `a /= expr`.
+ *     Compound assignment ops (`+= -= *= /=`) are classified as
+ *     `Compound([source_of_rhs, prev_value_of_lhs])` per the M14 spec
+ *     because the RHS implicitly depends on the LHS's prior value.
+ *     For simplicity we surface them as `Compound`, leaving the more
+ *     precise classification to the db-backend.
+ *
+ * Other shapes (destructuring, computed property assignment, etc.)
+ * fall through with no write site emitted.  Those are M16b
+ * territory and the lack of a write site is the M16a contract: the
+ * db-backend falls back to Path B for them.
+ */
+function collectAssignmentSitesFromStatement(
+  stmt: Statement,
+  ctx: TransformContext,
+): number[] {
+  const siteIds: number[] = [];
+
+  if (stmt.type === "VariableDeclaration") {
+    const vd = stmt as unknown as {
+      declarations: Array<{
+        type: string;
+        id: unknown;
+        init?: Expression;
+        span?: Span;
+      }>;
+    };
+    for (const decl of vd.declarations) {
+      if (!decl.init) continue;
+      const target = extractAssignmentTarget(decl.id);
+      if (target === null) continue;
+      const rvalue = classifyAssignmentRhs(decl.init);
+      const span =
+        (decl as { span?: Span }).span ??
+        (stmt as unknown as { span: Span }).span;
+      const resolved = resolveSpan(span.start, ctx);
+      const siteId = ctx.manifest.addWriteSite(
+        resolved.pathIndex,
+        resolved.line,
+        resolved.col,
+        target,
+        rvalue.kind,
+        {
+          source: rvalue.source,
+          field: rvalue.field,
+          index: rvalue.index,
+        },
+      );
+      siteIds.push(siteId);
+    }
+    return siteIds;
+  }
+
+  if (stmt.type === "ExpressionStatement") {
+    const es = stmt as unknown as { expression: Expression };
+    const expr = es.expression;
+    if (expr && (expr as { type: string }).type === "AssignmentExpression") {
+      const ae = expr as unknown as {
+        operator?: string;
+        left: Expression;
+        right: Expression;
+        span?: Span;
+      };
+      const target = extractAssignmentTarget(ae.left);
+      if (target !== null) {
+        // Compound-assignment operators (`+=` etc.) carry an implicit
+        // load-of-target; classify as Compound to express the
+        // dependency on the prior value.  The bare `=` case uses the
+        // full RHS classifier.
+        const rvalue: AssignmentRValue =
+          ae.operator && ae.operator !== "="
+            ? { kind: "Compound" }
+            : classifyAssignmentRhs(ae.right);
+        const span = ae.span ?? (stmt as unknown as { span: Span }).span;
+        const resolved = resolveSpan(span.start, ctx);
+        const siteId = ctx.manifest.addWriteSite(
+          resolved.pathIndex,
+          resolved.line,
+          resolved.col,
+          target,
+          rvalue.kind,
+          {
+            source: rvalue.source,
+            field: rvalue.field,
+            index: rvalue.index,
+          },
+        );
+        siteIds.push(siteId);
+      }
+    }
+  }
+
+  return siteIds;
 }
 
 function isExecutableStatement(stmt: Statement): boolean {
@@ -970,7 +1265,7 @@ function transformFunctionDecl(
     resolved.col,
   );
 
-  instrumentFunctionBody(decl.body, fnId, false, ctx);
+  instrumentFunctionBody(decl.body, fnId, false, ctx, params);
 }
 
 function transformFunctionExpression(
@@ -999,7 +1294,7 @@ function transformFunctionExpression(
     resolved.col,
   );
 
-  instrumentFunctionBody(expr.body, fnId, false, ctx);
+  instrumentFunctionBody(expr.body, fnId, false, ctx, params);
 }
 
 function transformArrowFunction(
@@ -1025,7 +1320,13 @@ function transformArrowFunction(
 
   if (expr.body.type === "BlockStatement") {
     // Arrow with block body
-    instrumentFunctionBody(expr.body as BlockStatement, fnId, false, ctx);
+    instrumentFunctionBody(
+      expr.body as BlockStatement,
+      fnId,
+      false,
+      ctx,
+      params,
+    );
   } else {
     // Arrow with expression body: (x) => expr
     // Transform to: (x) => { __ct.enter(fnId, arguments); __ct.step(siteId); return __ct.ret(fnId, expr); }
@@ -1089,7 +1390,7 @@ function transformMethodProperty(
     resolved.line,
     resolved.col,
   );
-  instrumentFunctionBody(fn.body, fnId, false, ctx);
+  instrumentFunctionBody(fn.body, fnId, false, ctx, params);
 }
 
 function transformGetterProperty(
@@ -1114,7 +1415,7 @@ function transformGetterProperty(
     resolved.line,
     resolved.col,
   );
-  instrumentFunctionBody(prop.body, fnId, false, ctx);
+  instrumentFunctionBody(prop.body, fnId, false, ctx, []);
 }
 
 function transformSetterProperty(
@@ -1142,7 +1443,7 @@ function transformSetterProperty(
     resolved.line,
     resolved.col,
   );
-  instrumentFunctionBody(prop.body, fnId, false, ctx);
+  instrumentFunctionBody(prop.body, fnId, false, ctx, params);
 }
 
 function transformClassBody(
@@ -1216,7 +1517,7 @@ function transformConstructor(
   const clsAny = cls as unknown as { superClass?: Expression };
   const isDerived = !!clsAny.superClass;
 
-  instrumentFunctionBody(ctor.body, fnId, isDerived, ctx);
+  instrumentFunctionBody(ctor.body, fnId, isDerived, ctx, params);
 }
 
 function transformClassMethod(cm: ClassMethod, ctx: TransformContext): void {
@@ -1242,7 +1543,7 @@ function transformClassMethod(cm: ClassMethod, ctx: TransformContext): void {
     resolved.col,
   );
 
-  instrumentFunctionBody(fn.body, fnId, false, ctx);
+  instrumentFunctionBody(fn.body, fnId, false, ctx, params);
 }
 
 // ---------- core function body instrumentation ----------
@@ -1273,6 +1574,7 @@ function instrumentFunctionBody(
   fnId: number,
   isDerivedCtor: boolean,
   ctx: TransformContext,
+  paramNames?: string[],
 ): void {
   const stmts = body.stmts;
 
@@ -1293,6 +1595,34 @@ function instrumentFunctionBody(
     withSteps.push(stmts[i]);
   }
 
+  // M16a: emit one __ct.write call per named parameter immediately
+  // after __ct.enter so the trace records the parameter binding as
+  // an explicit `Assignment` event.  The runtime classifies these
+  // as `RValue::Compound([])` (the actual values flow through the
+  // call args; the db-backend correlates them via the manifest's
+  // function signature).
+  const emitParamWrites = (): void => {
+    if (!paramNames || paramNames.length === 0) return;
+    const bodySpan = body.span;
+    const resolved = resolveSpan(bodySpan.start, ctx);
+    for (const name of paramNames) {
+      if (!name || name.startsWith("...") || name.startsWith("_param")) {
+        // Skip rest parameters and the synthetic placeholders
+        // returned by `extractPatternName` for destructured params;
+        // M16b extends this to per-element writes.
+        continue;
+      }
+      const siteId = ctx.manifest.addWriteSite(
+        resolved.pathIndex,
+        resolved.line,
+        resolved.col,
+        name,
+        "Compound",
+      );
+      withSteps.push(mkWriteCall(siteId));
+    }
+  };
+
   if (isDerivedCtor) {
     // For derived constructors, we need to find the super() call
     // and insert __ct.enter after it
@@ -1305,10 +1635,17 @@ function instrumentFunctionBody(
           withSteps.push(mkStepCall(siteId));
         }
         withSteps.push(stmts[i]);
+        for (const siteId of collectAssignmentSitesFromStatement(
+          stmts[i],
+          ctx,
+        )) {
+          withSteps.push(mkWriteCall(siteId));
+        }
       }
 
       // Insert __ct.enter after super()
       withSteps.push(mkEnterCall(fnId));
+      emitParamWrites();
 
       // Add remaining statements with steps
       for (let i = superIdx + 1; i < stmts.length; i++) {
@@ -1317,21 +1654,35 @@ function instrumentFunctionBody(
           withSteps.push(mkStepCall(siteId));
         }
         withSteps.push(stmts[i]);
+        for (const siteId of collectAssignmentSitesFromStatement(
+          stmts[i],
+          ctx,
+        )) {
+          withSteps.push(mkWriteCall(siteId));
+        }
       }
     } else {
       // No super() found — insert enter at beginning (after directives)
       withSteps.push(mkEnterCall(fnId));
+      emitParamWrites();
       for (let i = dirCount; i < stmts.length; i++) {
         if (isExecutableStatement(stmts[i])) {
           const siteId = addStepSiteForStmt(stmts[i], ctx);
           withSteps.push(mkStepCall(siteId));
         }
         withSteps.push(stmts[i]);
+        for (const siteId of collectAssignmentSitesFromStatement(
+          stmts[i],
+          ctx,
+        )) {
+          withSteps.push(mkWriteCall(siteId));
+        }
       }
     }
   } else {
     // Normal function — insert enter after directive prologues
     withSteps.push(mkEnterCall(fnId));
+    emitParamWrites();
 
     for (let i = dirCount; i < stmts.length; i++) {
       if (isExecutableStatement(stmts[i])) {
@@ -1339,6 +1690,9 @@ function instrumentFunctionBody(
         withSteps.push(mkStepCall(siteId));
       }
       withSteps.push(stmts[i]);
+      for (const siteId of collectAssignmentSitesFromStatement(stmts[i], ctx)) {
+        withSteps.push(mkWriteCall(siteId));
+      }
     }
   }
 

@@ -19,6 +19,7 @@ import {
   EVENT_ENTER,
   EVENT_RET,
   EVENT_WRITE,
+  EVENT_ASSIGNMENT,
 } from "./buffer.js";
 import type {
   FlushCallback,
@@ -429,6 +430,25 @@ export interface CtRuntime {
   step(siteId: number): void;
   enter(fnId: number, argsLike: IArguments): void;
   ret(fnId: number, value?: unknown): unknown;
+  /**
+   * M16a: synthetic assignment event.
+   *
+   * Called by instrumented code after every recognised
+   * simple-assignment shape (`const b = a`, `x = expr`, parameter
+   * binding).  The runtime resolves the manifest entry for
+   * `siteId`, mints a `BindVariable` event the first time it sees
+   * the target name in the current scope, then a stamped
+   * `Assignment` event whose `RValue` is taken from the manifest
+   * write-site metadata.  See the SWC visitor
+   * (`packages/instrumenter/src/visitor.ts`,
+   * `collectAssignmentSitesFromStatement`) for the shape set.
+   *
+   * No-op when the manifest entry is absent (e.g. when running an
+   * un-instrumented program against a stale manifest).  Never
+   * throws — the runtime is designed to be transparent to the host
+   * program even when its bookkeeping is wrong.
+   */
+  write(siteId: number): void;
 
   /**
    * Enable async context tracking.
@@ -500,6 +520,7 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
       ret(_fnId: number, value?: unknown): unknown {
         return value;
       },
+      write(_siteId: number): void {},
       enableAsyncTracking(): void {},
       disableAsyncTracking(): void {},
       get buffer() {
@@ -579,6 +600,23 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
         // Never crash the user's program
       }
       return value;
+    },
+
+    write(siteId: number): void {
+      // M16a: emit an EVENT_ASSIGNMENT for the site.  The native
+      // addon resolves the manifest write-site entry for `siteId`
+      // and lowers it into a `BindVariable + Assignment` pair on the
+      // trace stream.  We do not attempt to read the live binding
+      // here — the M14 spec carries the RValue description on the
+      // Assignment event, and the corresponding `Value` event for
+      // the target name is emitted independently by the existing
+      // step-level value-snapshot pass.
+      try {
+        asyncTracker.checkContext(buffer);
+        buffer.push(EVENT_ASSIGNMENT, siteId);
+      } catch {
+        // Never crash the user's program
+      }
     },
 
     enableAsyncTracking(): void {
