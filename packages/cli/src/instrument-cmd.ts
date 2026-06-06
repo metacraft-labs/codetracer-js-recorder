@@ -132,10 +132,22 @@ function parseArgs(args: string[]): {
   sourceMaps: boolean;
   include: string[];
   exclude: string[];
+  /**
+   * M26: when true, the output is intended for static browser hosting.
+   * The CLI emits an additional `codetracer-runtime.js` bootstrap file
+   * that installs the `__ct` global before any instrumented module
+   * loads.  Consumers add a single `<script src="codetracer-runtime.js">`
+   * tag to their `index.html` and the bundle is drop-in.
+   */
+  browser: boolean;
+  /** WebSocket endpoint baked into the browser runtime stub. */
+  endpoint?: string;
 } {
   let src: string | undefined;
   let outDir: string | undefined;
   let sourceMaps = false;
+  let browser = false;
+  let endpoint: string | undefined;
   const include: string[] = [];
   const exclude: string[] = [];
 
@@ -149,9 +161,13 @@ function parseArgs(args: string[]): {
       include.push(args[++i]);
     } else if (arg === "--exclude" && i + 1 < args.length) {
       exclude.push(args[++i]);
+    } else if (arg === "--browser") {
+      browser = true;
+    } else if (arg === "--endpoint" && i + 1 < args.length) {
+      endpoint = args[++i];
     } else if (arg === "--help" || arg === "-h") {
       console.log(
-        `Usage: codetracer-js-recorder instrument <src> --out <dir> [--source-maps] [--include <glob>] [--exclude <glob>]`,
+        `Usage: codetracer-js-recorder instrument <src> --out <dir> [--source-maps] [--include <glob>] [--exclude <glob>] [--browser [--endpoint <url>]]`,
       );
       process.exit(0);
     } else if (!src && !arg.startsWith("-")) {
@@ -168,14 +184,138 @@ function parseArgs(args: string[]): {
     process.exit(1);
   }
 
-  return { src: src!, outDir: outDir!, sourceMaps, include, exclude };
+  return {
+    src: src!,
+    outDir: outDir!,
+    sourceMaps,
+    include,
+    exclude,
+    browser,
+    endpoint,
+  };
+}
+
+/**
+ * Build the contents of `codetracer-runtime.js` — a self-contained
+ * browser bootstrap that installs the `__ct` global before any
+ * instrumented module loads.  The file is small enough (a few KB) to
+ * inline; consumers add `<script src="./codetracer-runtime.js"></script>`
+ * to their `index.html` before the instrumented bundle.
+ *
+ * The stub is intentionally minimal — it ships only the surface the
+ * SWC instrumenter calls (`step`, `enter`, `ret`, `write`) plus the M25
+ * `markCorrelation` hook.  It buffers events until the WebSocket reaches
+ * `OPEN` and flushes on a fixed threshold + on `pagehide`.  When the
+ * WebSocket is unavailable (e.g. the daemon is not running) the runtime
+ * silently degrades into a no-op — the host program is unaffected.
+ *
+ * We inline the JS source rather than `require()`-ing
+ * `@codetracer/runtime-browser` because the produced bundle must be
+ * runnable as a static asset with no `node_modules` lookup.
+ */
+function buildBrowserRuntimeStub(endpoint: string, manifest: unknown): string {
+  const manifestJson = JSON.stringify(manifest);
+  const endpointJson = JSON.stringify(endpoint);
+  // The runtime stub mirrors `packages/runtime-browser/src/index.ts`'s
+  // queue-and-flush semantics.  We keep it ES5 / no-modules so it loads
+  // from a plain `<script>` tag without `type="module"`.
+  return `// CodeTracer browser runtime (M26 AOT bundle bootstrap).
+// Wire format: newline-delimited JSON over WebSocket.
+// Spec: codetracer-specs/GUI/Debugging-Features/Value-Origin-Tracking.md §14.4
+(function () {
+  if (typeof globalThis === "undefined") return;
+  if (globalThis.__ct) return;
+  var endpoint =
+    globalThis.__codetracer_endpoint || ${endpointJson};
+  var manifest = ${manifestJson};
+  var queue = [];
+  var stopped = false;
+  var threshold = 256;
+  var socket = null;
+  try {
+    if (typeof WebSocket !== "undefined") {
+      socket = new WebSocket(endpoint);
+      socket.onopen = function () { flush(); };
+    }
+  } catch (e) {
+    socket = null;
+  }
+  function enqueue(evt) {
+    if (stopped) return;
+    queue.push(evt);
+    if (queue.length >= threshold) flush();
+  }
+  function flush() {
+    if (!socket) { queue.length = 0; return; }
+    if (socket.readyState !== 1) return;
+    if (queue.length === 0) return;
+    var lines = [];
+    for (var i = 0; i < queue.length; i++) {
+      try { lines.push(JSON.stringify(queue[i])); } catch (e) {}
+    }
+    try { socket.send(lines.join("\\n") + "\\n"); } catch (e) {}
+    queue.length = 0;
+  }
+  function encodeValue(v) {
+    if (v === undefined || v === null) return { value: null, typeKind: "None" };
+    var t = typeof v;
+    if (t === "boolean") return { value: v, typeKind: "Bool" };
+    if (t === "number") {
+      if (isNaN(v)) return { value: "NaN", typeKind: "Raw" };
+      if (!isFinite(v)) return { value: v > 0 ? "Infinity" : "-Infinity", typeKind: "Raw" };
+      return { value: v, typeKind: (v | 0) === v ? "Int" : "Float" };
+    }
+    if (t === "string") {
+      return { value: v.length > 1000 ? v.slice(0, 1000) : v, typeKind: "String" };
+    }
+    if (t === "function") return { value: v.name || "anonymous", typeKind: "FunctionKind" };
+    return { value: "[object]", typeKind: "Raw" };
+  }
+  enqueue({ kind: "SessionStart", program: (typeof document !== "undefined" && document.title) || "browser", args: [] });
+  if (manifest) enqueue({ kind: "Manifest", manifest: manifest });
+  var safeFlush = function () { try { flush(); } catch (e) {} };
+  if (typeof globalThis.addEventListener === "function") {
+    try {
+      globalThis.addEventListener("pagehide", safeFlush);
+      globalThis.addEventListener("beforeunload", safeFlush);
+    } catch (e) {}
+  }
+  globalThis.__ct = {
+    step: function (siteId) { enqueue({ kind: "Step", siteId: siteId }); },
+    enter: function (fnId, argsLike) {
+      var args = [];
+      for (var i = 0; i < argsLike.length; i++) args.push(encodeValue(argsLike[i]));
+      enqueue({ kind: "Call", fnId: fnId, args: args });
+    },
+    ret: function (fnId, value) {
+      enqueue({ kind: "Return", fnId: fnId, returnValue: encodeValue(value) });
+      return value;
+    },
+    write: function (siteId) { enqueue({ kind: "Assignment", siteId: siteId }); },
+    markCorrelation: function (direction, boundary, key, payload) {
+      var evt = { kind: "CorrelationMarker", direction: direction, boundary: boundary, key: key };
+      if (payload !== undefined) evt.payload = payload;
+      enqueue(evt);
+    },
+    flush: flush,
+    stop: function () {
+      if (stopped) return;
+      enqueue({ kind: "SessionEnd" });
+      flush();
+      stopped = true;
+      try { socket && socket.close(); } catch (e) {}
+    },
+  };
+})();
+`;
 }
 
 /**
  * Entry point for the `instrument` command.
  */
 export function instrumentCommand(args: string[]): void {
-  const { src, outDir, sourceMaps, include, exclude } = parseArgs(args);
+  const { src, outDir, sourceMaps, include, exclude, browser, endpoint } =
+    parseArgs(args);
 
   const srcPath = path.resolve(src);
   if (!fs.existsSync(srcPath)) {
@@ -255,6 +395,17 @@ export function instrumentCommand(args: string[]): void {
     path.join(outPath, "codetracer.manifest.json"),
     JSON.stringify(manifest, null, 2),
   );
+
+  // M26: emit the browser-runtime bootstrap stub when --browser is set.
+  // The output directory becomes a drop-in static-hostable bundle: the
+  // `<script src="./codetracer-runtime.js">` tag loads the runtime + the
+  // manifest, then the instrumented modules can be loaded normally.
+  if (browser) {
+    const stubEndpoint = endpoint ?? "ws://localhost:9230/ct-stream";
+    const stubPath = path.join(outPath, "codetracer-runtime.js");
+    fs.writeFileSync(stubPath, buildBrowserRuntimeStub(stubEndpoint, manifest));
+    console.log(`Browser runtime stub written to ${stubPath}`);
+  }
 
   console.log(`Instrumented ${instrumentedCount} file(s) -> ${outPath}`);
   console.log(

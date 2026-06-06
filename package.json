@@ -6,8 +6,14 @@
   "description": "CodeTracer JavaScript/TypeScript recorder — full-state recording via compile-time SWC instrumentation",
   "workspaces": [
     "packages/instrumenter",
+    "packages/instrumenter-core",
     "packages/runtime",
-    "packages/cli"
+    "packages/runtime-browser",
+    "packages/cli",
+    "packages/vite-plugin",
+    "packages/webpack-plugin",
+    "packages/esbuild-plugin",
+    "packages/rollup-plugin"
   ],
   "scripts": {
     "build": "npm run build --workspaces",

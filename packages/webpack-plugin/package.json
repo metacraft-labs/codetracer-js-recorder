@@ -1,0 +1,18 @@
+{
+  "name": "@codetracer/webpack-plugin",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "description": "Webpack plugin/loader that wires the CodeTracer instrumenter into the Webpack transform pipeline (M26)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@codetracer/instrumenter-core": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

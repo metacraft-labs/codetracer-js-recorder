@@ -1,0 +1,15 @@
+{
+  "name": "@codetracer/runtime-browser",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "description": "Browser-side CodeTracer runtime (__ct) — batched WebSocket producer streaming newline-delimited JSON events to the M26 daemon receiver",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

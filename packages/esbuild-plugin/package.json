@@ -1,0 +1,19 @@
+{
+  "name": "@codetracer/esbuild-plugin",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "description": "esbuild plugin that wires the CodeTracer instrumenter into the esbuild transform pipeline (M26)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@codetracer/instrumenter-core": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

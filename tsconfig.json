@@ -9,7 +9,13 @@
   },
   "references": [
     { "path": "packages/instrumenter" },
+    { "path": "packages/instrumenter-core" },
     { "path": "packages/runtime" },
-    { "path": "packages/cli" }
+    { "path": "packages/runtime-browser" },
+    { "path": "packages/cli" },
+    { "path": "packages/vite-plugin" },
+    { "path": "packages/webpack-plugin" },
+    { "path": "packages/esbuild-plugin" },
+    { "path": "packages/rollup-plugin" }
   ]
 }
