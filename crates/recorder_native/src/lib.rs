@@ -1073,7 +1073,7 @@ fn write_binary_trace(
     state: &RecorderState,
     trace_dir: &Path,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut writer = NimTraceWriter::new(&state.program, NimTraceFormat::Binary);
+    let mut writer = NimTraceWriter::new(&state.program, &state.args, NimTraceFormat::Binary);
 
     // Set the working directory for the trace metadata.
     let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
