@@ -396,12 +396,16 @@ greet("World");
       skipProcessHooks: true,
     });
 
-    // Step 4: Execute the instrumented code with our runtime as __ct
+    // Step 4: Execute the instrumented code with our runtime as __ct.
+    // The instrumenter (M16a) emits __ct.write(siteId) for synthetic
+    // per-assignment events, so the shim must expose write/ even
+    // when the underlying runtime treats it as a no-op.
     const wrappedCode = `
       const __ct = {
         step: function(siteId) { rt.step(siteId); },
         enter: function(fnId, args) { rt.enter(fnId, args); },
         ret: function(fnId, value) { return rt.ret(fnId, value); },
+        write: function(_siteId) {},
       };
       ${instrumentedCode}
     `;

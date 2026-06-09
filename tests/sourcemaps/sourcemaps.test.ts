@@ -400,12 +400,15 @@ console.log(greeting.message);
     // Its line should be from the original TS source (line 7)
     expect(createGreetingFn!.line).toBe(7);
 
-    // Verify the instrumented code still works with a no-op __ct
+    // Verify the instrumented code still works with a no-op __ct.
+    // The instrumenter (M16a) emits __ct.write(siteId) for synthetic
+    // per-assignment events, so the no-op shim must include write.
     const wrappedCode = `
       const __ct = {
         step: function(_siteId) {},
         enter: function(_fnId, _args) {},
         ret: function(_fnId, value) { return value; },
+        write: function(_siteId) {},
       };
       ${instResult.code}
     `;
