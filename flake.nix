@@ -164,6 +164,13 @@
               pkg-config
               capnproto
               makeWrapper
+              # codetracer_trace_writer_nim/build.rs compiles the Nim FFI
+              # static lib at cargo build time -- the previous derivation
+              # only exposed Nim in devShell, so the package build failed
+              # with "could not find native static library
+              # codetracer_trace_writer".
+              nim
+              nimble
             ];
 
             buildInputs = lib.optionals isDarwin (
