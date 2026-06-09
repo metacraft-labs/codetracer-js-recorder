@@ -450,6 +450,16 @@ globalThis.__ct = {
     } catch(e) {}
     return value;
   },
+  // M16a: synthetic per-assignment write event emitted by the
+  // instrumenter (see packages/instrumenter/src/visitor.ts).  Event
+  // type 7 = EVENT_ASSIGNMENT (distinct from the IO EVENT_WRITE at
+  // event type 3 used for stdout / stderr captures and from the
+  // EVENT_THREAD_* events at 4-6).  Kept side-effect-free so it
+  // never disrupts the instrumented program if the runtime is
+  // partially initialised.
+  write: function(siteId) {
+    try { checkAsyncContext(); pushEvent(7, siteId); } catch(e) {}
+  },
 };
 
 // Install console capture for IO recording
