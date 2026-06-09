@@ -19,6 +19,27 @@
       url = "github:metacraft-labs/codetracer-trace-format/main";
       flake = false;
     };
+    # codetracer_trace_writer_nim's build.rs reads the FFI entry
+    # point from this sibling repo and compiles it to a static lib
+    # at cargo build time.  Without the source the build aborts with
+    # "Nim FFI entry point not found".
+    codetracer-trace-format-nim = {
+      url = "github:metacraft-labs/codetracer-trace-format-nim/main";
+      flake = false;
+    };
+    # Nim packages the Nim FFI library declares as ``requires`` in its
+    # .nimble.  We resolve them via flake inputs (no network access
+    # inside the Nix sandbox) and pass their paths through
+    # CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS so the bare ``nim c``
+    # invocation finds them without a ``nimble install`` step.
+    nim-stew = {
+      url = "github:status-im/nim-stew/master";
+      flake = false;
+    };
+    nim-results = {
+      url = "github:arnetheduck/nim-results/master";
+      flake = false;
+    };
   };
 
   outputs =
@@ -28,6 +49,9 @@
       fenix,
       pre-commit-hooks,
       codetracer-trace-format,
+      codetracer-trace-format-nim,
+      nim-stew,
+      nim-results,
     }:
     let
       systems = [
@@ -202,6 +226,18 @@
                   'path = "../../../codetracer-trace-format/codetracer_ctfs"' \
                   'path = "${codetracer-trace-format}/codetracer_ctfs"'
             '';
+
+            # codetracer_trace_writer_nim/build.rs runs Nim against the
+            # FFI sources at this path and ``nimble install --depsOnly``
+            # to resolve the .nimble's ``requires`` (stew, results).  The
+            # nimble step needs network access, which is unavailable
+            # inside the Nix sandbox -- skip it via
+            # ``CODETRACER_TRACE_FORMAT_NIM_SKIP_NIMBLE_INSTALL=1`` and
+            # provide ``stew`` / ``results`` via ``--path:`` directives
+            # injected through ``CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS``.
+            CODETRACER_TRACE_FORMAT_NIM_DIR = "${codetracer-trace-format-nim}";
+            CODETRACER_TRACE_FORMAT_NIM_SKIP_NIMBLE_INSTALL = "1";
+            CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS = "${nim-stew}:${nim-results}";
 
             buildPhase = ''
               runHook preBuild
