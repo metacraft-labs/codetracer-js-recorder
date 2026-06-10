@@ -437,19 +437,23 @@ describe("e2e_record_simple_program", () => {
 
     // ----- Exact decoded return value ---------------------------------
     // greet("World") returns the concatenated string "Hello, World!".
-    // The JS recorder snapshots return values via ValueRecord::Raw
-    // (textual rendering) — the strict `kind === "Raw"` invariant
-    // means: if a future recorder upgrade emits ValueRecord::String
-    // (or any other variant), this test fails loudly and the next
-    // maintainer extends the assertion to the new variant rather than
-    // silently accepting it.
+    // Historically the JS recorder snapshotted return values via
+    // ValueRecord::Raw (textual rendering); since the runtime's
+    // encodeValue() upgrade, strings are encoded as ValueRecord::String
+    // (typed rendering) just like call arguments above.  Accept either
+    // variant explicitly — a future recorder upgrade to a new variant
+    // still fails this assertion loudly so the next maintainer must
+    // consciously extend it (per the original test author's intent).
     const greetExit = full.events.find(
       (e): e is Extract<CtFullEvent, { kind: "call_exit" }> =>
         e.kind === "call_exit" && e.function.endsWith("greet"),
     );
     expect(greetExit).toBeDefined();
-    expect(greetExit!.return_value.kind).toBe("Raw");
-    expect(greetExit!.return_value.r).toBe("Hello, World!");
+    const rv = greetExit!.return_value;
+    expect(["String", "Raw"]).toContain(rv.kind);
+    // ValueRecord::String carries the payload in `.text`; ::Raw in `.r`.
+    const rvText = rv.kind === "String" ? rv.text : rv.r;
+    expect(rvText).toBe("Hello, World!");
 
     // ----- Exact (varname, value) step-var pairs ----------------------
     // Collect every (varname, value-text) pair surfaced by step events.
@@ -480,19 +484,28 @@ describe("e2e_record_simple_program", () => {
     }
 
     // The canonical (var, kind, value) tuples for hello.js — these
-    // anchor the JS recorder's exact-value contract:
-    //   * `name = "World"` inside greet's body (Raw form).
-    const expectedStepVars: StepVarObservation[] = [
-      { name: "name", kind: "Raw", text: "World" },
-    ];
+    // anchor the JS recorder's exact-value contract.  Historically
+    // `name = "World"` came through as ValueRecord::Raw; after the
+    // runtime encodeValue() upgrade strings are typed and emitted as
+    // ValueRecord::String.  The test accepts either textual variant
+    // explicitly (see the return-value assertion above for the same
+    // String/Raw upgrade) — any future variant change still fails
+    // loudly so the next maintainer must consciously extend it.
+    const expectedStepVars: Array<{
+      name: string;
+      kinds: ReadonlyArray<string>;
+      text: string;
+    }> = [{ name: "name", kinds: ["String", "Raw"], text: "World" }];
     for (const want of expectedStepVars) {
       const found = observedStepVars.some(
         (o) =>
-          o.name === want.name && o.kind === want.kind && o.text === want.text,
+          o.name === want.name &&
+          want.kinds.includes(o.kind) &&
+          o.text === want.text,
       );
       expect(
         found,
-        `expected step variable \`${want.name}\` = ${want.kind} ` +
+        `expected step variable \`${want.name}\` = ${want.kinds.join("|")} ` +
           `\`${want.text}\` in --full output; observed = ` +
           JSON.stringify(observedStepVars),
       ).toBe(true);
