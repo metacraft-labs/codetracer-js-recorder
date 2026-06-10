@@ -141,7 +141,13 @@ struct ManifestSite {
     kind: String,
     path_index: usize,
     line: u32,
-    #[allow(dead_code)]
+    /// P2.1: column offset for this site.  Sourced from
+    /// `loc.start.column` (SWC byte offset within the line, 0-based).
+    /// Read by the column-aware step-emission cursor in
+    /// `append_events` to fold into `DeltaColumn` events.  When the
+    /// manifest predates P2 the field defaults to `0` (the canonical
+    /// "no column information available" sentinel).
+    #[serde(default)]
     col: u32,
     #[allow(dead_code)]
     fn_id: Option<usize>,
@@ -157,6 +163,16 @@ struct Manifest {
     sites: Vec<ManifestSite>,
     #[serde(default)]
     sources_content: HashMap<String, String>,
+    /// P2.3: per-source line-length tables keyed by source path.  Each
+    /// entry is the byte-length-per-line array used to populate the
+    /// CTFS `paths.dat` Layout A line-length record (see
+    /// `codetracer-trace-format-spec/trace-events.md` §"paths.dat
+    /// per-line offset table — Layout A").  Defaults to empty when
+    /// the manifest predates P2 — the writer falls back to the
+    /// bare-path `register_path` record and the column-aware reader
+    /// surfaces `column = None` for those files.
+    #[serde(default)]
+    line_lengths: HashMap<String, Vec<u32>>,
 }
 
 // ── Value types (deserialized from JS) ───────────────────────────────
@@ -283,10 +299,20 @@ struct TypeRecord {
 }
 
 /// Mirrors `codetracer_trace_types::StepRecord`.
+///
+/// P2.2: `column` is `Some(c)` when the upstream Babel/SWC manifest
+/// carried a column offset for this site, `None` otherwise.  Column
+/// numbering is 1-based on the wire (the canonical CTFS
+/// `DeltaColumn` writer applies the +1 conversion); the manifest
+/// stores SWC's 0-based offset.  When `column_aware` mode is off
+/// the field is ignored by `write_binary_trace` and the writer takes
+/// the legacy `register_step` path.
 #[derive(Debug, Clone, Serialize)]
 struct StepRecord {
     path_id: usize,
     line: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    column: Option<i64>,
 }
 
 /// Mirrors `codetracer_trace_types::FunctionRecord`.
@@ -479,6 +505,13 @@ struct RecorderState {
     args: Vec<String>,
     type_registry: TypeRegistry,
     var_name_registry: VariableNameRegistry,
+    /// P2.6: when true, the writer is opted into column-aware step
+    /// encoding at trace-flush time.  Defaults to true; gated by the
+    /// `columnAware` field of the `startRecording` options object
+    /// (which itself is wired through the runtime's
+    /// `StartRecordingOptions.columnAware` flag and the CLI's
+    /// `--column-aware` / `--no-column-aware` toggle).
+    column_aware: bool,
 }
 
 // Global handle counter
@@ -692,6 +725,18 @@ pub fn start_recording(opts: JsObject) -> Result<u32> {
     // The recorder is CTFS-only (Recorder-CLI-Conventions.md §4) — there is
     // no `format` parameter on the addon's `startRecording` call.
 
+    // P2.6: column-aware opt-in.  Defaults to `true` per the milestone
+    // spec.  The TypeScript runtime (`StartRecordingOptions`) passes
+    // the resolved boolean unconditionally, but JS callers that bypass
+    // the runtime (custom integrations) can omit the field — we
+    // honour the spec default in that case.
+    let column_aware: bool = opts
+        .get_named_property::<napi::JsUnknown>("columnAware")
+        .ok()
+        .and_then(|v| v.coerce_to_bool().ok())
+        .map(|b| b.get_value().unwrap_or(true))
+        .unwrap_or(true);
+
     // Parse manifest
     let manifest: Manifest = serde_json::from_str(&manifest_json).map_err(|e| {
         Error::new(
@@ -762,6 +807,7 @@ pub fn start_recording(opts: JsObject) -> Result<u32> {
         args,
         type_registry,
         var_name_registry,
+        column_aware,
     };
 
     recorder_map()
@@ -830,9 +876,23 @@ pub fn append_events(
             // step
             0 => {
                 if let Some(site) = state.manifest.sites.get(id) {
+                    // P2.2: forward the SWC byte offset (0-based) to the
+                    // step record.  The column-aware writer pass below
+                    // converts the offset to a 1-based column when it
+                    // emits the canonical `DeltaColumn` event (tag 0x07).
+                    // The manifest's `col` is `0` when the site predates
+                    // P2 — we surface that as `None` to preserve the
+                    // line-only step shape downstream readers expect from
+                    // pre-P2 traces.
+                    let column = if state.column_aware {
+                        Some(site.col as i64)
+                    } else {
+                        None
+                    };
                     state.events.push(TraceEvent::Step(StepRecord {
                         path_id: site.path_index,
                         line: site.line as i64,
+                        column,
                     }));
                 }
             }
@@ -1084,14 +1144,68 @@ fn write_binary_trace(
     // metadata + paths streams into the container on close.
     writer.begin_writing_trace_events(&trace_dir.join("trace.ct"))?;
 
+    // P2.6: opt the canonical CTFS writer into column-aware step
+    // encoding *before* the first `register_step` / `start` call.
+    // `enable_column_aware_steps` is sticky for the lifetime of the
+    // trace and gates the writer's `DeltaColumn` (tag 0x07) emission
+    // path.  On legacy CBOR backends this is a trait-default no-op
+    // (see `codetracer_trace_writer_nim/src/lib.rs:1135-1137`), but
+    // the JS recorder is pinned to the Nim multi-stream writer so
+    // the call lands on the real implementation.
+    if state.column_aware {
+        writer.enable_column_aware_steps();
+    }
+
     // We need to track whether we've called `start()` yet — the Nim writer
     // requires a `start()` call before registering steps/calls.
     let mut started = false;
 
+    // P2.2: per-trace column cursor.  The JS recorder doesn't track
+    // a frame stack at this layer (the runtime/N-API boundary works
+    // with a flat event queue), so we use a single global cursor.
+    // Same-line moves emit a single `DeltaColumn`; line changes emit
+    // a fresh `register_step` (which resets the writer's cursor to 1
+    // per spec) followed by an optional `DeltaColumn` to land at the
+    // desired column.
+    let mut last_line: Option<i64> = None;
+    let mut last_column: Option<i64> = None;
+
+    // P2.5: track paths we've registered with their line-length
+    // tables so we emit the `paths.dat` Layout A record exactly once
+    // per path (the first registration wins per the Nim writer's
+    // semantics).
+    let mut paths_with_line_lengths: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+
     for event in &state.events {
         match event {
             TraceEvent::Path(p) => {
-                writer.register_path(p);
+                // P2.5: when column-aware mode is on and the manifest
+                // ships a line-length table for this path, register
+                // it via the Layout A entry point.  Otherwise the
+                // legacy `register_path` call is preserved (the Nim
+                // writer takes the bare-path branch).
+                if state.column_aware {
+                    let path_str = p.to_string_lossy();
+                    let line_lengths_opt = state.manifest.line_lengths.get(path_str.as_ref());
+                    let line_lengths_slice: &[u32] =
+                        line_lengths_opt.map(Vec::as_slice).unwrap_or(&[]);
+                    if let Err(err) = writer.register_path_with_line_lengths(p, line_lengths_slice)
+                    {
+                        // Soft failure: the trace is still usable
+                        // without per-line column counts (column
+                        // resolution falls back to None at read time).
+                        eprintln!(
+                            "[codetracer-js-recorder] register_path_with_line_lengths failed for {}: {} \
+                             (column resolution will fall back to None for this file)",
+                            p.display(),
+                            err,
+                        );
+                    }
+                    paths_with_line_lengths.insert(p.clone());
+                } else {
+                    writer.register_path(p);
+                }
             }
             TraceEvent::Type(tr) => {
                 let upstream_kind = local_type_kind_to_upstream(tr.kind);
@@ -1124,7 +1238,87 @@ fn write_binary_trace(
                     started = true;
                 }
 
-                writer.register_step(&path, codetracer_trace_types::Line(sr.line));
+                // P2.5: lazy register-with-line-lengths.  Path events
+                // for files reached only through the source-map
+                // resolver may not have a corresponding TraceEvent::Path
+                // entry up front; when we see the first step for a
+                // file we haven't registered yet, fall through to the
+                // Layout A entry point now (when column-aware).
+                if state.column_aware && !paths_with_line_lengths.contains(&path) {
+                    let path_str = path.to_string_lossy();
+                    let line_lengths_opt = state.manifest.line_lengths.get(path_str.as_ref());
+                    let line_lengths_slice: &[u32] =
+                        line_lengths_opt.map(Vec::as_slice).unwrap_or(&[]);
+                    if let Err(err) =
+                        writer.register_path_with_line_lengths(&path, line_lengths_slice)
+                    {
+                        eprintln!(
+                            "[codetracer-js-recorder] register_path_with_line_lengths failed for {}: {} \
+                             (column resolution will fall back to None for this file)",
+                            path.display(),
+                            err,
+                        );
+                    }
+                    paths_with_line_lengths.insert(path.clone());
+                }
+
+                // P2.2: column-aware step emission.  Mirrors the
+                // Python recorder's cursor pattern (see
+                // `codetracer-python-recorder/src/runtime/tracer/events.rs:443-488`):
+                //
+                //   * Same-line move with a known previous column:
+                //     emit one `DeltaColumn(new - prev)` event (a
+                //     no-op when delta is 0; the cursor still updates).
+                //
+                //   * Line change OR first step: emit a fresh
+                //     `register_step(path, line)` — the writer resets
+                //     its column cursor to 1 per the CTFS spec — then
+                //     a `DeltaColumn(new - 1)` when `new > 1` to land
+                //     at the desired column.
+                //
+                //   * `column_aware` disabled OR no column info on the
+                //     site: fall back to plain `register_step` (no
+                //     `DeltaColumn` events).
+                //
+                // The manifest's `col` is the SWC byte offset on the
+                // line (0-based).  The CTFS spec uses 1-based column
+                // numbering, so the on-wire target column is
+                // `manifest_col + 1`.
+                let new_line = sr.line;
+                let new_column_1based: Option<i64> = sr.column.map(|c| c + 1);
+
+                // Every `TraceEvent::Step` is a logical step in the
+                // user's mental model — record one `register_step` per
+                // invocation so the user-facing step count matches the
+                // number of times the runtime emitted a step (the
+                // pre-column-aware semantic).  Column nudges layer on
+                // top as optional refinements.
+                writer.register_step(&path, codetracer_trace_types::Line(new_line));
+
+                if let (true, Some(new_col)) = (state.column_aware, new_column_1based) {
+                    // The writer's column cursor resets to 1 only on a
+                    // line transition (CTFS spec §"Column Encoding").
+                    // Same-line repeat steps keep the previous column
+                    // cursor untouched, so a DeltaColumn nudge is only
+                    // needed when the target column differs from where
+                    // the cursor already sits.
+                    let same_line = last_line == Some(new_line);
+                    let cursor_after_register: i64 = if same_line {
+                        last_column.unwrap_or(1)
+                    } else {
+                        1
+                    };
+                    let delta = new_col - cursor_after_register;
+                    if delta != 0 {
+                        writer.write_delta_column(delta);
+                    }
+                    last_line = Some(new_line);
+                    last_column = Some(new_col);
+                } else {
+                    // Legacy / column-aware-off path: line-only step.
+                    last_line = Some(new_line);
+                    last_column = None;
+                }
             }
             TraceEvent::Call(cr) => {
                 // Look up function info from the manifest to ensure the function

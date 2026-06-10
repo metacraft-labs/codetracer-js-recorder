@@ -59,11 +59,18 @@ function mergeManifestSlices(
   functions: FunctionEntry[];
   sites: SiteEntry[];
   sourcesContent?: Record<string, string>;
+  lineLengths?: Record<string, number[]>;
 } {
   const paths: string[] = [];
   const functions: FunctionEntry[] = [];
   const sites: SiteEntry[] = [];
   const sourcesContent: Record<string, string> = {};
+  // P2.3: merged per-source line-length tables keyed by source path.
+  // The native addon forwards the merged table through
+  // `register_path_with_line_lengths` so the CTFS writer's `paths.dat`
+  // ships the Layout A line-length record needed for column-aware
+  // decoding.
+  const lineLengths: Record<string, number[]> = {};
 
   const globalPathMap = new Map<string, number>();
 
@@ -107,6 +114,20 @@ function mergeManifestSlices(
         sourcesContent[key] = value;
       }
     }
+
+    // P2.3: merge line-length tables.  The first slice wins on
+    // collisions — re-instrumenting the same file in a different
+    // compilation run yields the same byte counts, so the choice
+    // doesn't matter in practice.  We slice() before storing to
+    // protect against the originating slice mutating the array
+    // afterward.
+    if (slice.lineLengths) {
+      for (const [key, value] of Object.entries(slice.lineLengths)) {
+        if (!(key in lineLengths)) {
+          lineLengths[key] = value.slice();
+        }
+      }
+    }
   }
 
   const result: {
@@ -114,10 +135,14 @@ function mergeManifestSlices(
     functions: FunctionEntry[];
     sites: SiteEntry[];
     sourcesContent?: Record<string, string>;
+    lineLengths?: Record<string, number[]>;
   } = { paths, functions, sites };
 
   if (Object.keys(sourcesContent).length > 0) {
     result.sourcesContent = sourcesContent;
+  }
+  if (Object.keys(lineLengths).length > 0) {
+    result.lineLengths = lineLengths;
   }
 
   return result;

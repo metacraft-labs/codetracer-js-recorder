@@ -361,6 +361,15 @@ export interface NativeAddon {
     program: string;
     args: string[];
     manifestJson: string;
+    /**
+     * P2.6: opt the writer into column-aware step encoding (CTFS
+     * `DeltaColumn` tag 0x07 + `paths.dat` Layout A line-length
+     * tables).  Defaults to `true`; pass `false` to fall back to
+     * line-only step encoding (matches the pre-P2 trace shape).
+     * See `codetracer-specs/Planned-Features/
+     * Column-Aware-Tracing-And-Deminification.milestones.org` §P2.
+     */
+    columnAware?: boolean;
   }): number;
   appendEvents(
     handle: number,
@@ -386,6 +395,13 @@ export interface StartRecordingOptions {
   args?: string[];
   /** When true, do NOT register process.on('exit') for auto flush+stop. */
   skipProcessHooks?: boolean;
+  /**
+   * P2.6: opt the writer into column-aware step encoding.  Defaults to
+   * `true` (matches the spec's recommended default).  Pass `false` to
+   * fall back to line-only steps; the trace will be smaller but the
+   * column-aware decoder will surface `column = None` for every step.
+   */
+  columnAware?: boolean;
 }
 
 /** Handle returned by startRecording, used to control the recording. */
@@ -710,6 +726,7 @@ export function startRecording(
     program,
     args = [],
     skipProcessHooks = false,
+    columnAware = true,
   } = opts;
 
   if (!runtime.manifest) {
@@ -739,6 +756,7 @@ export function startRecording(
       program,
       args,
       manifestJson,
+      columnAware,
     });
   } catch (err) {
     process.stderr.write(

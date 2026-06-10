@@ -66,6 +66,41 @@ function computeSwcBaseOffset(source: string, moduleSpanStart: number): number {
 }
 
 /**
+ * P2.3: compute the per-line byte-length table from a source string.
+ *
+ * `lineLengths[i]` is the byte count of source line `i+1` (1-based
+ * line numbering matching the CTFS spec), excluding the trailing
+ * `\n`.  An `\r\n` terminator contributes its `\r` to the line's
+ * byte count, which keeps the table consistent with the column
+ * offsets the SWC instrumenter emits (also byte offsets).  A file
+ * that doesn't end with `\n` still has its final line counted.
+ *
+ * The output unit is "UTF-8 code units" (the JS `string.length`
+ * counts UTF-16 code units, so we encode through `Buffer.byteLength`
+ * to get the byte count the column-aware reader expects).
+ *
+ * See `codetracer-trace-format-spec/trace-events.md` §"paths.dat
+ * per-line offset table — Layout A" for the on-wire layout these
+ * counts populate.
+ */
+export function computeLineLengths(source: string): number[] {
+  const lengths: number[] = [];
+  let lineStart = 0;
+  for (let i = 0; i < source.length; i++) {
+    if (source.charCodeAt(i) === 0x0a /* '\n' */) {
+      const line = source.slice(lineStart, i);
+      lengths.push(Buffer.byteLength(line, "utf-8"));
+      lineStart = i + 1;
+    }
+  }
+  if (lineStart < source.length) {
+    const line = source.slice(lineStart);
+    lengths.push(Buffer.byteLength(line, "utf-8"));
+  }
+  return lengths;
+}
+
+/**
  * Determine the SWC parser config based on the filename extension.
  */
 function getParserConfig(filename: string): ParserConfig {
@@ -125,6 +160,14 @@ export function instrument(
   // Create manifest builder
   const manifest = new ManifestBuilder();
   const pathIndex = manifest.addPath(filename);
+  // P2.3: register the per-line byte-length table for the source
+  // we're instrumenting.  The native addon forwards this through
+  // `register_path_with_line_lengths` so the CTFS writer's `paths.dat`
+  // ships the Layout A line-length record the column-aware reader
+  // needs to resolve `(line, column)` ↔ `global_position_index`
+  // round-trips.  We use the cleaned source (sourceMappingURL
+  // stripped) so the byte offsets match what SWC saw.
+  manifest.setLineLengths(filename, computeLineLengths(cleanCode));
 
   // If we have a source map resolver, register original source paths
   // and store sourcesContent
@@ -137,6 +180,11 @@ export function instrument(
         manifest.addPath(src);
         if (sourcesContent[i] != null) {
           manifest.setSourceContent(src, sourcesContent[i]!);
+          // P2.3: derive a line-length table from the embedded
+          // sourcesContent so column-aware decoding works even when
+          // the original source isn't on disk (typical for bundled /
+          // minified JS shipped with an inline sourceMap).
+          manifest.setLineLengths(src, computeLineLengths(sourcesContent[i]!));
         }
       }
     }

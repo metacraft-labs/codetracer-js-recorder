@@ -39,6 +39,22 @@ export interface ManifestSlice {
    * even when original sources are not on disk.
    */
   sourcesContent?: Record<string, string>;
+  /**
+   * P2.3: per-source line-length tables keyed by source path.  Each
+   * entry is an array of byte counts — `lineLengths[path][i]` is the
+   * addressable column count of source line `i+1` (1-based line
+   * numbering matching the CTFS spec).  Used by the native addon to
+   * populate `paths.dat` Layout A line-length tables so the canonical
+   * column-aware reader can resolve `(line, column)` ↔
+   * `global_position_index` round-trips.
+   *
+   * Lengths are byte counts (UTF-8 code units), not character counts —
+   * this matches the SWC instrumenter's column offsets (also byte
+   * counts).  See
+   * `codetracer-trace-format-spec/trace-events.md` §"paths.dat
+   * per-line offset table — Layout A".
+   */
+  lineLengths?: Record<string, number[]>;
 }
 
 export interface FunctionEntry {

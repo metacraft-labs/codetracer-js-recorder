@@ -76,11 +76,17 @@ function mergeManifestSlices(
   functions: FunctionEntry[];
   sites: SiteEntry[];
   sourcesContent?: Record<string, string>;
+  lineLengths?: Record<string, number[]>;
 } {
   const paths: string[] = [];
   const functions: FunctionEntry[] = [];
   const sites: SiteEntry[] = [];
   const sourcesContent: Record<string, string> = {};
+  // P2.3: merged per-source line-length tables keyed by source path
+  // (mirror of instrument-cmd.ts).  The native addon ships these
+  // through `register_path_with_line_lengths` so the CTFS writer's
+  // `paths.dat` carries the Layout A line-length record.
+  const lineLengths: Record<string, number[]> = {};
 
   const globalPathMap = new Map<string, number>();
 
@@ -121,6 +127,17 @@ function mergeManifestSlices(
         sourcesContent[key] = value;
       }
     }
+
+    // P2.3: merge per-source line-length tables.  First slice wins on
+    // duplicate keys — re-instrumenting the same file always produces
+    // the same byte counts, so the choice is inert.
+    if (slice.lineLengths) {
+      for (const [key, value] of Object.entries(slice.lineLengths)) {
+        if (!(key in lineLengths)) {
+          lineLengths[key] = value.slice();
+        }
+      }
+    }
   }
 
   const result: {
@@ -128,10 +145,14 @@ function mergeManifestSlices(
     functions: FunctionEntry[];
     sites: SiteEntry[];
     sourcesContent?: Record<string, string>;
+    lineLengths?: Record<string, number[]>;
   } = { paths, functions, sites };
 
   if (Object.keys(sourcesContent).length > 0) {
     result.sourcesContent = sourcesContent;
+  }
+  if (Object.keys(lineLengths).length > 0) {
+    result.lineLengths = lineLengths;
   }
 
   return result;
@@ -155,6 +176,12 @@ function parseArgs(args: string[]): {
   appArgs: string[];
   include: string[];
   exclude: string[];
+  /**
+   * P2.6: opt the writer into column-aware step encoding.  Defaults to
+   * `true` per the milestone spec — pass `--no-column-aware` to fall
+   * back to line-only step encoding.
+   */
+  columnAware: boolean;
 } {
   let entryFile: string | undefined;
   let outDirFromFlag: string | undefined;
@@ -162,6 +189,10 @@ function parseArgs(args: string[]): {
   const include: string[] = [];
   const exclude: string[] = [];
   let seenDashDash = false;
+  // P2.6: column-aware step encoding defaults ON.  The companion
+  // `--no-column-aware` flag forces the legacy line-only path for
+  // bisection / back-compat testing.
+  let columnAware = true;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -182,18 +213,24 @@ function parseArgs(args: string[]): {
       include.push(args[++i]);
     } else if (arg === "--exclude" && i + 1 < args.length) {
       exclude.push(args[++i]);
+    } else if (arg === "--column-aware") {
+      columnAware = true;
+    } else if (arg === "--no-column-aware") {
+      columnAware = false;
     } else if (arg === "--help" || arg === "-h") {
       // Per Recorder-CLI-Conventions.md §4 the recorder is CTFS-only:
       // there is no `--format` flag and no `CODETRACER_FORMAT` env var.
       // Use `ct print` from codetracer-trace-format-nim to convert the
       // produced .ct bundle to JSON / text.
       console.log(
-        `Usage: codetracer-js-recorder record <file> [-o|--out-dir <dir>] [--include <glob>] [--exclude <glob>] [-- app-args...]
+        `Usage: codetracer-js-recorder record <file> [-o|--out-dir <dir>] [--include <glob>] [--exclude <glob>] [--no-column-aware] [-- app-args...]
 
 Options:
   -o, --out-dir <dir>     Trace output directory (default: ./ct-traces/)
   --include <glob>        Include glob pattern (repeatable)
   --exclude <glob>        Exclude glob pattern (repeatable)
+  --column-aware          Emit column-aware step encoding (default: on)
+  --no-column-aware       Fall back to line-only step encoding
 
 Environment variables:
   CODETRACER_JS_RECORDER_OUT_DIR    Output directory (overridden by --out-dir)
@@ -228,7 +265,14 @@ JSON / text conversion of the produced bundle.`,
     outDirFromFlag ??
     (envOutDir && envOutDir.length > 0 ? envOutDir : "./ct-traces/");
 
-  return { entryFile: entryFile!, outDir, appArgs, include, exclude };
+  return {
+    entryFile: entryFile!,
+    outDir,
+    appArgs,
+    include,
+    exclude,
+    columnAware,
+  };
 }
 
 /**
@@ -249,6 +293,13 @@ function generateRunner(opts: {
   outDir: string;
   program: string;
   appArgs: string[];
+  /**
+   * P2.6: when true, the recorder emits column-aware step events
+   * (CTFS `DeltaColumn` tag 0x07 + `paths.dat` Layout A line-length
+   * tables).  Mirrors the `--column-aware` / `--no-column-aware` CLI
+   * flag.
+   */
+  columnAware: boolean;
 }): string {
   // Escape paths for embedding in JS strings (handle backslashes on Windows)
   const esc = (s: string) => JSON.stringify(s);
@@ -273,6 +324,7 @@ var handle = addon.startRecording({
   program: ${esc(opts.program)},
   args: ${JSON.stringify(opts.appArgs)},
   manifestJson: manifestJson,
+  columnAware: ${JSON.stringify(opts.columnAware)},
 });
 
 // Deep value encoding with depth/circular/size limits
@@ -554,7 +606,8 @@ function recordingDisabledByEnv(): boolean {
  * Entry point for the `record` command.
  */
 export function recordCommand(args: string[]): void {
-  const { entryFile, outDir, appArgs, include, exclude } = parseArgs(args);
+  const { entryFile, outDir, appArgs, include, exclude, columnAware } =
+    parseArgs(args);
 
   if (recordingDisabledByEnv()) {
     // §5: when recording is disabled via env, the recorder must not
@@ -699,6 +752,7 @@ export function recordCommand(args: string[]): void {
       outDir: traceOutDir,
       program: path.resolve(mainEntry),
       appArgs,
+      columnAware,
     });
 
     const runnerPath = path.join(tmpDir, "__ct_runner.js");

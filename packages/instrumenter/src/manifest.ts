@@ -10,6 +10,17 @@ export class ManifestBuilder {
   private sites: SiteEntry[] = [];
   private pathIndexMap = new Map<string, number>();
   private _sourcesContent = new Map<string, string>();
+  /**
+   * P2.3: per-source line-length tables keyed by source path.  Each
+   * value is an array of byte-lengths (excluding the trailing newline)
+   * for every line in the source.  The native addon forwards this
+   * through `register_path_with_line_lengths` so the CTFS writer's
+   * `paths.dat` carries the Layout A line-length record the column-
+   * aware reader needs.  See
+   * `codetracer-trace-format-spec/trace-events.md` §"paths.dat
+   * per-line offset table — Layout A".
+   */
+  private _lineLengths = new Map<string, number[]>();
 
   /**
    * Register a file path and return its index.
@@ -28,6 +39,16 @@ export class ManifestBuilder {
    */
   setSourceContent(filePath: string, content: string): void {
     this._sourcesContent.set(filePath, content);
+  }
+
+  /**
+   * P2.3: store the per-line byte-length table for a path.  Lengths
+   * exclude the trailing newline; an entry of `N` means "line `i+1` is
+   * `N` bytes long".  See `computeLineLengths` in `instrument.ts` for
+   * the canonical computation from a source string.
+   */
+  setLineLengths(filePath: string, lengths: number[]): void {
+    this._lineLengths.set(filePath, lengths);
   }
 
   /**
@@ -155,6 +176,16 @@ export class ManifestBuilder {
         sourcesContent[k] = v;
       }
       result.sourcesContent = sourcesContent;
+    }
+
+    if (this._lineLengths.size > 0) {
+      const lineLengths: Record<string, number[]> = {};
+      for (const [k, v] of this._lineLengths) {
+        // Copy the array so callers can't mutate our state through the
+        // returned manifest slice.
+        lineLengths[k] = v.slice();
+      }
+      result.lineLengths = lineLengths;
     }
 
     return result;
