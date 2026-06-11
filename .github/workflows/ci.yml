@@ -81,8 +81,13 @@ jobs:
             nimble install -y stew results
             nim c --app:staticlib --mm:arc --noMain -d:release --passC:'-fPIC' -p:src \
               -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
+            # Build ct-print so the test helpers can inspect srcviews.dat
+            # (recorder_autoformat.test.ts requires it as the canonical
+            # oracle since the P6.2 srcviews migration).
+            nim c -d:release -o:ct-print src/codetracer_ct_print.nim
           "
           echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "$GITHUB_ENV"
+          echo "CT_PRINT=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim/ct-print" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: nix develop --command npm install
