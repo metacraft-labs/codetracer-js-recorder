@@ -295,6 +295,13 @@ impl Serialize for EventLogKind {
 #[serde(tag = "kind")]
 enum TypeSpecificInfo {
     None,
+    // The Struct variant mirrors upstream `codetracer_trace_types::TypeSpecificInfo`
+    // for serialization-shape completeness. The JS recorder doesn't currently emit
+    // it because its type registry encodes struct shapes via the parent
+    // `TypeKind::Struct` discriminator + the value record's own `field_values` array,
+    // but the variant is kept so the on-disk enum tag layout matches the canonical
+    // crate byte-for-byte (consumers may serde-deserialize through this enum).
+    #[allow(dead_code)]
     Struct { fields: Vec<FieldTypeRecord> },
 }
 
@@ -421,6 +428,11 @@ enum TraceEvent {
     Call(CallRecord),
     Return(ReturnRecord),
     Event(RecordEvent),
+    // The Value variant mirrors upstream `codetracer_trace_types::TraceEvent`
+    // for tag-discriminator completeness. The JS recorder doesn't emit standalone
+    // Value events because every step bundles its values inline; the variant is
+    // kept so a serde-deserialiser walking this enum sees the canonical tag layout.
+    #[allow(dead_code)]
     Value(FullValueRecord),
     ThreadStart(u64),
     ThreadSwitch(u64),
