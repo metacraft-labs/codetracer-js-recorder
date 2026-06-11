@@ -1,0 +1,22 @@
+# Variable rename list for the transitive composition test.
+#
+# This file is consumed by the replay-server's `SourcemapCache` at
+# trace-open time (see `codetracer/src/db-backend/src/rename_list.rs`).
+# The composition tested here is:
+#
+#   formatted view (recorder autoformat) → recorded minified ('a')
+#       → original.js 'calculateSum'   (via upstream V3 sourcemap)
+#       → 'addNumbers'                 (via this rename list)
+#
+# The `file = "original.js"` key matches the `sources[0]` entry inside
+# minified.js.map — that's the original-side path the per-position
+# sourcemap lookup yields once the upstream `names[]` recovery applied.
+
+[meta]
+version = "1"
+
+[[rename]]
+file = "original.js"
+scope = "global"
+from = "calculateSum"
+to = "addNumbers"

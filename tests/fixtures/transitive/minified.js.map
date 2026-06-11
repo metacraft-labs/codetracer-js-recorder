@@ -1,0 +1,18 @@
+{
+  "version": 3,
+  "file": "minified.js",
+  "names": [
+    "calculateSum",
+    "leftOperand",
+    "rightOperand",
+    "computedResult"
+  ],
+  "sources": [
+    "original.js"
+  ],
+  "sourcesContent": [
+    "function calculateSum(leftOperand, rightOperand) {\n  const computedResult = leftOperand + rightOperand;\n  return computedResult;\n}\nmodule.exports = { calculateSum };\ncalculateSum(3, 4);\n"
+  ],
+  "mappings": "AAAA,SAASA,EAAaC,EAAaC,GACjC,MAAMC,EAAiBF,EAAcC,EACrC,OAAOC,GAET,gBAAmBH,aAAAA,IACnBA",
+  "ignoreList": []
+}

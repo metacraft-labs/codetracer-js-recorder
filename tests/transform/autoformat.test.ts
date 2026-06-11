@@ -12,9 +12,12 @@
  */
 
 import { describe, it, expect } from "vitest";
+import * as fs from "node:fs";
 import {
   looksMinified,
   generateInverseSourceMap,
+  resolveBundledPrettier,
+  runPrettier,
   tryAutoformat,
   autoformatEnabledByEnv,
   DEFAULT_MINIFIED_THRESHOLD,
@@ -125,6 +128,56 @@ describe("tryAutoformat", () => {
     const src = "var x = 1;\nvar y = 2;\n";
     const outcome = tryAutoformat(src, "input.js", { enabled: true });
     expect(outcome.kind).toBe("not-minified");
+  });
+});
+
+describe("resolveBundledPrettier", () => {
+  it("bundled_prettier_resolves_via_require", () => {
+    // STRICT: the recorder declares `prettier` as a runtime
+    // dependency of `@codetracer/instrumenter` so it ships inside the
+    // recorder's `node_modules` tree.  This test proves the bundled
+    // path is reachable from the instrumenter module itself — without
+    // relying on the user's PATH.
+    //
+    // A `null` return here means either:
+    //   1. The dependency was downgraded back to a devDependency
+    //      (regression — the user opt-in path is gone).
+    //   2. `npm install` was skipped (CI configuration regression).
+    //
+    // Both are real bugs we want to surface loudly, so the assertion
+    // is STRICT (no silent skip).
+    const resolved = resolveBundledPrettier();
+    expect(resolved).not.toBeNull();
+    expect(typeof resolved).toBe("string");
+    // The resolved path must point at an existing file — a stale
+    // pointer would mean the bin entry drifted away from the package
+    // layout, which would break `runPrettier`'s `node <bin>` spawn.
+    expect(fs.existsSync(resolved!)).toBe(true);
+    // Sanity check: the resolved bin entry should live under a
+    // directory called `prettier` (defensive — guards against
+    // accidental resolution of an unrelated tool that happens to
+    // declare `bin: "./prettier.js"`).
+    expect(resolved!).toMatch(/[\\/]prettier[\\/]/);
+  });
+
+  it("bundled_prettier_actually_runs", () => {
+    // End-to-end smoke: feed `runPrettier` a small minified-looking
+    // input and assert that the bundled tier produced reformatted
+    // output.  This proves we wired the `node <bin>` spawn correctly,
+    // not just the path resolution.
+    const input =
+      "function a(b,c){const d=b+c;return d;}function e(f){return f*2;}";
+    const outcome = runPrettier(input, "input.js");
+    expect(outcome.kind).toBe("ok");
+    if (outcome.kind === "ok") {
+      // Prettier always inserts at least one newline between top-level
+      // statements, so the formatted output must be multi-line.
+      expect(outcome.stdout.split("\n").length).toBeGreaterThan(1);
+      // And both function names from the input must survive the
+      // pretty-print pass (prettier doesn't rename identifiers).
+      expect(outcome.stdout).toContain("function a(b, c)");
+      expect(outcome.stdout).toContain("function e(f)");
+    }
   });
 });
 

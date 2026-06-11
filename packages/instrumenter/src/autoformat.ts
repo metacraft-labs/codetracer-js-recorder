@@ -36,6 +36,9 @@
  */
 
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { createRequire } from "node:module";
 
 /**
  * Default minified-source heuristic threshold (matches
@@ -151,19 +154,93 @@ function isOnPath(binary: string): boolean {
 }
 
 /**
+ * Resolve the prettier CLI entry shipped alongside the recorder via
+ * Node's module-resolution algorithm.
+ *
+ * The instrumenter package declares `prettier` as a runtime dependency
+ * (see `packages/instrumenter/package.json`), so prettier is always
+ * available inside the recorder's `node_modules` tree once `npm install`
+ * has run.  Resolving via `require.resolve` finds it whether the
+ * recorder was installed globally, linked, or pulled in as a workspace
+ * package — without relying on the user's `PATH`.
+ *
+ * Returns the absolute path of prettier's executable script (the file
+ * the package's `package.json#bin` points at), or `null` when prettier
+ * is not reachable from this module's resolution graph.  The script
+ * MUST be invoked through `node <path>` rather than executed directly
+ * because the file lives inside `node_modules` without a `+x` bit on
+ * many install layouts (npm strips it on Windows and on some Linux
+ * tarballs).
+ *
+ * Defensive: every step is wrapped in `try` / `catch` because the
+ * `bin` field's shape can vary by prettier major version (string vs.
+ * object) and a missing or unreadable `package.json` MUST NOT crash
+ * the recorder — the caller falls back to the system-PATH tiers.
+ */
+export function resolveBundledPrettier(): string | null {
+  try {
+    // `createRequire` lets this work in both CJS and ESM builds without
+    // a top-level `require` reference: TypeScript currently compiles
+    // this file to CJS (Node16/CommonJS, no `"type": "module"` in
+    // package.json), so `__filename` is the natural anchor; we also
+    // fall back to the source filename `__filename ?? "autoformat.ts"`
+    // for unit-test contexts that load this module via a transformer
+    // that doesn't define `__filename`.
+    //
+    // Anchoring on this module's own location is load-bearing: the
+    // resolver must find prettier under THIS package's `node_modules`,
+    // not under whatever the parent process's cwd happens to be.
+    const anchor =
+      typeof __filename !== "undefined" ? __filename : "autoformat.ts";
+    const req = createRequire(anchor);
+    const pkgPath = req.resolve("prettier/package.json");
+    const pkgJson = fs.readFileSync(pkgPath, "utf-8");
+    const pkg = JSON.parse(pkgJson) as {
+      bin?: string | Record<string, string>;
+    };
+    // prettier 3.x ships `"bin": "./bin/prettier.cjs"` (a bare string).
+    // Earlier versions used `"bin": { "prettier": "./bin/prettier.js" }`
+    // — we handle both shapes for forward / backward compatibility.
+    let binEntry: string | undefined;
+    if (typeof pkg.bin === "string") {
+      binEntry = pkg.bin;
+    } else if (pkg.bin && typeof pkg.bin === "object") {
+      binEntry = pkg.bin.prettier;
+    }
+    if (!binEntry) return null;
+    return path.join(path.dirname(pkgPath), binEntry);
+  } catch {
+    // Any failure (missing package, unreadable JSON, malformed `bin`)
+    // falls through to the system-PATH resolution tiers in
+    // `runPrettier`.  Recorder availability MUST NOT depend on the
+    // bundled lookup succeeding.
+    return null;
+  }
+}
+
+/**
  * Run prettier on `content` synchronously and return its stdout.
  *
- * Resolution order matches the replay-server fallback in
- * `db-backend/autoformat.rs::run_prettier`:
+ * Resolution order (first hit wins):
  *
- *   1. `prettier --stdin-filepath <name>` (fastest, no per-call
- *      Node-module resolution).
- *   2. `npx --no-install prettier --stdin-filepath <name>` (works on
- *      machines that have Node.js but no globally installed prettier).
+ *   1. **Bundled prettier** — `require.resolve('prettier/package.json')`
+ *      finds prettier inside the recorder's own `node_modules`.  This
+ *      is the canonical tier because the recorder declares prettier as
+ *      a hard dependency, so the bundled copy is always available
+ *      regardless of the user's `PATH`.
+ *   2. `prettier --stdin-filepath <name>` — fall back to a globally
+ *      installed prettier on `PATH` for installation layouts that
+ *      didn't ship the bundled copy (defensive — handles odd setups
+ *      like a stripped-down container image).
+ *   3. `npx --no-install prettier --stdin-filepath <name>` — last
+ *      resort for machines that have Node.js but no globally installed
+ *      prettier.  `--no-install` makes sure we never spend 30+ seconds
+ *      downloading prettier on the record-start hot path.
  *
- * `--no-install` makes sure we never spend 30+ seconds downloading
- * prettier on the record-start hot path.  Recording is meant to be
- * fast — silently downloading 30 MB of npm dependencies isn't.
+ * Mirrors the replay-server fallback in
+ * `db-backend/autoformat.rs::run_prettier` for the PATH-based tiers;
+ * the bundled tier is recorder-specific (the replay-server doesn't
+ * bundle prettier itself).
  *
  * `stdinFilepath` is passed to prettier so its parser inference picks
  * the right syntax based on the file extension; the file itself is
@@ -173,16 +250,28 @@ export function runPrettier(
   content: string,
   stdinFilepath: string,
 ): PrettierOutcome {
+  const bundled = resolveBundledPrettier();
   const haveDirect = isOnPath("prettier");
   const haveNpx = isOnPath("npx");
-  if (!haveDirect && !haveNpx) {
+  if (!bundled && !haveDirect && !haveNpx) {
     return { kind: "missing" };
   }
 
-  const exec = haveDirect ? "prettier" : "npx";
-  const argv = haveDirect
-    ? ["--stdin-filepath", stdinFilepath]
-    : ["--no-install", "prettier", "--stdin-filepath", stdinFilepath];
+  // Bundled tier wins: invoke via `node <bin>` so the script runs even
+  // when the file doesn't have a `+x` bit (common on Windows / on some
+  // tarball installs).  The bin script handles its own argv parsing.
+  let exec: string;
+  let argv: string[];
+  if (bundled) {
+    exec = process.execPath;
+    argv = [bundled, "--stdin-filepath", stdinFilepath];
+  } else if (haveDirect) {
+    exec = "prettier";
+    argv = ["--stdin-filepath", stdinFilepath];
+  } else {
+    exec = "npx";
+    argv = ["--no-install", "prettier", "--stdin-filepath", stdinFilepath];
+  }
 
   let result: SpawnSyncReturns<string>;
   try {

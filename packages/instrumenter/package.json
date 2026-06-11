@@ -14,7 +14,8 @@
     "@jridgewell/source-map": "^0.3.6",
     "@jridgewell/trace-mapping": "^0.3.25",
     "@swc/core": "^1.10.0",
-    "picomatch": "^4.0.3"
+    "picomatch": "^4.0.3",
+    "prettier": "^3.4.0"
   },
   "devDependencies": {
     "typescript": "^5.7.0"

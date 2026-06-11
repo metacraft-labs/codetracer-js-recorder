@@ -9,6 +9,7 @@ export {
   tryAutoformat,
   looksMinified,
   runPrettier,
+  resolveBundledPrettier,
   generateInverseSourceMap,
   autoformatEnabledByEnv,
   DEFAULT_MINIFIED_THRESHOLD,

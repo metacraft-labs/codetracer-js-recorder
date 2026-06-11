@@ -254,12 +254,25 @@ describe("P6.2 recorder-side autoformat", () => {
     expect(mapMatches.length).toBe(0);
   });
 
-  it("p6_2_recorder_skip_logs_clearly_without_prettier", () => {
-    // Force prettier missing by pointing PATH at an empty directory.
-    // The CLI itself still needs `node` (we invoke it via
-    // `process.execPath`) so we don't override that — the recorder's
-    // autoformat subprocess shells out via PATH, which is what we're
-    // gating.
+  it("p6_2_recorder_bundled_prettier_rescues_empty_path", () => {
+    // Historically this test asserted that an empty PATH degrades
+    // cleanly with a "prettier not found" warning.  Since the recorder
+    // now bundles prettier as a runtime dependency of
+    // `@codetracer/instrumenter` (see `packages/instrumenter/
+    // package.json`), the autoformat subprocess no longer needs
+    // `prettier` on PATH at all — `resolveBundledPrettier` finds it
+    // via `require.resolve('prettier/package.json')` and invokes it
+    // through `node <bin>`.
+    //
+    // The test is kept as a regression guard for the bundling
+    // contract: clear `PATH` to the empty directory and assert that
+    // the recorder STILL produces a formatted srcview (proving the
+    // bundled tier rescued the lookup).
+    //
+    // To exercise the "prettier truly missing" path, use the
+    // `--no-autoformat` flag (see the dedicated test below) or break
+    // the bundled lookup at the unit level (see
+    // `tests/transform/autoformat.test.ts`).
     const emptyDir = path.join(tmpDir, "empty-path");
     fs.mkdirSync(emptyDir, { recursive: true });
 
@@ -275,30 +288,25 @@ describe("P6.2 recorder-side autoformat", () => {
       { PATH: emptyDir },
     );
 
-    // The recorder MUST have warned about prettier being missing.
-    expect(stderr).toContain("prettier not found");
+    // The bundled tier rescued the lookup — no "missing" warning
+    // must appear in stderr.
+    expect(stderr).not.toContain("prettier not found");
 
-    // STRICT — kill-switch invariant: no canonical srcview must have
-    // been registered when prettier is unavailable.  The trace's
-    // `meta.dat` flag bit 5 (`has_alternate_source_views`) MUST be
-    // false / absent.
+    // STRICT — bundled prettier produced the formatted view; the
+    // canonical srcview record MUST be present.
     expect(ctPrintAvailable()).toBe(true);
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintFull(ctFile);
-    expect(bundle.metadata.flags?.has_alternate_source_views ?? false).toBe(
-      false,
-    );
-    expect(bundle.counts.source_views).toBe(0);
+    expect(bundle.metadata.flags?.has_alternate_source_views).toBe(true);
+    expect(bundle.counts.source_views).toBeGreaterThanOrEqual(1);
 
-    // And there must be NO `.fmt.js` or `.fmt.js.map` files in the
-    // trace's files directory either (no migration AND no sidecar).
-    const filesDir = path.join(traceDir, "files");
-    if (fs.existsSync(filesDir)) {
-      const fmtMatches = walkAndFilter(filesDir, (name) =>
-        name.includes(".fmt."),
-      );
-      expect(fmtMatches.length).toBe(0);
-    }
+    const view = bundle.source_views.find((sv) =>
+      sv.view_name.endsWith("lib.min.js.fmt.js"),
+    );
+    expect(view).toBeDefined();
+    expect(view!.view_kind).toBe(1);
+    expect(view!.content_len).toBeGreaterThan(0);
+    expect(view!.map_len).toBeGreaterThan(0);
   });
 
   it("p6_2_recorder_skip_when_source_not_minified", () => {
