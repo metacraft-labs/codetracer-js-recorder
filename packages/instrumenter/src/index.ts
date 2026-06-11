@@ -5,6 +5,19 @@ export {
   DEFAULT_EXCLUDE,
 } from "./filter.js";
 export type { FilterOptions } from "./filter.js";
+export {
+  tryAutoformat,
+  looksMinified,
+  runPrettier,
+  generateInverseSourceMap,
+  autoformatEnabledByEnv,
+  DEFAULT_MINIFIED_THRESHOLD,
+} from "./autoformat.js";
+export type {
+  AutoformatOutcome,
+  AutoformatOptions,
+  PrettierOutcome,
+} from "./autoformat.js";
 
 export interface InstrumentOptions {
   /** Source file path (used for manifest and source map resolution) */

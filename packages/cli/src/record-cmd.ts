@@ -28,12 +28,17 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
-import { instrument, shouldInstrument } from "@codetracer/instrumenter";
+import {
+  instrument,
+  shouldInstrument,
+  tryAutoformat,
+} from "@codetracer/instrumenter";
 import type {
   ManifestSlice,
   FunctionEntry,
   SiteEntry,
   FilterOptions,
+  AutoformatOutcome,
 } from "@codetracer/instrumenter";
 
 /**
@@ -182,6 +187,13 @@ function parseArgs(args: string[]): {
    * back to line-only step encoding.
    */
   columnAware: boolean;
+  /**
+   * P6.2: enable / disable recorder-side autoformat of minified
+   * sources.  Defaults to `true`; `--no-autoformat` disables.  Also
+   * respects the `CT_AUTOFORMAT` env var (shared with replay-server,
+   * see `db-backend/autoformat.rs::autoformat_enabled`).
+   */
+  autoformat: boolean;
 } {
   let entryFile: string | undefined;
   let outDirFromFlag: string | undefined;
@@ -193,6 +205,11 @@ function parseArgs(args: string[]): {
   // `--no-column-aware` flag forces the legacy line-only path for
   // bisection / back-compat testing.
   let columnAware = true;
+  // P6.2: recorder-side autoformat defaults ON; `--no-autoformat`
+  // disables.  When disabled, minified sources are recorded as-is
+  // and the replay-server's lazy P4 fallback formats them at view
+  // time (slower but still correct).
+  let autoformat = true;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -217,13 +234,17 @@ function parseArgs(args: string[]): {
       columnAware = true;
     } else if (arg === "--no-column-aware") {
       columnAware = false;
+    } else if (arg === "--autoformat") {
+      autoformat = true;
+    } else if (arg === "--no-autoformat") {
+      autoformat = false;
     } else if (arg === "--help" || arg === "-h") {
       // Per Recorder-CLI-Conventions.md §4 the recorder is CTFS-only:
       // there is no `--format` flag and no `CODETRACER_FORMAT` env var.
       // Use `ct print` from codetracer-trace-format-nim to convert the
       // produced .ct bundle to JSON / text.
       console.log(
-        `Usage: codetracer-js-recorder record <file> [-o|--out-dir <dir>] [--include <glob>] [--exclude <glob>] [--no-column-aware] [-- app-args...]
+        `Usage: codetracer-js-recorder record <file> [-o|--out-dir <dir>] [--include <glob>] [--exclude <glob>] [--no-column-aware] [--no-autoformat] [-- app-args...]
 
 Options:
   -o, --out-dir <dir>     Trace output directory (default: ./ct-traces/)
@@ -231,10 +252,17 @@ Options:
   --exclude <glob>        Exclude glob pattern (repeatable)
   --column-aware          Emit column-aware step encoding (default: on)
   --no-column-aware       Fall back to line-only step encoding
+  --autoformat            Pre-format minified sources at record time (default: on)
+  --no-autoformat         Record minified sources unformatted (replay-server
+                          P4 fallback formats them at view time instead)
 
 Environment variables:
   CODETRACER_JS_RECORDER_OUT_DIR    Output directory (overridden by --out-dir)
   CODETRACER_JS_RECORDER_DISABLED   Set to "true" / "1" to disable recording
+  CT_AUTOFORMAT                     Set to 0/off/false/no to disable autoformat
+                                    (shared with replay-server's P4 fallback)
+  CT_AUTOFORMAT_THRESHOLD           Override the minified-line-length heuristic
+                                    threshold (default 500 chars/line)
 
 The recorder always writes the canonical CTFS multi-stream container.
 Use 'ct print' from codetracer-trace-format-nim for human-readable
@@ -272,6 +300,7 @@ JSON / text conversion of the produced bundle.`,
     include,
     exclude,
     columnAware,
+    autoformat,
   };
 }
 
@@ -606,8 +635,15 @@ function recordingDisabledByEnv(): boolean {
  * Entry point for the `record` command.
  */
 export function recordCommand(args: string[]): void {
-  const { entryFile, outDir, appArgs, include, exclude, columnAware } =
-    parseArgs(args);
+  const {
+    entryFile,
+    outDir,
+    appArgs,
+    include,
+    exclude,
+    columnAware,
+    autoformat,
+  } = parseArgs(args);
 
   if (recordingDisabledByEnv()) {
     // §5: when recording is disabled via env, the recorder must not
@@ -682,18 +718,110 @@ export function recordCommand(args: string[]): void {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ct-record-"));
 
   try {
-    // Instrument each file
+    // Instrument each file.  For files that look minified, run the
+    // P6.2 recorder-side autoformat first so the trace records
+    // positions on the formatted view instead of the gibberish
+    // single-line bundle.  See `packages/instrumenter/src/autoformat.ts`
+    // for the heuristic + prettier wiring.
     const slices: Array<{ slice: ManifestSlice; originalFile: string }> = [];
+    // P6.2: per-file autoformat artefacts, keyed by the *virtual*
+    // filename that the manifest will reference (`<file>.fmt.js`).
+    // Each entry carries the formatted source + the V3 sourcemap
+    // (formatted → original) that the native addon materialises as
+    // sidecars under `<trace>/files/`.  Replay-server's P3 path
+    // discovers the `.map` sibling automatically.
+    const formattedSiblings: Array<{
+      virtualPath: string;
+      formattedContent: string;
+      sourceMapJson: string;
+    }> = [];
+    // Tracks whether we already warned the user that prettier is
+    // missing.  We only emit one warning per record() invocation so
+    // a bundle with dozens of minified files doesn't drown the
+    // console in identical messages.
+    let prettierMissingWarned = false;
 
     for (const file of files) {
       const relPath = path.relative(baseDir, file);
-      const code = fs.readFileSync(file, "utf-8");
+      const originalCode = fs.readFileSync(file, "utf-8");
+
+      // P6.2 — recorder-side autoformat hook.  We run *before* the
+      // instrumenter so the SWC pass sees the formatted view; that
+      // way the manifest's column offsets land at sensible columns
+      // in the formatted source instead of all clustering at column
+      // 1 of the single minified line.
+      let codeToInstrument = originalCode;
+      let instrumentFilename = path.resolve(file);
+      // The instrumented output is always emitted at `<tmpDir>/<relPath>`
+      // (the original filename) so `require()` calls in sibling
+      // instrumented files resolve cleanly.  When autoformat fires
+      // we only change the *manifest* virtual path — not the file
+      // on disk.
+      const outFilePath = path.join(tmpDir, relPath);
+      const baseName = path.basename(file);
+
+      // P6.2 follow-up: if the source already ships with an adjacent
+      // `<file>.map` sourcemap, the upstream toolchain already knows
+      // how to map positions on this (possibly minified) view back to
+      // the original sources.  Recorder-side autoformat would replace
+      // that mapping with our line-level inverse, which is a strict
+      // downgrade.  Skip and let the replay-server's existing P3
+      // sourcemap discovery use the upstream `.map` sibling directly.
+      const siblingMapPath = file + ".map";
+      const hasSiblingMap =
+        autoformat && fs.existsSync(siblingMapPath);
+
+      if (autoformat && !hasSiblingMap) {
+        const outcome: AutoformatOutcome = tryAutoformat(
+          originalCode,
+          baseName,
+          { enabled: true },
+        );
+
+        if (outcome.kind === "ok") {
+          // The instrumenter sees the formatted code; the manifest's
+          // path entry uses a `.fmt.js`-suffixed virtual filename so
+          // recorded steps reference the sibling we materialise into
+          // `<trace>/files/<virtualPath>` + its V3 sourcemap.  The
+          // emitted instrumented file on disk keeps its original
+          // name so `require()` from sibling instrumented files
+          // resolves correctly.
+          const virtualPath = `${path.resolve(file)}.fmt.js`;
+          codeToInstrument = outcome.formatted;
+          instrumentFilename = virtualPath;
+
+          formattedSiblings.push({
+            virtualPath,
+            formattedContent: outcome.formatted,
+            sourceMapJson: JSON.stringify(outcome.sourceMap),
+          });
+
+          process.stderr.write(
+            `[codetracer-js-recorder] autoformat: pre-formatted minified source '${baseName}' (` +
+              `${originalCode.length} → ${outcome.formatted.length} bytes)\n`,
+          );
+        } else if (outcome.kind === "tool-missing") {
+          if (!prettierMissingWarned) {
+            process.stderr.write(
+              "[codetracer-js-recorder] autoformat: prettier not found on PATH — minified sources will display unformatted (replay-server P4 fallback will format at view time)\n",
+            );
+            prettierMissingWarned = true;
+          }
+        } else if (outcome.kind === "tool-error") {
+          process.stderr.write(
+            `[codetracer-js-recorder] autoformat: prettier failed for '${baseName}': ${outcome.message} — recording original source\n`,
+          );
+        }
+        // "skipped", "not-minified", "no-change" — silent: these
+        // are the steady-state outcomes for normal source files.
+      }
 
       try {
-        const result = instrument(code, { filename: path.resolve(file) });
+        const result = instrument(codeToInstrument, {
+          filename: instrumentFilename,
+        });
 
         // Write instrumented code
-        const outFilePath = path.join(tmpDir, relPath);
         const outFileDir = path.dirname(outFilePath);
         fs.mkdirSync(outFileDir, { recursive: true });
         fs.writeFileSync(outFilePath, result.code);
@@ -711,10 +839,29 @@ export function recordCommand(args: string[]): void {
 
     // Merge manifests and write
     const merged = mergeManifestSlices(slices);
-    const manifest = {
+    // P6.2 — extra files materialised by the native addon under
+    // `<trace>/files/`.  The first entry per pair is the formatted
+    // source itself (so the UI's filesystem reader serves it as
+    // `<virtual-path>`); the second is the V3 sourcemap sibling
+    // (`<virtual-path>.map`) that the replay-server discovers via
+    // the existing P3 sibling-lookup path.
+    //
+    // Keying by absolute virtual path mirrors how
+    // `manifest.paths` is keyed — the native addon shares the same
+    // "strip leading drive letter / slash, join under files/" logic
+    // for both lists.
+    const extraFiles: Record<string, string> = {};
+    for (const sib of formattedSiblings) {
+      extraFiles[sib.virtualPath] = sib.formattedContent;
+      extraFiles[`${sib.virtualPath}.map`] = sib.sourceMapJson;
+    }
+    const manifest: Record<string, unknown> = {
       formatVersion: 1,
       ...merged,
     };
+    if (Object.keys(extraFiles).length > 0) {
+      manifest.extraFiles = extraFiles;
+    }
     const manifestPath = path.join(tmpDir, "codetracer.manifest.json");
     fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
 
@@ -738,7 +885,11 @@ export function recordCommand(args: string[]): void {
     // Resolve output directory for traces
     const traceOutDir = path.resolve(outDir);
 
-    // Determine the instrumented entry file path
+    // Determine the instrumented entry file path.  The instrumented
+    // output keeps the original filename (autoformat only changes
+    // the manifest virtual path, not the on-disk filename), so the
+    // legacy 1:1 mapping holds in both autoformat and
+    // no-autoformat cases.
     const instrumentedEntry = path.join(
       tmpDir,
       path.relative(baseDir, mainEntry),

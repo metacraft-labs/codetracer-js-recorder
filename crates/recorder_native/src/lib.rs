@@ -173,6 +173,21 @@ struct Manifest {
     /// surfaces `column = None` for those files.
     #[serde(default)]
     line_lengths: HashMap<String, Vec<u32>>,
+    /// P6.2: additional files to materialise under `<trace>/files/`
+    /// beyond the entries in `paths`.  Keyed by absolute virtual
+    /// path (same encoding as `paths`), value is the file contents.
+    ///
+    /// Populated by `packages/cli/src/record-cmd.ts` when the
+    /// recorder-side autoformat pass produces a formatted sibling
+    /// (`<file>.fmt.js`) and its V3 sourcemap (`<file>.fmt.js.map`).
+    /// Replay-server's existing P3 sourcemap discovery (sibling
+    /// `.map` lookup) picks these up at trace-open time — no
+    /// replay-time subprocess.
+    ///
+    /// Defaults to empty when the manifest predates P6.2 — the
+    /// addon falls through to the legacy copy-only behaviour.
+    #[serde(default)]
+    extra_files: HashMap<String, String>,
 }
 
 // ── Value types (deserialized from JS) ───────────────────────────────
@@ -1496,23 +1511,7 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
     })?;
 
     for source_path in &state.manifest.paths {
-        // Preserve directory structure inside files/.
-        // Strip leading '/' from absolute paths so join() doesn't replace the base.
-        let relative = source_path.strip_prefix('/').unwrap_or(source_path);
-        // On Windows, also strip leading drive letters like "D:\" so join() works.
-        // Drop the whole "X:" prefix (2 chars): dropping only the letter
-        // would leave ":\path", an invalid Windows path component, which
-        // makes the subsequent fs::copy silently fail.
-        let relative = relative
-            .get(2..)
-            .filter(|_| relative.as_bytes().get(1) == Some(&b':'))
-            .map(|s| {
-                s.strip_prefix('\\')
-                    .or_else(|| s.strip_prefix('/'))
-                    .unwrap_or(s)
-            })
-            .unwrap_or(relative);
-        let dest = files_dir.join(relative);
+        let dest = files_dir.join(relativise_for_files_dir(source_path));
         if let Some(parent) = dest.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -1529,5 +1528,47 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
         }
     }
 
+    // P6.2: materialise extra files (autoformat formatted source +
+    // its V3 sourcemap sibling) into the trace's files/ directory.
+    // Replay-server discovers `.fmt.js.map` siblings via the existing
+    // P3 sourcemap path — no special handling needed downstream.
+    //
+    // We deliberately allow `extra_files` to overwrite a `paths`
+    // entry: when the autoformat pass replaced the original source
+    // with the formatted view, both keys point at the same virtual
+    // path and the manifest's `extra_files` value is authoritative.
+    for (virtual_path, content) in &state.manifest.extra_files {
+        let dest = files_dir.join(relativise_for_files_dir(virtual_path));
+        if let Some(parent) = dest.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&dest, content);
+    }
+
     Ok(state.trace_dir.to_string_lossy().to_string())
+}
+
+/// Project an absolute source-side path onto a path safe to join under
+/// `<trace>/files/`.
+///
+/// Strips leading '/' from POSIX absolute paths and the leading
+/// `X:[\\/]` drive prefix from Windows absolute paths so that
+/// `files_dir.join(relative)` lands at the correct sub-tree rather
+/// than replacing `files_dir` outright.
+///
+/// Dropping only the drive letter (e.g. `"D:\path"` → `":\path"`)
+/// would leave an invalid Windows path component, which makes the
+/// subsequent write silently fail — drop the whole 2-char `X:`
+/// prefix instead.
+fn relativise_for_files_dir(absolute: &str) -> &str {
+    let trimmed = absolute.strip_prefix('/').unwrap_or(absolute);
+    trimmed
+        .get(2..)
+        .filter(|_| trimmed.as_bytes().get(1) == Some(&b':'))
+        .map(|s| {
+            s.strip_prefix('\\')
+                .or_else(|| s.strip_prefix('/'))
+                .unwrap_or(s)
+        })
+        .unwrap_or(trimmed)
 }
