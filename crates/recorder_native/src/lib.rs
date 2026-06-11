@@ -1144,10 +1144,18 @@ fn local_value_to_upstream(
 /// CTFS — see `codetracer_trace_writer_nim/src/lib.rs:297`).  Per
 /// `Recorder-CLI-Conventions.md` §4 the recorder is CTFS-only — there is
 /// no JSON output dispatch.
+///
+/// Returns the set of `manifest.extra_files` keys that were successfully
+/// migrated into the canonical CTFS `srcviews.dat` stream (P6.2 →
+/// canonical migration).  Callers MUST skip materialising these keys
+/// under `<trace>/files/` so the sidecar and the srcviews record don't
+/// fight over the same content.  Other `extra_files` entries (anything
+/// not part of the autoformat pair) remain caller-owned and still need
+/// to be written to `<trace>/files/`.
 fn write_binary_trace(
     state: &RecorderState,
     trace_dir: &Path,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<std::collections::HashSet<String>, Box<dyn std::error::Error>> {
     let mut writer = NimTraceWriter::new(&state.program, &state.args, NimTraceFormat::Binary);
 
     // Set the working directory for the trace metadata.
@@ -1441,6 +1449,97 @@ fn write_binary_trace(
         }
     }
 
+    // ── Alternate source views (Deminification Support) ──────────────
+    //
+    // Migrate the P6.2 autoformat sidecar (`<trace>/files/<name>.fmt.js`
+    // + `.fmt.js.map`) into the canonical CTFS `srcviews.dat` /
+    // `srcviews.off` stream.  See
+    // `codetracer-trace-format-spec/internal-files.md` §"Alternate
+    // Source Views (Deminification Support)" for the wire format and
+    // discovery contract — replay-server walks `srcviews.dat` at
+    // trace-open time (commit `483c9f7e`).
+    //
+    // The recorder-side autoformat pass (see
+    // `packages/cli/src/record-cmd.ts`) stages two `extra_files`
+    // entries per formatted source:
+    //
+    //   * key = `<abs>/lib.min.js.fmt.js`        → formatted bytes
+    //   * key = `<abs>/lib.min.js.fmt.js.map`    → V3 sourcemap (JSON)
+    //
+    // The `<abs>/lib.min.js.fmt.js` virtual path is ALSO present in
+    // `manifest.paths` (the instrumenter routed the SWC pass through
+    // the formatted view), so its index there is the writer's
+    // `path_id` for the registration.
+    //
+    // `view_kind = 1` is `prettier_format` per the spec enum.  The
+    // `view_name` is the basename of the virtual path (e.g.
+    // `"lib.min.js.fmt.js"`) — the user-facing label surfaced in the
+    // DAP `stackTrace` response by the replay-server.
+    //
+    // We track which `extra_files` keys we successfully consumed so
+    // the caller (flush_and_stop) can skip the corresponding
+    // `<trace>/files/` sidecar write — the canonical srcviews record
+    // is authoritative once present.  Entries that fail to migrate
+    // (e.g. virtual path missing from `manifest.paths`, sourcemap
+    // missing) fall through to the legacy sidecar path so the trace
+    // still carries the formatted view in some form.
+    let mut consumed_extra_files: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for (virtual_path, content) in &state.manifest.extra_files {
+        // Only migrate the formatted-source entries; `.fmt.js.map`
+        // entries are picked up implicitly as the sibling sourcemap.
+        if !virtual_path.ends_with(".fmt.js") {
+            continue;
+        }
+        let map_key = format!("{}.map", virtual_path);
+        let Some(path_id) = state
+            .manifest
+            .paths
+            .iter()
+            .position(|p| p == virtual_path)
+        else {
+            // Virtual path didn't make it into manifest.paths — leave
+            // the sidecar fallback in place so the formatted view is
+            // still discoverable by older replay-servers.
+            continue;
+        };
+        let sourcemap_bytes: &[u8] = state
+            .manifest
+            .extra_files
+            .get(&map_key)
+            .map(|s| s.as_bytes())
+            .unwrap_or(&[]);
+        let view_name = Path::new(virtual_path)
+            .file_name()
+            .map(|os| os.to_string_lossy().into_owned())
+            .unwrap_or_else(|| virtual_path.clone());
+        match writer.register_source_view(
+            codetracer_trace_types::PathId(path_id),
+            1, // prettier_format per the spec enum
+            &view_name,
+            content.as_bytes(),
+            sourcemap_bytes,
+        ) {
+            Ok(_idx) => {
+                consumed_extra_files.insert(virtual_path.clone());
+                if !sourcemap_bytes.is_empty() {
+                    consumed_extra_files.insert(map_key);
+                }
+            }
+            Err(err) => {
+                // Soft failure: log and fall through to the sidecar
+                // path.  The trace stays usable — the formatted view
+                // just won't appear in the canonical srcviews stream
+                // for this file.
+                eprintln!(
+                    "[codetracer-js-recorder] register_source_view failed for {}: {} \
+                     (falling back to <trace>/files/ sidecar)",
+                    virtual_path, err,
+                );
+            }
+        }
+    }
+
     // Finish writing streams and close the writer to produce the final output.
     writer.finish_writing_trace_events()?;
 
@@ -1449,7 +1548,7 @@ fn write_binary_trace(
 
     writer.close()?;
 
-    Ok(())
+    Ok(consumed_extra_files)
 }
 
 #[napi]
@@ -1473,12 +1572,13 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
     // `CODETRACER_FORMAT` surface area.  Use `ct print` from
     // `codetracer-trace-format-nim` to convert the produced `.ct` bundle
     // to JSON / text.
-    write_binary_trace(&state, &state.trace_dir.clone()).map_err(|e| {
-        Error::new(
-            Status::GenericFailure,
-            format!("Failed to write CTFS trace: {e}"),
-        )
-    })?;
+    let consumed_extra_files = write_binary_trace(&state, &state.trace_dir.clone())
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to write CTFS trace: {e}"),
+            )
+        })?;
 
     if std::env::var("CODETRACER_MANAGED_UPLOAD_URL")
         .ok()
@@ -1528,16 +1628,28 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
         }
     }
 
-    // P6.2: materialise extra files (autoformat formatted source +
-    // its V3 sourcemap sibling) into the trace's files/ directory.
-    // Replay-server discovers `.fmt.js.map` siblings via the existing
-    // P3 sourcemap path — no special handling needed downstream.
+    // P6.2 → canonical CTFS migration: materialise extra files
+    // (autoformat formatted source + its V3 sourcemap sibling) into
+    // the trace's files/ directory ONLY for entries that did NOT
+    // migrate into the canonical `srcviews.dat` stream.
+    //
+    // The autoformat pair (`<name>.fmt.js` + `<name>.fmt.js.map`) is
+    // now served from `srcviews.dat` by the replay-server (commit
+    // `483c9f7e`); writing it again under `<trace>/files/` would
+    // duplicate the formatted view bytes on disk and confuse newer
+    // readers that already discover it through CTFS.  Entries that
+    // failed the canonical registration (logged above) fall through
+    // here so the trace still carries the view in the legacy P6.2
+    // location.
     //
     // We deliberately allow `extra_files` to overwrite a `paths`
     // entry: when the autoformat pass replaced the original source
     // with the formatted view, both keys point at the same virtual
     // path and the manifest's `extra_files` value is authoritative.
     for (virtual_path, content) in &state.manifest.extra_files {
+        if consumed_extra_files.contains(virtual_path) {
+            continue;
+        }
         let dest = files_dir.join(relativise_for_files_dir(virtual_path));
         if let Some(parent) = dest.parent() {
             let _ = fs::create_dir_all(parent);

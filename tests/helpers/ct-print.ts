@@ -227,6 +227,24 @@ export type CtFullEvent =
     };
 
 /**
+ * One alternate source view as surfaced by `ct-print --full` under the
+ * top-level `source_views` array.
+ *
+ * Inline content/sourcemap bytes are NOT included by ct-print (they'd
+ * blow up the JSON dump); only the structural metadata + byte counts
+ * are surfaced.  See
+ * `codetracer-trace-format-spec/internal-files.md` §"Alternate Source
+ * Views (Deminification Support)" for the underlying record layout.
+ */
+export interface CtFullSourceView {
+  path_id: number;
+  view_kind: number;
+  view_name: string;
+  content_len: number;
+  map_len: number;
+}
+
+/**
  * Top-level shape of `ct-print --full` output.  Deterministic ordering
  * is guaranteed by ct-print itself (see its `--help`).
  */
@@ -236,16 +254,41 @@ export interface CtFullBundle {
     args: string[];
     workdir: string;
     recorder?: string;
+    /**
+     * meta.dat flag bits surfaced as a flat boolean object.  Each
+     * known flag bit gets its own key; readers MUST treat absent keys
+     * as `false` to stay forward-compatible.
+     */
+    flags?: {
+      has_column_aware_steps?: boolean;
+      /**
+       * Set when the trace carries one or more `srcviews.dat` records
+       * (Alternate Source Views, P6.2 → canonical migration).
+       */
+      has_alternate_source_views?: boolean;
+    };
   };
   paths: string[];
   functions: string[];
   varnames: string[];
   types: string[];
+  /**
+   * Alternate source views (deminification support).  Empty when the
+   * trace was written without any `register_source_view` calls (the
+   * common case for non-minified codebases).
+   */
+  source_views: CtFullSourceView[];
   counts: {
     paths: number;
     functions: number;
     varnames: number;
     types: number;
+    /**
+     * Number of `srcviews.dat` records — convenient anchor for tests
+     * that want a single numeric assertion instead of walking
+     * `source_views[]`.
+     */
+    source_views: number;
     steps: number;
     calls: number;
     values: number;
