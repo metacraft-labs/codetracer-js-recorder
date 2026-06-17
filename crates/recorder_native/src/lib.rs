@@ -1195,15 +1195,15 @@ fn write_binary_trace(
     // requires a `start()` call before registering steps/calls.
     let mut started = false;
 
-    // P2.2: per-trace column cursor.  The JS recorder doesn't track
-    // a frame stack at this layer (the runtime/N-API boundary works
-    // with a flat event queue), so we use a single global cursor.
-    // Same-line moves emit a single `DeltaColumn`; line changes emit
-    // a fresh `register_step` (which resets the writer's cursor to 1
-    // per spec) followed by an optional `DeltaColumn` to land at the
-    // desired column.
-    let mut last_line: Option<i64> = None;
-    let mut last_column: Option<i64> = None;
+    // P2.2: column-aware step emission.  Every `TraceEvent::Step`
+    // produces one `register_step(path, line)` call on the Nim writer,
+    // which always sets the writer-side column cursor to column 1 of
+    // the named line (see
+    // `codetracer-trace-format-nim/src/codetracer_trace_writer/multi_stream_writer.nim:494`).
+    // A subsequent `write_delta_column(new_col - 1)` then lands the
+    // cursor at the desired 1-based column.  The recorder doesn't need
+    // to track a previous-step cursor because the reset is
+    // unconditional.
 
     // P2.5: track paths we've registered with their line-length
     // tables so we emit the `paths.dat` Layout A record exactly once
@@ -1331,28 +1331,28 @@ fn write_binary_trace(
                 writer.register_step(&path, codetracer_trace_types::Line(new_line));
 
                 if let (true, Some(new_col)) = (state.column_aware, new_column_1based) {
-                    // The writer's column cursor resets to 1 only on a
-                    // line transition (CTFS spec §"Column Encoding").
-                    // Same-line repeat steps keep the previous column
-                    // cursor untouched, so a DeltaColumn nudge is only
-                    // needed when the target column differs from where
-                    // the cursor already sits.
-                    let same_line = last_line == Some(new_line);
-                    let cursor_after_register: i64 = if same_line {
-                        last_column.unwrap_or(1)
-                    } else {
-                        1
-                    };
-                    let delta = new_col - cursor_after_register;
+                    // The Nim multi-stream writer's `registerStep`
+                    // unconditionally sets `lastGlobalLineIndex = gli`,
+                    // where `gli` is "column 1 of the target line" (see
+                    // `codetracer-trace-format-nim/src/codetracer_trace_writer/multi_stream_writer.nim:467,494`).
+                    // The reset happens on EVERY `register_step` call,
+                    // not only on line transitions — the writer treats
+                    // every absolute / delta step as "the cursor now
+                    // sits at column 1 of the named line".
+                    //
+                    // Therefore the DeltaColumn delta the JS recorder
+                    // must emit to land at `new_col` is always
+                    // `new_col - 1`, regardless of whether the previous
+                    // step was on the same line.  Modelling the cursor
+                    // as sticky across same-line repeats (the pre-fix
+                    // behaviour) caused the third (and subsequent)
+                    // statements on a multi-statement line to collapse
+                    // onto the *previous* statement's column because
+                    // the delta was computed against the wrong base.
+                    let delta = new_col - 1;
                     if delta != 0 {
                         writer.write_delta_column(delta);
                     }
-                    last_line = Some(new_line);
-                    last_column = Some(new_col);
-                } else {
-                    // Legacy / column-aware-off path: line-only step.
-                    last_line = Some(new_line);
-                    last_column = None;
                 }
             }
             TraceEvent::Call(cr) => {
