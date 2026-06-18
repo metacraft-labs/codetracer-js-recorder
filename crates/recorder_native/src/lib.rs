@@ -1189,6 +1189,17 @@ fn write_binary_trace(
     // the call lands on the real implementation.
     if state.column_aware {
         writer.enable_column_aware_steps();
+        // Advertise that this trace's columns are sharp enough for
+        // both per-column breakpoints and per-column motions — V8's
+        // source-position table gives per-statement columns and the
+        // instrumenter emits distinct columns for multi-statement-
+        // per-line code, so both capabilities hold.  Sets meta.dat
+        // bits 6 and 7 (FLAG_SUPPORTS_COLUMN_BREAKPOINTS,
+        // FLAG_SUPPORTS_COLUMN_MOTIONS); see
+        // `codetracer-trace-format-spec/internal-files.md`
+        // §"Column-Aware Capability Flags".
+        writer.enable_column_breakpoints_support();
+        writer.enable_column_motions_support();
     }
 
     // We need to track whether we've called `start()` yet — the Nim writer
