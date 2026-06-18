@@ -210,13 +210,17 @@ function writeFixture(dir: string, daemonPort: number): void {
   ].join("\n");
   fs.writeFileSync(path.join(dir, "app.js"), appJs);
 
-  // Bootstrap: install the runtime BEFORE app.js runs.  We neutralise
-  // enter/ret because the receiver expects snake_case `fn_id` on those
-  // two variants (no #[serde(rename ...)]) while the runtime ships
-  // camelCase `fnId` — tracked as a separate receiver bug.
-  // We fetch+IIFE-wrap app.js (rather than `await import('./app.js')`)
-  // so the SWC `__ct.enter(0, arguments)` prelude lands inside a
-  // function scope (`arguments` is not bound at ES-module top level).
+  // Bootstrap: install the runtime BEFORE app.js runs.  We fetch+IIFE-wrap
+  // app.js (rather than `await import('./app.js')`) so the SWC
+  // `__ct.enter(0, arguments)` prelude lands inside a function scope
+  // (`arguments` is not bound at ES-module top level).
+  //
+  // The earlier workaround that stubbed `__ct.enter` / `__ct.ret` to
+  // no-ops was removed once the receiver learned to decode the runtime's
+  // camelCase `fnId` on Call / Return frames — see
+  // `codetracer/src/backend-manager/src/browser_stream_receiver.rs`
+  // (`#[serde(rename = "fnId")]` on `BrowserEvent::Call` /
+  // `BrowserEvent::Return`).
   const bootstrapJs = [
     "import { installBrowserRuntime } from '@codetracer/runtime-browser';",
     "const rt = installBrowserRuntime({",
@@ -225,11 +229,6 @@ function writeFixture(dir: string, daemonPort: number): void {
     "  args: [],",
     "  flushThreshold: 1,",
     "});",
-    "// Workaround: drop Call / Return events on the floor — see comment",
-    "// above and codetracer/src/backend-manager/src/browser_stream_receiver.rs",
-    '// (Call/Return variants miss #[serde(rename = "fnId")]).',
-    "window.__ct.enter = function () {};",
-    "window.__ct.ret = function (_id, v) { return v; };",
     "window.__ctStop = () => rt.stop();",
     "const src = await (await fetch('/app.js')).text();",
     "new Function('(function(){' + src + '\\n})();')();",
