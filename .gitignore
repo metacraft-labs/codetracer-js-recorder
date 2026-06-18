@@ -28,3 +28,6 @@ trace-*/
 
 # Test artifacts
 tests/tmp/
+
+# reprobuild build artifacts
+.repro/
