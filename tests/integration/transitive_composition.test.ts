@@ -78,10 +78,7 @@ import {
   tryAutoformat,
   runPrettier,
 } from "@codetracer/instrumenter";
-import {
-  TraceMap,
-  originalPositionFor,
-} from "@jridgewell/trace-mapping";
+import { TraceMap, originalPositionFor } from "@jridgewell/trace-mapping";
 
 const FIXTURE_DIR = path.resolve(__dirname, "../fixtures/transitive");
 
@@ -98,9 +95,7 @@ const FIXTURE_DIR = path.resolve(__dirname, "../fixtures/transitive");
  * Defensive: we throw if the file is malformed or the expected entry
  * is missing so a fixture regression is loud, not silent.
  */
-function loadGlobalRenames(
-  tomlPath: string,
-): Map<string, Map<string, string>> {
+function loadGlobalRenames(tomlPath: string): Map<string, Map<string, string>> {
   const text = fs.readFileSync(tomlPath, "utf-8");
   // The fixture is hand-written and small enough that a regex pass is
   // safer than pulling in a TOML parser dependency just for tests.
@@ -146,164 +141,164 @@ function applyRename(
 }
 
 describe("transitive composition (format + sourcemap + rename)", () => {
-  it("formatted line/col survives through to renamed identifier", { timeout: 30_000 }, () => {
-    // ---- Inputs ---------------------------------------------------
-    const originalSrc = fs.readFileSync(
-      path.join(FIXTURE_DIR, "original.js"),
-      "utf-8",
-    );
-    const minifiedSrc = fs.readFileSync(
-      path.join(FIXTURE_DIR, "minified.js"),
-      "utf-8",
-    );
-    const upstreamMapJson = fs.readFileSync(
-      path.join(FIXTURE_DIR, "minified.js.map"),
-      "utf-8",
-    );
-    const renames = loadGlobalRenames(
-      path.join(FIXTURE_DIR, "renames.toml"),
-    );
+  it(
+    "formatted line/col survives through to renamed identifier",
+    { timeout: 30_000 },
+    () => {
+      // ---- Inputs ---------------------------------------------------
+      const originalSrc = fs.readFileSync(
+        path.join(FIXTURE_DIR, "original.js"),
+        "utf-8",
+      );
+      const minifiedSrc = fs.readFileSync(
+        path.join(FIXTURE_DIR, "minified.js"),
+        "utf-8",
+      );
+      const upstreamMapJson = fs.readFileSync(
+        path.join(FIXTURE_DIR, "minified.js.map"),
+        "utf-8",
+      );
+      const renames = loadGlobalRenames(path.join(FIXTURE_DIR, "renames.toml"));
 
-    // STRICT: fixture invariants — guard against accidental edits to
-    // the fixture set that would make the rest of the test pass for
-    // the wrong reasons.
-    expect(originalSrc).toContain("calculateSum");
-    expect(minifiedSrc).toContain("calculateSum");
-    expect(minifiedSrc.split("\n").filter((l) => l.length > 0).length).toBe(1);
-    const renamesForOriginal = renames.get("original.js");
-    expect(renamesForOriginal).toBeDefined();
-    expect(renamesForOriginal!.get("calculateSum")).toBe("addNumbers");
+      // STRICT: fixture invariants — guard against accidental edits to
+      // the fixture set that would make the rest of the test pass for
+      // the wrong reasons.
+      expect(originalSrc).toContain("calculateSum");
+      expect(minifiedSrc).toContain("calculateSum");
+      expect(minifiedSrc.split("\n").filter((l) => l.length > 0).length).toBe(
+        1,
+      );
+      const renamesForOriginal = renames.get("original.js");
+      expect(renamesForOriginal).toBeDefined();
+      expect(renamesForOriginal!.get("calculateSum")).toBe("addNumbers");
 
-    // ---- Layer 1: recorder-side autoformat + inverse sourcemap ----
-    //
-    // The recorder shells out to prettier to produce the formatted
-    // view, then builds an inverse Source Map V3 document that maps
-    // each formatted line back to a line in the recorded-minified
-    // source.  We invoke `tryAutoformat` directly (not the higher
-    // level CLI) because the CLI's autoformat skip gate fires when an
-    // upstream `.map` is present — that gate is correct for a real
-    // recording but here we explicitly want to exercise both maps.
-    //
-    // The `tryAutoformat` call uses the threshold override `0` so the
-    // single-line minified fixture trips the minified heuristic
-    // unconditionally.
-    const fmtOutcome = tryAutoformat(minifiedSrc, "minified.js", {
-      enabled: true,
-      threshold: 0,
-    });
-    expect(fmtOutcome.kind).toBe("ok");
-    if (fmtOutcome.kind !== "ok") return;
-    const formatted = fmtOutcome.formatted;
-    // Sanity: prettier broke the single-line minified source into
-    // multiple lines (otherwise there's nothing to map back).
-    expect(formatted.split("\n").length).toBeGreaterThan(2);
+      // ---- Layer 1: recorder-side autoformat + inverse sourcemap ----
+      //
+      // The recorder shells out to prettier to produce the formatted
+      // view, then builds an inverse Source Map V3 document that maps
+      // each formatted line back to a line in the recorded-minified
+      // source.  We invoke `tryAutoformat` directly (not the higher
+      // level CLI) because the CLI's autoformat skip gate fires when an
+      // upstream `.map` is present — that gate is correct for a real
+      // recording but here we explicitly want to exercise both maps.
+      //
+      // The `tryAutoformat` call uses the threshold override `0` so the
+      // single-line minified fixture trips the minified heuristic
+      // unconditionally.
+      const fmtOutcome = tryAutoformat(minifiedSrc, "minified.js", {
+        enabled: true,
+        threshold: 0,
+      });
+      expect(fmtOutcome.kind).toBe("ok");
+      if (fmtOutcome.kind !== "ok") return;
+      const formatted = fmtOutcome.formatted;
+      // Sanity: prettier broke the single-line minified source into
+      // multiple lines (otherwise there's nothing to map back).
+      expect(formatted.split("\n").length).toBeGreaterThan(2);
 
-    // The inverse map produced by `tryAutoformat` is keyed off the
-    // SOURCE name we passed in (`"minified.js"`).  Replay-server
-    // reads this map at trace-open time to translate any (formatted
-    // line, col) position into a (recorded-minified line, col)
-    // position.
-    const inverseMap = fmtOutcome.sourceMap;
-    expect(inverseMap.sources).toEqual(["minified.js"]);
-    const inverseTm = new TraceMap(JSON.stringify(inverseMap));
+      // The inverse map produced by `tryAutoformat` is keyed off the
+      // SOURCE name we passed in (`"minified.js"`).  Replay-server
+      // reads this map at trace-open time to translate any (formatted
+      // line, col) position into a (recorded-minified line, col)
+      // position.
+      const inverseMap = fmtOutcome.sourceMap;
+      expect(inverseMap.sources).toEqual(["minified.js"]);
+      const inverseTm = new TraceMap(JSON.stringify(inverseMap));
 
-    // Pick a formatted-line position to test.  We look for the line
-    // carrying the formatted `module.exports = { calculateSum: a };`
-    // statement — that line has identifier anchors (`module`,
-    // `exports`, `calculateSum`) ≥3 chars long that the inverse-map
-    // builder picks up.
-    //
-    // The function-declaration line in this fixture (`function a(b,
-    // c) {`) has only 1- and 2-char identifiers, which the recorder's
-    // `generateInverseSourceMap` filters out by design — see its doc
-    // comment §"identifier tokens".  Tests must anchor on a line with
-    // identifier tokens that survive both minification and formatting.
-    const formattedLines = formatted.split("\n");
-    const exportsLineIdx = formattedLines.findIndex((l) =>
-      /module\.exports/.test(l),
-    );
-    expect(exportsLineIdx).toBeGreaterThanOrEqual(0);
+      // Pick a formatted-line position to test.  We look for the line
+      // carrying the formatted `module.exports = { calculateSum: a };`
+      // statement — that line has identifier anchors (`module`,
+      // `exports`, `calculateSum`) ≥3 chars long that the inverse-map
+      // builder picks up.
+      //
+      // The function-declaration line in this fixture (`function a(b,
+      // c) {`) has only 1- and 2-char identifiers, which the recorder's
+      // `generateInverseSourceMap` filters out by design — see its doc
+      // comment §"identifier tokens".  Tests must anchor on a line with
+      // identifier tokens that survive both minification and formatting.
+      const formattedLines = formatted.split("\n");
+      const exportsLineIdx = formattedLines.findIndex((l) =>
+        /module\.exports/.test(l),
+      );
+      expect(exportsLineIdx).toBeGreaterThanOrEqual(0);
 
-    // Layer-1 lookup: ask the inverse map where this formatted line
-    // came from in the recorded-minified source.  We pass `column: 0`
-    // because the inverse map is line-level only (the recorder's
-    // `generateInverseSourceMap` is v1, line precision — see its doc
-    // comment for the rationale).
-    const layer1 = originalPositionFor(inverseTm, {
-      line: exportsLineIdx + 1, // 1-indexed
-      column: 0,
-    });
-    expect(layer1.source).toBe("minified.js");
-    // The recorded-minified source is single-line, so EVERY anchored
-    // formatted line must map back to line 1.
-    expect(layer1.line).toBe(1);
+      // Layer-1 lookup: ask the inverse map where this formatted line
+      // came from in the recorded-minified source.  We pass `column: 0`
+      // because the inverse map is line-level only (the recorder's
+      // `generateInverseSourceMap` is v1, line precision — see its doc
+      // comment for the rationale).
+      const layer1 = originalPositionFor(inverseTm, {
+        line: exportsLineIdx + 1, // 1-indexed
+        column: 0,
+      });
+      expect(layer1.source).toBe("minified.js");
+      // The recorded-minified source is single-line, so EVERY anchored
+      // formatted line must map back to line 1.
+      expect(layer1.line).toBe(1);
 
-    // ---- Layer 2 + 3: upstream sourcemap + per-position name ------
-    //
-    // The upstream toolchain shipped `minified.js.map`.  We feed it
-    // into the same V3 parser; given the recorded-minified (line, col)
-    // from layer 1, the parser returns the matching position in
-    // `original.js` plus the original-side name attached to that
-    // segment.
-    //
-    // We pick the `a` identifier position at the top-level call
-    // (`a(3,4);` near the end of the minified line) because that's
-    // the segment whose `name_index` was wired to the original
-    // `calculateSum` identifier in the fixture's map generator.
-    //
-    // The minified-line column of `a` in `a(3,4);` is 71 — see
-    // `tests/fixtures/transitive/minified.js` and the per-position
-    // walk-through in the map's generator script (committed as a
-    // comment in `minified.js.map`).
-    const upstreamTm = new TraceMap(upstreamMapJson);
-    const layer23 = originalPositionFor(upstreamTm, {
-      line: layer1.line!, // recorded-minified line = 1
-      column: 71, // position of `a` in the top-level `a(3,4);` call
-    });
-    expect(layer23.source).toBe("original.js");
-    // `original.js` line 6 carries `calculateSum(3, 4);`.
-    expect(layer23.line).toBe(6);
-    // The per-position name recovery surfaces the original identifier
-    // name attached to this segment.  This is the layer that
-    // recovers `calculateSum` from minified `a`.
-    expect(layer23.name).toBe("calculateSum");
+      // ---- Layer 2 + 3: upstream sourcemap + per-position name ------
+      //
+      // The upstream toolchain shipped `minified.js.map`.  We feed it
+      // into the same V3 parser; given the recorded-minified (line, col)
+      // from layer 1, the parser returns the matching position in
+      // `original.js` plus the original-side name attached to that
+      // segment.
+      //
+      // We pick the `a` identifier position at the top-level call
+      // (`a(3,4);` near the end of the minified line) because that's
+      // the segment whose `name_index` was wired to the original
+      // `calculateSum` identifier in the fixture's map generator.
+      //
+      // The minified-line column of `a` in `a(3,4);` is 71 — see
+      // `tests/fixtures/transitive/minified.js` and the per-position
+      // walk-through in the map's generator script (committed as a
+      // comment in `minified.js.map`).
+      const upstreamTm = new TraceMap(upstreamMapJson);
+      const layer23 = originalPositionFor(upstreamTm, {
+        line: layer1.line!, // recorded-minified line = 1
+        column: 71, // position of `a` in the top-level `a(3,4);` call
+      });
+      expect(layer23.source).toBe("original.js");
+      // `original.js` line 6 carries `calculateSum(3, 4);`.
+      expect(layer23.line).toBe(6);
+      // The per-position name recovery surfaces the original identifier
+      // name attached to this segment.  This is the layer that
+      // recovers `calculateSum` from minified `a`.
+      expect(layer23.name).toBe("calculateSum");
 
-    // ---- Layer 4: user rename list --------------------------------
-    //
-    // Run the original-side name through the user TOML to surface
-    // the user's chosen display name.  This is the contract the
-    // replay-server's `SourcemapCache::resolve_name_at_position`
-    // enforces in `db-backend/src/sourcemap_cache.rs`.
-    const renamed = applyRename(
-      renames,
-      layer23.source!,
-      layer23.name!,
-    );
-    expect(renamed).toBe("addNumbers");
+      // ---- Layer 4: user rename list --------------------------------
+      //
+      // Run the original-side name through the user TOML to surface
+      // the user's chosen display name.  This is the contract the
+      // replay-server's `SourcemapCache::resolve_name_at_position`
+      // enforces in `db-backend/src/sourcemap_cache.rs`.
+      const renamed = applyRename(renames, layer23.source!, layer23.name!);
+      expect(renamed).toBe("addNumbers");
 
-    // ---- STRICT composition assertions: 4 transitions -------------
-    //
-    // These mirror the high-level assertions called out in the
-    // dispatch description; each one pins a single layer's
-    // contribution.
+      // ---- STRICT composition assertions: 4 transitions -------------
+      //
+      // These mirror the high-level assertions called out in the
+      // dispatch description; each one pins a single layer's
+      // contribution.
 
-    // 1) The formatted view is multi-line (recorder's autoformat
-    //    actually fired and produced a view we could anchor into).
-    expect(formattedLines.length).toBeGreaterThan(2);
+      // 1) The formatted view is multi-line (recorder's autoformat
+      //    actually fired and produced a view we could anchor into).
+      expect(formattedLines.length).toBeGreaterThan(2);
 
-    // 2) The formatted-line position resolved to a recorded-minified
-    //    position via the recorder's inverse map.
-    expect(layer1.source).toBe("minified.js");
-    expect(layer1.line).toBe(1);
+      // 2) The formatted-line position resolved to a recorded-minified
+      //    position via the recorder's inverse map.
+      expect(layer1.source).toBe("minified.js");
+      expect(layer1.line).toBe(1);
 
-    // 3) The recorded-minified position resolved to an original.js
-    //    position via the upstream sourcemap.
-    expect(layer23.source).toBe("original.js");
+      // 3) The recorded-minified position resolved to an original.js
+      //    position via the upstream sourcemap.
+      expect(layer23.source).toBe("original.js");
 
-    // 4) The user rename list translated the original-side name to
-    //    the user's chosen display name.
-    expect(renamed).toBe("addNumbers");
-  });
+      // 4) The user rename list translated the original-side name to
+      //    the user's chosen display name.
+      expect(renamed).toBe("addNumbers");
+    },
+  );
 
   it("inverse map is monotone and parser-roundtrips", () => {
     // Smoke test on the inverse-map shape so a regression in

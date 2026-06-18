@@ -768,8 +768,7 @@ export function recordCommand(args: string[]): void {
       // downgrade.  Skip and let the replay-server's existing P3
       // sourcemap discovery use the upstream `.map` sibling directly.
       const siblingMapPath = file + ".map";
-      const hasSiblingMap =
-        autoformat && fs.existsSync(siblingMapPath);
+      const hasSiblingMap = autoformat && fs.existsSync(siblingMapPath);
 
       if (autoformat && !hasSiblingMap) {
         const outcome: AutoformatOutcome = tryAutoformat(

@@ -48,11 +48,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { execFileSync, spawnSync } from "node:child_process";
-import {
-  ctPrintAvailable,
-  ctPrintFull,
-  findCtFile,
-} from "../helpers/ct-print";
+import { ctPrintAvailable, ctPrintFull, findCtFile } from "../helpers/ct-print";
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
 const CLI_PATH = path.join(PROJECT_ROOT, "packages/cli/dist/index.js");
@@ -180,79 +176,83 @@ describe("P6.2 recorder-side autoformat", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("p6_2_recorder_emits_srcview_for_minified_source", { timeout: 30_000 }, () => {
-    // STRICT: when prettier isn't on PATH at all, we cannot exercise
-    // the happy path — fail loudly rather than silently passing.  The
-    // recorder ships prettier as a devDependency and the CI
-    // environment always has it on PATH (via node_modules/.bin), so
-    // a missing prettier here is a real configuration issue.
-    expect(
-      prettierAvailable,
-      "prettier or npx must be on PATH to exercise the autoformat happy path",
-    ).toBe(true);
+  it(
+    "p6_2_recorder_emits_srcview_for_minified_source",
+    { timeout: 30_000 },
+    () => {
+      // STRICT: when prettier isn't on PATH at all, we cannot exercise
+      // the happy path — fail loudly rather than silently passing.  The
+      // recorder ships prettier as a devDependency and the CI
+      // environment always has it on PATH (via node_modules/.bin), so
+      // a missing prettier here is a real configuration issue.
+      expect(
+        prettierAvailable,
+        "prettier or npx must be on PATH to exercise the autoformat happy path",
+      ).toBe(true);
 
-    // STRICT: ct-print is the canonical oracle for srcviews — without
-    // it we cannot assert what landed in the trace's `srcviews.dat`.
-    // Fail loudly instead of falling back to the legacy sidecar
-    // assertions; CI ships ct-print via the trace-format-nim sibling.
-    expect(
-      ctPrintAvailable(),
-      "ct-print binary must be available to inspect srcviews.dat",
-    ).toBe(true);
+      // STRICT: ct-print is the canonical oracle for srcviews — without
+      // it we cannot assert what landed in the trace's `srcviews.dat`.
+      // Fail loudly instead of falling back to the legacy sidecar
+      // assertions; CI ships ct-print via the trace-format-nim sibling.
+      expect(
+        ctPrintAvailable(),
+        "ct-print binary must be available to inspect srcviews.dat",
+      ).toBe(true);
 
-    const lib = minifiedLibrarySource();
-    const driver = `var lib = require("./lib.min.js"); console.log(lib.call(2,3));\n`;
+      const lib = minifiedLibrarySource();
+      const driver = `var lib = require("./lib.min.js"); console.log(lib.call(2,3));\n`;
 
-    const { traceDir, stderr } = recordDriver(
-      driver,
-      lib,
-      "lib.min.js",
-      tmpDir,
-    );
+      const { traceDir, stderr } = recordDriver(
+        driver,
+        lib,
+        "lib.min.js",
+        tmpDir,
+      );
 
-    // The recorder logs an info line for each pre-formatted file.
-    // We use a loose match (just the filename) so changes to the
-    // exact wording don't break the test.
-    expect(stderr).toContain("autoformat");
-    expect(stderr).toContain("lib.min.js");
+      // The recorder logs an info line for each pre-formatted file.
+      // We use a loose match (just the filename) so changes to the
+      // exact wording don't break the test.
+      expect(stderr).toContain("autoformat");
+      expect(stderr).toContain("lib.min.js");
 
-    // STRICT — canonical assertion:  the formatted view + its V3
-    // sourcemap MUST appear as one record in the trace's
-    // `srcviews.dat` stream, NOT as a `<trace>/files/<name>.fmt.js`
-    // sidecar (the old P6.2 transitional convention).
-    const ctFile = findCtFile(traceDir);
-    const bundle = ctPrintFull(ctFile);
+      // STRICT — canonical assertion:  the formatted view + its V3
+      // sourcemap MUST appear as one record in the trace's
+      // `srcviews.dat` stream, NOT as a `<trace>/files/<name>.fmt.js`
+      // sidecar (the old P6.2 transitional convention).
+      const ctFile = findCtFile(traceDir);
+      const bundle = ctPrintFull(ctFile);
 
-    expect(bundle.metadata.flags?.has_alternate_source_views).toBe(true);
-    expect(bundle.counts.source_views).toBeGreaterThanOrEqual(1);
+      expect(bundle.metadata.flags?.has_alternate_source_views).toBe(true);
+      expect(bundle.counts.source_views).toBeGreaterThanOrEqual(1);
 
-    const view = bundle.source_views.find((sv) =>
-      sv.view_name.endsWith("lib.min.js.fmt.js"),
-    );
-    expect(view).toBeDefined();
-    // `view_kind = 1` is `prettier_format` per the spec enum (see
-    // `internal-files.md` §"Alternate Source Views").
-    expect(view!.view_kind).toBe(1);
-    expect(view!.content_len).toBeGreaterThan(0);
-    expect(view!.map_len).toBeGreaterThan(0);
-    // The view's path_id must point into the trace's paths table.
-    expect(view!.path_id).toBeGreaterThanOrEqual(0);
-    expect(view!.path_id).toBeLessThan(bundle.paths.length);
+      const view = bundle.source_views.find((sv) =>
+        sv.view_name.endsWith("lib.min.js.fmt.js"),
+      );
+      expect(view).toBeDefined();
+      // `view_kind = 1` is `prettier_format` per the spec enum (see
+      // `internal-files.md` §"Alternate Source Views").
+      expect(view!.view_kind).toBe(1);
+      expect(view!.content_len).toBeGreaterThan(0);
+      expect(view!.map_len).toBeGreaterThan(0);
+      // The view's path_id must point into the trace's paths table.
+      expect(view!.path_id).toBeGreaterThanOrEqual(0);
+      expect(view!.path_id).toBeLessThan(bundle.paths.length);
 
-    // The legacy P6.2 sidecar MUST be gone — its presence would mean
-    // we wrote the formatted view twice (once into srcviews.dat,
-    // once under files/) and would confuse readers that prefer the
-    // canonical CTFS record.
-    const filesDir = path.join(traceDir, "files");
-    const fmtMatches = walkAndFilter(filesDir, (name) =>
-      name.endsWith("lib.min.js.fmt.js"),
-    );
-    const mapMatches = walkAndFilter(filesDir, (name) =>
-      name.endsWith("lib.min.js.fmt.js.map"),
-    );
-    expect(fmtMatches.length).toBe(0);
-    expect(mapMatches.length).toBe(0);
-  });
+      // The legacy P6.2 sidecar MUST be gone — its presence would mean
+      // we wrote the formatted view twice (once into srcviews.dat,
+      // once under files/) and would confuse readers that prefer the
+      // canonical CTFS record.
+      const filesDir = path.join(traceDir, "files");
+      const fmtMatches = walkAndFilter(filesDir, (name) =>
+        name.endsWith("lib.min.js.fmt.js"),
+      );
+      const mapMatches = walkAndFilter(filesDir, (name) =>
+        name.endsWith("lib.min.js.fmt.js.map"),
+      );
+      expect(fmtMatches.length).toBe(0);
+      expect(mapMatches.length).toBe(0);
+    },
+  );
 
   it("p6_2_recorder_bundled_prettier_rescues_empty_path", () => {
     // Historically this test asserted that an empty PATH degrades

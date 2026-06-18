@@ -302,7 +302,9 @@ enum TypeSpecificInfo {
     // but the variant is kept so the on-disk enum tag layout matches the canonical
     // crate byte-for-byte (consumers may serde-deserialize through this enum).
     #[allow(dead_code)]
-    Struct { fields: Vec<FieldTypeRecord> },
+    Struct {
+        fields: Vec<FieldTypeRecord>,
+    },
 }
 
 /// Mirrors `codetracer_trace_types::FieldTypeRecord`.
@@ -1515,12 +1517,7 @@ fn write_binary_trace(
             continue;
         }
         let map_key = format!("{}.map", virtual_path);
-        let Some(path_id) = state
-            .manifest
-            .paths
-            .iter()
-            .position(|p| p == virtual_path)
-        else {
+        let Some(path_id) = state.manifest.paths.iter().position(|p| p == virtual_path) else {
             // Virtual path didn't make it into manifest.paths — leave
             // the sidecar fallback in place so the formatted view is
             // still discoverable by older replay-servers.
@@ -1595,8 +1592,8 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
     // `CODETRACER_FORMAT` surface area.  Use `ct print` from
     // `codetracer-trace-format-nim` to convert the produced `.ct` bundle
     // to JSON / text.
-    let consumed_extra_files = write_binary_trace(&state, &state.trace_dir.clone())
-        .map_err(|e| {
+    let consumed_extra_files =
+        write_binary_trace(&state, &state.trace_dir.clone()).map_err(|e| {
             Error::new(
                 Status::GenericFailure,
                 format!("Failed to write CTFS trace: {e}"),
