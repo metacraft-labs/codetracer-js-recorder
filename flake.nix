@@ -128,10 +128,6 @@
               ++ pkgs.lib.optionals isLinux [
                 glibc.dev
               ]
-              ++ pkgs.lib.optionals isDarwin [
-                darwin.apple_sdk.frameworks.CoreFoundation
-                darwin.apple_sdk.frameworks.Security
-              ]
               ++ preCommit.enabledPackages;
 
             shellHook = preCommit.shellHook + ''
@@ -201,8 +197,6 @@
               with pkgs;
               [
                 libiconv
-                darwin.apple_sdk.frameworks.CoreFoundation
-                darwin.apple_sdk.frameworks.Security
               ]
             );
 
