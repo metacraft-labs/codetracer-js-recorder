@@ -972,6 +972,45 @@ pub fn append_events(
 
                 // Emit any pending type/variable-name events before the Call event
                 state.events.extend(pending_events);
+
+                // Anchor the call entry on the function's DEFINITION line.
+                //
+                // The trace-format `entryStep` convention (see
+                // `codetracer-trace-format-nim`, MultiStreamTraceWriter.registerCall)
+                // records a call entry at `stepCount - 1` — i.e. the step that was
+                // most recently flushed BEFORE the call.  ct-print then resolves
+                // that step index back to a source line to populate the call
+                // record's `entry_step`.
+                //
+                // The SWC instrumenter emits `__ct.step(callSite)` at the *call
+                // site* and only emits the callee's first body step AFTER
+                // `__ct.enter`.  Without an intervening step, the call entry would
+                // therefore anchor on the caller's line, not the callee's
+                // definition — the same defect previously seen in the Python
+                // recorder.  Downstream consumers (e.g. function-level incremental
+                // rebuild) expect the call's recorded line to be the function
+                // DEFINITION line, matching the Ruby recorder, whose `:call`
+                // tracepoint fires at the method-definition line and emits
+                // `register_step(def_line)` immediately before `register_call`
+                // (see codetracer-ruby-recorder ext/native_tracer/src/lib.rs).
+                //
+                // Mirror that contract here: emit a Step at the callee's
+                // definition line/col right before the Call so `entryStep`
+                // resolves to the definition line for every callee, including
+                // leaf functions with no further body steps.
+                if let Some(func) = state.manifest.functions.get(id) {
+                    let column = if state.column_aware {
+                        Some(func.col as i64)
+                    } else {
+                        None
+                    };
+                    state.events.push(TraceEvent::Step(StepRecord {
+                        path_id: func.path_index,
+                        line: func.line as i64,
+                        column,
+                    }));
+                }
+
                 state.events.push(TraceEvent::Call(CallRecord {
                     function_id: id,
                     args,

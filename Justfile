@@ -1,8 +1,21 @@
 alias t := test
 alias fmt := format
 
+# Install npm dependencies (idempotent).
+#
+# `build-native` shells out to `npx napi`, and the workspace build/test
+# steps need the dev dependencies (`@napi-rs/cli`, `typescript`,
+# `vitest`, …).  On a fresh checkout `node_modules` is absent and
+# `npx napi build` fails with `ENOVERSIONS`.  Run `npm install` first so
+# the recorder builds cleanly from a clean tree (the reprobuild
+# `just build` integration relies on this).  `npm install` is a no-op
+# once dependencies are present, so wiring it into `build`/`test` is safe
+# to run repeatedly.
+install:
+    npm install
+
 # Run all tests (builds workspaces first so imports resolve)
-test:
+test: install
     npm run build
     npm test
     just verify-cli-convention
@@ -14,11 +27,11 @@ verify-cli-convention:
     bash tests/verify-cli-convention-no-silent-skip.sh
 
 # Build the Rust native addon via napi-rs
-build-native:
+build-native: install
     npx napi build --release --manifest-path crates/recorder_native/Cargo.toml --output-dir crates/recorder_native/
 
 # Build all packages
-build:
+build: install
     just build-native
     npm run build
 

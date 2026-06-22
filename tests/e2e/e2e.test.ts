@@ -342,17 +342,52 @@ describe("e2e_record_simple_program", () => {
 
     // ----- Step / call counts -----------------------------------------
     // hello.js produces a stable number of recorder events:
-    //   - 7 step events (1 thread-start synthetic, 1 module prologue,
-    //     1 line 4 (greet entry), 1 line 9 (greet body), 1 line 5
-    //     (return), 1 line 6 (post-call), 1 line 10 (console.log))
+    //   - 9 step events:
+    //       step 0  line 1  (synthetic thread-start)
+    //       step 1  line 1  (<module> definition-line anchor — see below)
+    //       step 2  line 1  (module prologue)
+    //       step 3  line 4  (`function greet` declaration hoist)
+    //       step 4  line 9  (`var result = greet("World")` — the call site)
+    //       step 5  line 4  (greet definition-line anchor — see below)
+    //       step 6  line 5  (greet body: `var message = ...`)
+    //       step 7  line 6  (greet body: `return message`)
+    //       step 8  line 10 (`console.log(result)`)
     //   - 2 call entries (synthetic <module> wrapper + greet)
     //   - 1 io event (the console.log("Hello, World!") write to stdout)
+    //
+    // The two "definition-line anchor" steps (1 and 5) are emitted by the
+    // native recorder immediately before each call entry so the call's
+    // `entry_step` resolves to the callee's DEFINITION line (asserted
+    // below) rather than the caller's line — matching the trace-format
+    // `entryStep` contract and the Ruby recorder. See
+    // `crates/recorder_native/src/lib.rs` (EVENT_ENTER handler).
+    //
     // These are stable properties of the canonical fixture under the
     // current JS recorder — if they change, that's a real regression
     // to investigate, not a flake.
-    expect(full.counts.steps).toBe(7);
+    expect(full.counts.steps).toBe(9);
     expect(full.counts.calls).toBe(2);
     expect(full.counts.io_events).toBe(1);
+
+    // ----- entry_step points at the callee DEFINITION line ------------
+    // A call's recorded source line is the line of its `entry_step` step.
+    // `greet` is defined on line 4 and called on line 9; its call entry
+    // MUST anchor on line 4 (the definition), NOT line 9 (the call site).
+    // This is the core guarantee the function-level incremental-rebuild
+    // engine relies on, and the regression this fix repaired.
+    const stepLineByIndex = new Map<number, number>();
+    for (const e of full.events) {
+      if (e.kind === "step") {
+        stepLineByIndex.set(e.step_index, e.line);
+      }
+    }
+    const greetEntry = full.events.find(
+      (e): e is Extract<CtFullEvent, { kind: "call_entry" }> =>
+        e.kind === "call_entry" && e.function.endsWith("greet"),
+    );
+    expect(greetEntry).toBeDefined();
+    // greet is declared on line 4 of examples/hello.js.
+    expect(stepLineByIndex.get(greetEntry!.entry_step)).toBe(4);
 
     // ----- Call sequence: <module> first, then greet ------------------
     const callSequence: string[] = full.events
