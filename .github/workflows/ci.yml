@@ -8,8 +8,10 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nixos]
     steps:
+      - uses: actions/checkout@v4
+
       - name: Generate CI token
         id: app-token
         uses: actions/create-github-app-token@v1
@@ -18,88 +20,25 @@ jobs:
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
           owner: metacraft-labs
 
-      - uses: actions/checkout@v4
-
-      - name: Setup Nix
-        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+      - name: Setup dev env
+        # setup-dev-env clones the siblings listed in .github/sibling-repos
+        # (codetracer-trace-format, codetracer-trace-format-nim) at the
+        # workspace-lock-pinned revisions before materialising the nix env.
+        # --impure lets the dev shell pick up CODETRACER_NIM_LIB_DIR from the
+        # ambient environment (it defaults to ../codetracer-trace-format-nim).
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
         with:
-          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
-          substituters: ${{ vars.SUBSTITUTERS }}
-          nix-github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Checkout metacraft-manifests (workspace locks)
-        uses: actions/checkout@v5
-        with:
-          repository: metacraft-labs/metacraft-manifests
-          ref: latest
-          path: _manifests
-          token: ${{ steps.app-token.outputs.token }}
-
-      - name: Resolve cross-repo workspace-lock SHA
-        shell: bash
-        run: |
-          case "${{ github.event_name }}" in
-            pull_request) CANDS="${{ github.event.pull_request.base.sha }}" ;;
-            push) CANDS="${{ github.sha }} ${{ github.event.before }}" ;;
-            *) CANDS="${{ github.sha }}" ;;
-          esac
-          LOCK_SHA=""
-          for c in $CANDS; do
-            [ -z "$c" ] && continue
-            [ "$c" = "0000000000000000000000000000000000000000" ] && continue
-            if "${{ github.workspace }}/scripts/resolve-sibling-rev.sh" \
-                 --repo codetracer-js-recorder --sibling codetracer \
-                 --manifest-dir "${{ github.workspace }}/_manifests" \
-                 --sha "$c" --no-walk >/dev/null 2>&1; then
-              LOCK_SHA="$c"; break
-            fi
-          done
-          if [ -z "$LOCK_SHA" ]; then
-            echo "::error::No repo-workspaces workspace lock for codetracer-js-recorder (candidates: $CANDS). The commit must be published through the workspace tooling."
-            exit 1
-          fi
-          echo "CT_MANIFEST_DIR=${{ github.workspace }}/_manifests" >> "$GITHUB_ENV"
-          echo "CT_LOCK_SHA=$LOCK_SHA" >> "$GITHUB_ENV"
-          echo "Resolved cross-repo lock SHA for codetracer-js-recorder: $LOCK_SHA"
-      - name: Clone codetracer-trace-format (Cargo path dependency)
-        run: |
-          TF_REF="$("${{ github.workspace }}/scripts/resolve-sibling-rev.sh" \
-            --repo codetracer-js-recorder --sibling codetracer-trace-format \
-            --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk)"
-          TOKEN="${{ steps.app-token.outputs.token }}"
-          if [ -n "${TOKEN}" ]; then
-            CLONE_URL="https://x-access-token:${TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git"
-          else
-            CLONE_URL="https://github.com/metacraft-labs/codetracer-trace-format.git"
-          fi
-          rm -rf "${GITHUB_WORKSPACE}/../codetracer-trace-format"
-          # TF_REF is a commit SHA resolved from the workspace lock, so
-          # ``git clone --branch`` cannot be used; fetch the SHA and detach.
-          git clone --no-checkout "${CLONE_URL}" "${GITHUB_WORKSPACE}/../codetracer-trace-format"
-          git -C "${GITHUB_WORKSPACE}/../codetracer-trace-format" fetch --depth 1 origin "${TF_REF}"
-          git -C "${GITHUB_WORKSPACE}/../codetracer-trace-format" checkout --detach FETCH_HEAD
-
-      - name: Install zstd headers
-        run: sudo apt-get update && sudo apt-get install -y libzstd-dev
+          env-flavor: nix
+          gh-token: ${{ steps.app-token.outputs.token }}
+          nix-develop-args: --impure
 
       - name: Build Nim trace writer library
+        # The nim+nimble+zstd toolchain comes from the dev shell; zstd is on
+        # the dev-shell package set so the cargo/napi build resolves it via
+        # pkg-config without an explicit ZSTD_LIB_DIR.
         run: |
-          TFN_REF="$("${{ github.workspace }}/scripts/resolve-sibling-rev.sh" \
-            --repo codetracer-js-recorder --sibling codetracer-trace-format-nim \
-            --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk)"
-          TOKEN="${{ steps.app-token.outputs.token }}"
-          if [ -n "${TOKEN}" ]; then
-            CLONE_URL="https://x-access-token:${TOKEN}@github.com/metacraft-labs/codetracer-trace-format-nim.git"
-          else
-            CLONE_URL="https://github.com/metacraft-labs/codetracer-trace-format-nim.git"
-          fi
-          rm -rf "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
-          # TFN_REF is a commit SHA resolved from the workspace lock, so
-          # ``git clone --branch`` cannot be used; fetch the SHA and detach.
-          git clone --no-checkout "${CLONE_URL}" "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
-          git -C "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" fetch --depth 1 origin "${TFN_REF}"
-          git -C "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" checkout --detach FETCH_HEAD
-          nix develop --command bash -c "
+          dev-exec bash -c "
+            set -euo pipefail
             cd '${GITHUB_WORKSPACE}/../codetracer-trace-format-nim'
             nimble install -y stew results
             nim c --app:staticlib --mm:arc --noMain -d:release --passC:'-fPIC' -p:src \
@@ -113,31 +52,36 @@ jobs:
           echo "CT_PRINT=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim/ct-print" >> "$GITHUB_ENV"
 
       - name: Install dependencies
-        run: nix develop --command npm install
+        run: dev-exec npm install
 
       - name: Build native addon
-        run: |
-          CODETRACER_NIM_LIB_DIR='${{ github.workspace }}/../codetracer-trace-format-nim' \
-          ZSTD_LIB_DIR='/usr/lib/x86_64-linux-gnu' \
-          nix develop --impure --command just build-native
+        run: dev-exec just build-native
 
       - name: Build TypeScript packages
-        run: nix develop --command npm run build
+        run: dev-exec npm run build
 
       - name: Run tests
-        run: nix develop --command just test
+        run: dev-exec just test
 
   nix-build:
     name: Verify nix flake packages build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nixos]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Nix
-        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
         with:
-          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
-          substituters: ${{ vars.SUBSTITUTERS }}
-          nix-github-token: ${{ secrets.GITHUB_TOKEN }}
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Setup dev env
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        with:
+          env-flavor: nix
+          gh-token: ${{ steps.app-token.outputs.token }}
+
       - name: Build default package
         run: nix build .#default
