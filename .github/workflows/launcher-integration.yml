@@ -12,7 +12,7 @@ on:
 
 jobs:
   npm-bundling:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nixos]
     name: npm bundling smoke-test
     steps:
       - name: Generate CI token
