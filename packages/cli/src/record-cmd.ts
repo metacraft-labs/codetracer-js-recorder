@@ -538,8 +538,12 @@ globalThis.__ct = {
   // EVENT_THREAD_* events at 4-6).  Kept side-effect-free so it
   // never disrupts the instrumented program if the runtime is
   // partially initialised.
-  write: function(siteId) {
-    try { checkAsyncContext(); pushEvent(7, siteId); } catch(e) {}
+  write: function(siteId, value) {
+    try {
+      checkAsyncContext();
+      pushEvent(7, siteId);
+      valueEntries.push({ eventIndex: bufLen - 1, assignmentValue: encodeValue(value) });
+    } catch(e) {}
   },
 };
 

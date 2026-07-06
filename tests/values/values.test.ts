@@ -20,6 +20,7 @@ import {
   type CtPrintBundle,
 } from "../helpers/ct-print.js";
 
+const EVENT_ASSIGNMENT = 7;
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
 const ADDON_PATH = path.resolve(
   __dirname,
@@ -397,6 +398,32 @@ describe("test_mixed_values_in_batch", () => {
       value: 20,
       typeKind: "Int",
     });
+  });
+});
+
+// =============================================
+// test_assignment_value_capture
+// =============================================
+describe("test_assignment_value_capture", () => {
+  it("captures assignment target values on write events", () => {
+    const rt = createRuntime({
+      bufferCapacity: 1024,
+      skipProcessHooks: true,
+    });
+
+    rt.write(7, 42);
+    rt.flush();
+
+    const batch = rt.buffer.flushedBatches[0];
+    expect(batch.length).toBe(1);
+    expect(batch.eventKinds[0]).toBe(EVENT_ASSIGNMENT);
+    expect(batch.ids[0]).toBe(7);
+    expect(batch.values).toEqual([
+      {
+        eventIndex: 0,
+        assignmentValue: { value: 42, typeKind: "Int" },
+      },
+    ]);
   });
 });
 

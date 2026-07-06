@@ -464,7 +464,7 @@ export interface CtRuntime {
    * throws — the runtime is designed to be transparent to the host
    * program even when its bookkeeping is wrong.
    */
-  write(siteId: number): void;
+  write(siteId: number, value?: unknown): void;
 
   /**
    * Enable async context tracking.
@@ -536,7 +536,7 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
       ret(_fnId: number, value?: unknown): unknown {
         return value;
       },
-      write(_siteId: number): void {},
+      write(_siteId: number, _value?: unknown): void {},
       enableAsyncTracking(): void {},
       disableAsyncTracking(): void {},
       get buffer() {
@@ -618,7 +618,7 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
       return value;
     },
 
-    write(siteId: number): void {
+    write(siteId: number, value?: unknown): void {
       // M16a: emit an EVENT_ASSIGNMENT for the site.  The native
       // addon resolves the manifest write-site entry for `siteId`
       // and lowers it into a `BindVariable + Assignment` pair on the
@@ -630,6 +630,10 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
       try {
         asyncTracker.checkContext(buffer);
         buffer.push(EVENT_ASSIGNMENT, siteId);
+        buffer.pushValue({
+          eventIndex: buffer.length - 1,
+          assignmentValue: encodeValue(value),
+        });
       } catch {
         // Never crash the user's program
       }

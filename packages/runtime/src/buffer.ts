@@ -54,6 +54,8 @@ export interface ValueEntry {
   args?: EncodedValue[];
   /** Encoded return value (for ret events). */
   returnValue?: EncodedValue;
+  /** Encoded assignment target value (for assignment events). */
+  assignmentValue?: EncodedValue;
 }
 
 /** A write entry associated with a Write event (console output). */

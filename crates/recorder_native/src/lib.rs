@@ -137,7 +137,6 @@ struct ManifestFunction {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManifestSite {
-    #[allow(dead_code)]
     kind: String,
     path_index: usize,
     line: u32,
@@ -151,6 +150,16 @@ struct ManifestSite {
     col: u32,
     #[allow(dead_code)]
     fn_id: Option<usize>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    rvalue_kind: Option<String>,
+    #[serde(default)]
+    rvalue_source: Option<String>,
+    #[serde(default)]
+    rvalue_field: Option<String>,
+    #[serde(default)]
+    rvalue_index: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,6 +216,8 @@ struct ValueEntry {
     args: Option<Vec<EncodedValue>>,
     #[serde(default)]
     return_value: Option<EncodedValue>,
+    #[serde(default)]
+    assignment_value: Option<EncodedValue>,
 }
 
 /// A write entry deserialized from the JS side (console output).
@@ -436,6 +447,7 @@ enum TraceEvent {
     // kept so a serde-deserialiser walking this enum sees the canonical tag layout.
     #[allow(dead_code)]
     Value(FullValueRecord),
+    Assignment(codetracer_trace_types::AssignmentRecord),
     ThreadStart(u64),
     ThreadSwitch(u64),
     ThreadExit(u64),
@@ -517,6 +529,125 @@ impl VariableNameRegistry {
             self.next_id += 1;
             self.map.insert(name.to_string(), id);
             (id, Some(TraceEvent::VariableName(name.to_string())))
+        }
+    }
+}
+
+fn assignment_rvalue_from_site(
+    site: &ManifestSite,
+    registry: &mut VariableNameRegistry,
+    pending_events: &mut Vec<TraceEvent>,
+) -> codetracer_trace_types::RValue {
+    let mut variable_id_for = |name: &str| {
+        let (id, var_event) = registry.get_or_register(name);
+        if let Some(ve) = var_event {
+            pending_events.push(ve);
+        }
+        codetracer_trace_types::VariableId(id)
+    };
+
+    match site.rvalue_kind.as_deref().unwrap_or("Compound") {
+        "Literal" => codetracer_trace_types::RValue::Literal,
+        "Simple" => site
+            .rvalue_source
+            .as_deref()
+            .map(&mut variable_id_for)
+            .map(codetracer_trace_types::RValue::Simple)
+            .unwrap_or_else(|| codetracer_trace_types::RValue::Compound(Vec::new())),
+        "FieldAccess" => match (site.rvalue_source.as_deref(), site.rvalue_field.as_ref()) {
+            (Some(source), Some(field)) => codetracer_trace_types::RValue::FieldAccess {
+                receiver: variable_id_for(source),
+                field: field.clone(),
+            },
+            _ => codetracer_trace_types::RValue::Compound(Vec::new()),
+        },
+        "IndexAccess" => match (site.rvalue_source.as_deref(), site.rvalue_index) {
+            (Some(source), Some(index)) => codetracer_trace_types::RValue::IndexAccess {
+                receiver: variable_id_for(source),
+                index,
+            },
+            _ => codetracer_trace_types::RValue::Compound(Vec::new()),
+        },
+        "FunctionReturn" => {
+            // The JS runtime currently reports assignment writes as
+            // `EVENT_ASSIGNMENT(site_id, target_value)` with no link to the
+            // immediately preceding/underlying call event.  Call keys are
+            // allocated inside the Nim trace writer when `register_call` is
+            // replayed, so this native buffering layer cannot safely name the
+            // call record whose return value flowed into this assignment.
+            // Emitting `FunctionReturn { CallKey(0) }` is therefore actively
+            // misleading: it points every call/new/tagged-template assignment
+            // at the same synthetic call.  Until the runtime carries a stable
+            // call-event identity through the assignment side channel, keep the
+            // rvalue conservative and let the captured target Value event carry
+            // the concrete result.
+            codetracer_trace_types::RValue::Compound(Vec::new())
+        }
+        _ => site
+            .rvalue_source
+            .as_deref()
+            .map(&mut variable_id_for)
+            .map(|id| codetracer_trace_types::RValue::Compound(vec![id]))
+            .unwrap_or_else(|| codetracer_trace_types::RValue::Compound(Vec::new())),
+    }
+}
+
+#[cfg(test)]
+mod assignment_rvalue_tests {
+    use super::*;
+
+    fn write_site(target: &str, rvalue_kind: &str) -> ManifestSite {
+        ManifestSite {
+            kind: "write".to_string(),
+            path_index: 0,
+            line: 1,
+            col: 0,
+            fn_id: None,
+            target: Some(target.to_string()),
+            rvalue_kind: Some(rvalue_kind.to_string()),
+            rvalue_source: None,
+            rvalue_field: None,
+            rvalue_index: None,
+        }
+    }
+
+    #[test]
+    fn function_return_assignment_rvalue_does_not_fabricate_call_key_zero() {
+        let site = write_site("result", "FunctionReturn");
+        let mut registry = VariableNameRegistry::new();
+        let mut pending_events = Vec::new();
+
+        let rvalue = assignment_rvalue_from_site(&site, &mut registry, &mut pending_events);
+
+        match rvalue {
+            codetracer_trace_types::RValue::Compound(ids) => assert!(ids.is_empty()),
+            codetracer_trace_types::RValue::FunctionReturn { call_key } => {
+                panic!("function-return assignment used bogus call key {call_key:?}")
+            }
+            other => panic!("unexpected conservative function-return rvalue: {other:?}"),
+        }
+        assert!(pending_events.is_empty());
+    }
+
+    #[test]
+    fn simple_assignment_rvalue_registers_source_variable() {
+        let mut site = write_site("b", "Simple");
+        site.rvalue_source = Some("a".to_string());
+        let mut registry = VariableNameRegistry::new();
+        let mut pending_events = Vec::new();
+
+        let rvalue = assignment_rvalue_from_site(&site, &mut registry, &mut pending_events);
+
+        match rvalue {
+            codetracer_trace_types::RValue::Simple(codetracer_trace_types::VariableId(id)) => {
+                assert_eq!(id, 0);
+            }
+            other => panic!("expected Simple rvalue for direct assignment, got {other:?}"),
+        }
+        assert_eq!(pending_events.len(), 1);
+        match &pending_events[0] {
+            TraceEvent::VariableName(name) => assert_eq!(name, "a"),
+            other => panic!("expected source VariableName event, got {other:?}"),
         }
     }
 }
@@ -1076,6 +1207,56 @@ pub fn append_events(
             6 => {
                 state.events.push(TraceEvent::ThreadExit(id as u64));
             }
+            // assignment write site
+            7 => {
+                let Some(site) = state.manifest.sites.get(id).cloned() else {
+                    continue;
+                };
+                if site.kind != "write" {
+                    continue;
+                }
+                let Some(target) = site.target.as_deref() else {
+                    continue;
+                };
+
+                let mut pending_events: Vec<TraceEvent> = Vec::new();
+                let (target_id, var_event) = state.var_name_registry.get_or_register(target);
+                if let Some(ve) = var_event {
+                    pending_events.push(ve);
+                }
+
+                let value = value_map
+                    .get(&i)
+                    .and_then(|entry| entry.assignment_value.as_ref())
+                    .map(|encoded| {
+                        encoded_to_value_record(
+                            encoded,
+                            &mut state.type_registry,
+                            &mut pending_events,
+                        )
+                    });
+
+                let rvalue = assignment_rvalue_from_site(
+                    &site,
+                    &mut state.var_name_registry,
+                    &mut pending_events,
+                );
+
+                state.events.extend(pending_events);
+                if let Some(value) = value {
+                    state.events.push(TraceEvent::Value(FullValueRecord {
+                        variable_id: target_id,
+                        value,
+                    }));
+                }
+                state.events.push(TraceEvent::Assignment(
+                    codetracer_trace_types::AssignmentRecord {
+                        to: codetracer_trace_types::VariableId(target_id),
+                        pass_by: codetracer_trace_types::PassBy::Value,
+                        from: rvalue,
+                    },
+                ));
+            }
             _ => {
                 // Unknown event kind — skip
             }
@@ -1484,6 +1665,11 @@ fn write_binary_trace(
                     .unwrap_or_else(|| format!("var_{}", fvr.variable_id));
                 let v = local_value_to_upstream(&fvr.value, &mut writer);
                 writer.register_variable_with_full_value(&var_name, v);
+            }
+            TraceEvent::Assignment(ar) => {
+                writer.add_event(codetracer_trace_types::TraceLowLevelEvent::Assignment(
+                    ar.clone(),
+                ));
             }
             TraceEvent::Event(re) => {
                 // Map local EventLogKind to upstream.  We produce Write

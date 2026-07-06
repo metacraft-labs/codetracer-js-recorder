@@ -186,18 +186,20 @@ function mkRetExpr(fnId: number, value?: Expression): Expression {
 // ---------- M16a: write-call builder ----------
 
 /**
- * Build a synthetic `__ct.write(siteId)` statement.
+ * Build a synthetic `__ct.write(siteId, value)` statement.
  *
  * The runtime resolves the metadata for `siteId` from the manifest
  * (target name + RValue description) and emits the corresponding
  * `BindVariable` + `Assignment` pair into its event buffer.  The
- * single-argument shape keeps the bytecode-level call cost minimal
- * and matches the existing `__ct.step(siteId)` pattern.
+ * The second argument captures the just-written live binding so the
+ * recorder emits a normal Value event for the assignment target.
  */
-function mkWriteCall(siteId: number): Statement {
-  return mkExprStmt(
-    mkCallExpr(mkMemberExpr("__ct", "write"), [mkNumericLiteral(siteId)]),
-  );
+function mkWriteCall(siteId: number, targetName?: string): Statement {
+  const args: Expression[] = [mkNumericLiteral(siteId)];
+  if (targetName) {
+    args.push(mkIdentifier(targetName));
+  }
+  return mkExprStmt(mkCallExpr(mkMemberExpr("__ct", "write"), args));
 }
 
 // ---------- M16a: assignment classifier ----------
@@ -942,11 +944,13 @@ export function transformModule(module: Module, ctx: TransformContext): void {
     // shape in the top-level statement.  Module-level `const`/`let`
     // declarations are the common case here (entry-point scripts).
     if ("type" in item) {
-      for (const siteId of collectAssignmentSitesFromStatement(
+      for (const site of collectAssignmentSitesFromStatement(
         item as unknown as Statement,
         ctx,
       )) {
-        newBody.push(mkWriteCall(siteId) as unknown as ModuleItem);
+        newBody.push(
+          mkWriteCall(site.siteId, site.target) as unknown as ModuleItem,
+        );
       }
     }
   }
@@ -1238,8 +1242,8 @@ function transformBlockBody(stmts: Statement[], ctx: TransformContext): void {
     // recognised in this statement.  We do this AFTER the statement
     // so the runtime sees the post-store value when it inspects the
     // live binding via the manifest's target name.
-    for (const siteId of collectAssignmentSitesFromStatement(stmt, ctx)) {
-      newStmts.push(mkWriteCall(siteId));
+    for (const site of collectAssignmentSitesFromStatement(stmt, ctx)) {
+      newStmts.push(mkWriteCall(site.siteId, site.target));
     }
   }
 
@@ -1277,8 +1281,8 @@ function transformBlockBody(stmts: Statement[], ctx: TransformContext): void {
 function collectAssignmentSitesFromStatement(
   stmt: Statement,
   ctx: TransformContext,
-): number[] {
-  const siteIds: number[] = [];
+): Array<{ siteId: number; target: string }> {
+  const sites: Array<{ siteId: number; target: string }> = [];
 
   /**
    * Helper: register every destructuring write produced by an LHS
@@ -1309,7 +1313,7 @@ function collectAssignmentSitesFromStatement(
           index: w.rvalue.index,
         },
       );
-      siteIds.push(id);
+      sites.push({ siteId: id, target: w.target });
     }
   };
 
@@ -1352,9 +1356,9 @@ function collectAssignmentSitesFromStatement(
           index: rvalue.index,
         },
       );
-      siteIds.push(siteId);
+      sites.push({ siteId, target });
     }
-    return siteIds;
+    return sites;
   }
 
   if (stmt.type === "ExpressionStatement") {
@@ -1380,7 +1384,7 @@ function collectAssignmentSitesFromStatement(
         isDestructuringPattern(ae.left)
       ) {
         emitDestructuringWriteSites(ae.left, ae.right, span);
-        return siteIds;
+        return sites;
       }
 
       const target = extractAssignmentTarget(ae.left);
@@ -1406,12 +1410,12 @@ function collectAssignmentSitesFromStatement(
             index: rvalue.index,
           },
         );
-        siteIds.push(siteId);
+        sites.push({ siteId, target });
       }
     }
   }
 
-  return siteIds;
+  return sites;
 }
 
 function isExecutableStatement(stmt: Statement): boolean {
@@ -1999,7 +2003,7 @@ function instrumentFunctionBody(
         name,
         "Compound",
       );
-      withSteps.push(mkWriteCall(siteId));
+      withSteps.push(mkWriteCall(siteId, name));
     }
   };
 
@@ -2015,11 +2019,8 @@ function instrumentFunctionBody(
           withSteps.push(mkStepCall(siteId));
         }
         withSteps.push(stmts[i]);
-        for (const siteId of collectAssignmentSitesFromStatement(
-          stmts[i],
-          ctx,
-        )) {
-          withSteps.push(mkWriteCall(siteId));
+        for (const site of collectAssignmentSitesFromStatement(stmts[i], ctx)) {
+          withSteps.push(mkWriteCall(site.siteId, site.target));
         }
       }
 
@@ -2034,11 +2035,8 @@ function instrumentFunctionBody(
           withSteps.push(mkStepCall(siteId));
         }
         withSteps.push(stmts[i]);
-        for (const siteId of collectAssignmentSitesFromStatement(
-          stmts[i],
-          ctx,
-        )) {
-          withSteps.push(mkWriteCall(siteId));
+        for (const site of collectAssignmentSitesFromStatement(stmts[i], ctx)) {
+          withSteps.push(mkWriteCall(site.siteId, site.target));
         }
       }
     } else {
@@ -2051,11 +2049,8 @@ function instrumentFunctionBody(
           withSteps.push(mkStepCall(siteId));
         }
         withSteps.push(stmts[i]);
-        for (const siteId of collectAssignmentSitesFromStatement(
-          stmts[i],
-          ctx,
-        )) {
-          withSteps.push(mkWriteCall(siteId));
+        for (const site of collectAssignmentSitesFromStatement(stmts[i], ctx)) {
+          withSteps.push(mkWriteCall(site.siteId, site.target));
         }
       }
     }
@@ -2070,8 +2065,8 @@ function instrumentFunctionBody(
         withSteps.push(mkStepCall(siteId));
       }
       withSteps.push(stmts[i]);
-      for (const siteId of collectAssignmentSitesFromStatement(stmts[i], ctx)) {
-        withSteps.push(mkWriteCall(siteId));
+      for (const site of collectAssignmentSitesFromStatement(stmts[i], ctx)) {
+        withSteps.push(mkWriteCall(site.siteId, site.target));
       }
     }
   }
