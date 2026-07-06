@@ -30,6 +30,9 @@ package codetracer_js_recorder:
     when defined(windows):
       "npm"
     when not defined(windows):
+      # Cargo build scripts look for ``cc`` by default; pass ``CC=clang``
+      # below and make clang part of the Unix dev environment.
+      "clang"
       "pkg-config"
       "openssl"
 
@@ -60,6 +63,9 @@ package codetracer_js_recorder:
       dylibExt
     const cargoManifest = "crates/recorder_native/Cargo.toml"
     const cargoLockfile = "crates/recorder_native/Cargo.lock"
+    let cargoCompilerEnv: seq[(string, string)] =
+      when defined(windows): @[]
+      else: @[("CC", "clang")]
 
     let addonBuild = cargo.build(
       release = true,
@@ -69,7 +75,8 @@ package codetracer_js_recorder:
         cargoManifest, cargoLockfile,
         "crates/recorder_native/src"
       ],
-      extraOutputs = @[addonBinary])
+      extraOutputs = @[addonBinary],
+      extraEnv = cargoCompilerEnv)
     discard collect("default", @[addonBuild])
 
     # ---- Rust-side cargo tests ---------------------------------------
@@ -80,7 +87,8 @@ package codetracer_js_recorder:
       actionId = "codetracer-js-recorder.cargo-test-build",
       extraInputs = @[cargoManifest, cargoLockfile,
                       "crates/recorder_native/src"],
-      extraOutputs = @["crates/recorder_native/target/debug/deps"])
+      extraOutputs = @["crates/recorder_native/target/debug/deps"],
+      extraEnv = cargoCompilerEnv)
 
     let cargoTestsRun = cargo.test(
       manifestPath = cargoManifest,
@@ -90,6 +98,7 @@ package codetracer_js_recorder:
         cargoManifest, cargoLockfile,
         "crates/recorder_native/src",
         "crates/recorder_native/target/debug/deps"
-      ])
+      ],
+      extraEnv = cargoCompilerEnv)
 
     discard collect("test", @[cargoTestsRun.action])
