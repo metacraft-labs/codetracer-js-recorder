@@ -65,12 +65,13 @@ jobs:
           attic-cache: ${{ vars.ATTIC_CACHE }}
           attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
 
-      - name: Add xz for macOS reprobuild tool archives
-        if: matrix.os == 'macos'
+      - name: Add xz for reprobuild tool archives
+        if: matrix.os != 'windows'
         shell: bash
         run: |
           set -euo pipefail
-          xz_bin="$(nix build --no-link --print-out-paths nixpkgs#xz)/bin"
+          xz_out="$(nix build --no-link --print-out-paths nixpkgs#xz.bin)"
+          xz_bin="${xz_out}/bin"
           echo "$xz_bin" >> "$GITHUB_PATH"
           "$xz_bin/xz" --version
 
