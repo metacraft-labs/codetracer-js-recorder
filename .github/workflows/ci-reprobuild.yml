@@ -102,7 +102,7 @@ jobs:
 
       - name: repro test
         # Materialises the `test` collection.
-        run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'path' || 'nix' }}
+        run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'path' || 'nix' }} --no-runquota
 
       - name: just build (cross-check)
         # Re-runs the legacy `just build` path inside the same env so
