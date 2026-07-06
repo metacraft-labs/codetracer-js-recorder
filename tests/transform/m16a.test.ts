@@ -49,9 +49,10 @@ const b = a;
     expect(bSite!.rvalueKind).toBe("Simple");
     expect(bSite!.rvalueSource).toBe("a");
 
-    // The instrumented source should contain a __ct.write(siteId)
-    // call referencing the new write site.
-    expect(result.code).toMatch(/__ct\.write\(\d+\)/);
+    // The instrumented source should pass the just-written binding to
+    // the runtime so the native assignment event can carry the target
+    // value snapshot.
+    expect(result.code).toMatch(/__ct\.write\(\d+,\s*b\)/);
   });
 
   it("emits a write site with RValue::Literal for `let a = 10`", () => {
