@@ -65,6 +65,15 @@ jobs:
           attic-cache: ${{ vars.ATTIC_CACHE }}
           attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
 
+      - name: Add xz for macOS reprobuild tool archives
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          xz_bin="$(nix build --no-link --print-out-paths nixpkgs#xz)/bin"
+          echo "$xz_bin" >> "$GITHUB_PATH"
+          "$xz_bin/xz" --version
+
       - name: repro build
         # Builds the conventional `build` collection declared in
         # `repro.nim`. Verifies the primary shipping artefact (the
