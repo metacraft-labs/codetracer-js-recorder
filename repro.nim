@@ -29,10 +29,15 @@ package codetracer_js_recorder:
     "node >=20"
     when defined(windows):
       "npm"
-    when not defined(windows):
+    when defined(linux):
+      # Nim staticlib builds invoked from cargo expect a GNU archiver on
+      # Linux. Use gcc so Nim selects ``ar`` instead of ``llvm-ar``.
+      "gcc"
+    when defined(macosx):
       # Cargo build scripts look for ``cc`` by default; pass ``CC=clang``
-      # below and make clang part of the Unix dev environment.
+      # below and make clang part of the macOS dev environment.
       "clang"
+    when not defined(windows):
       "pkg-config"
       "openssl"
 
@@ -47,8 +52,8 @@ package codetracer_js_recorder:
     # The Rust crate produces a cdylib that napi-rs renames to
     # `<addon>.<platform-suffix>.node` at packaging time. For the
     # `default` collection we materialise the cargo cdylib output;
-    # the platform-suffix rename happens at gem-packing time (the
-    # `package` collection's job, declared elsewhere).
+    # the platform-suffix rename happens at package time (outside this
+    # cargo edge). Cargo uses ``lib`` prefixes for Unix cdylibs.
     #
     # Path-mode caveat: the JS recorder's cargo crate lives at
     # ``crates/recorder_native/Cargo.toml`` (there is no workspace
@@ -58,14 +63,17 @@ package codetracer_js_recorder:
       when defined(windows): "dll"
       elif defined(macosx): "dylib"
       else: "so"
+    const dylibName =
+      when defined(windows): "codetracer_js_recorder_native"
+      else: "libcodetracer_js_recorder_native"
     const addonBinary =
-      "crates/recorder_native/target/release/codetracer_js_recorder_native." &
-      dylibExt
+      "crates/recorder_native/target/release/" & dylibName & "." & dylibExt
     const cargoManifest = "crates/recorder_native/Cargo.toml"
     const cargoLockfile = "crates/recorder_native/Cargo.lock"
     let cargoCompilerEnv: seq[(string, string)] =
       when defined(windows): @[]
-      else: @[("CC", "clang")]
+      elif defined(macosx): @[("CC", "clang")]
+      else: @[("CC", "gcc")]
 
     let addonBuild = cargo.build(
       release = true,
