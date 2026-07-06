@@ -22,12 +22,13 @@ package codetracer_js_recorder:
     "nimble"
     "capnp"
     "zstd"
-    # ``node`` + ``npm`` drive the napi-rs binding step. With MR2's
-    # stdlib tarball entries the engine materialises a content-
-    # addressed Node 20.x LTS prefix and surfaces ``node`` / ``npm``
-    # from that prefix to the build edge.
+    # ``node`` drives the napi-rs binding step. The Unix Node tarballs
+    # expose ``npm`` as a symlink, which the current tarball resolver
+    # does not materialise as an executable; the reprobuild cargo-only
+    # build/test edges do not need npm on Linux/macOS.
     "node >=20"
-    "npm"
+    when defined(windows):
+      "npm"
     when not defined(windows):
       "pkg-config"
       "openssl"
