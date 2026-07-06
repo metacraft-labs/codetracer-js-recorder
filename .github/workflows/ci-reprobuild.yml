@@ -80,11 +80,13 @@ jobs:
         # `repro.nim`. Verifies the primary shipping artefact (the
         # recorder binary or extension) materialises through the
         # reprobuild engine identically to `just build`.
-        run: dev-exec repro build
+        # Linux/macOS use Nix-provisioned Rust tools; generic Rust
+        # tarballs do not run directly on NixOS runners.
+        run: dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'path' || 'nix' }}
 
       - name: repro test
         # Materialises the `test` collection.
-        run: dev-exec repro test
+        run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'path' || 'nix' }}
 
       - name: just build (cross-check)
         # Re-runs the legacy `just build` path inside the same env so
