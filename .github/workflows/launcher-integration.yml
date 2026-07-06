@@ -36,7 +36,7 @@ jobs:
 
       - name: Build launcher
         working-directory: codetracer-launcher
-        run: nix-shell -p nim2 zig --run "bash ./build.sh --target linux-musl-x86_64 --out launcher"
+        run: nix --extra-experimental-features "nix-command flakes" shell nixpkgs#nim2 nixpkgs#zig --command bash ./build.sh --target linux-musl-x86_64 --out launcher
 
       - name: Set up Node
         uses: actions/setup-node@v4
