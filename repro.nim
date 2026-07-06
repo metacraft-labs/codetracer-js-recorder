@@ -22,6 +22,7 @@ package codetracer_js_recorder:
     "nimble"
     "capnp"
     "zstd"
+    "just >=1"
     # ``node`` drives the napi-rs binding step. The Unix Node tarballs
     # expose ``npm`` as a symlink, which the current tarball resolver
     # does not materialise as an executable; the reprobuild cargo-only
