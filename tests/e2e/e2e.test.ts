@@ -356,10 +356,10 @@ describe("e2e_record_simple_program", () => {
     //   - 1 io event (the console.log("Hello, World!") write to stdout)
     //
     // The two "definition-line anchor" steps (1 and 5) are emitted by the
-    // native recorder immediately before each call entry so the call's
+    // native recorder as the first step inside each call so the call's
     // `entry_step` resolves to the callee's DEFINITION line (asserted
-    // below) rather than the caller's line — matching the trace-format
-    // `entryStep` contract and the Ruby recorder. See
+    // below) rather than the first executable body line — matching the
+    // trace-format `entryStep` contract and the Ruby recorder. See
     // `crates/recorder_native/src/lib.rs` (EVENT_ENTER handler).
     //
     // These are stable properties of the canonical fixture under the

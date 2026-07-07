@@ -875,6 +875,11 @@ function resolveSpan(
   return ctx.resolveLocation(loc.line, loc.col);
 }
 
+function spanStartOf(node: unknown): number | undefined {
+  const span = (node as { span?: { start?: unknown } } | undefined)?.span;
+  return typeof span?.start === "number" ? span.start : undefined;
+}
+
 /**
  * Transform an SWC Module AST in-place, injecting __ct instrumentation.
  */
@@ -1620,7 +1625,8 @@ function transformFunctionDecl(
 ): void {
   if (!decl.body) return;
 
-  const resolved = resolveSpan(decl.span.start, ctx);
+  const definitionStart = spanStartOf(decl.identifier) ?? decl.span.start;
+  const resolved = resolveSpan(definitionStart, ctx);
   const name = decl.identifier?.value ?? "<anonymous>";
   const params = extractParamNames(decl.params as unknown[]);
   const fnId = ctx.manifest.addFunction(
@@ -1647,7 +1653,8 @@ function transformFunctionExpression(
 ): void {
   if (!expr.body) return;
 
-  const resolved = resolveSpan(expr.span.start, ctx);
+  const definitionStart = spanStartOf(expr.identifier) ?? expr.span.start;
+  const resolved = resolveSpan(definitionStart, ctx);
   const name = getFunctionName(
     expr as unknown as { type: string; identifier?: { value: string } },
   );
@@ -1745,7 +1752,8 @@ function transformMethodProperty(
   };
   if (!fn.body) return;
 
-  const resolved = resolveSpan(fn.span.start, ctx);
+  const definitionStart = spanStartOf(fn.key) ?? fn.span.start;
+  const resolved = resolveSpan(definitionStart, ctx);
   const name = getFunctionName(
     fn as unknown as { type: string; key?: { type: string; value?: string } },
   );
@@ -1771,7 +1779,8 @@ function transformGetterProperty(
   ctx: TransformContext,
 ): void {
   if (!prop.body) return;
-  const resolved = resolveSpan(prop.span.start, ctx);
+  const definitionStart = spanStartOf(prop.key) ?? prop.span.start;
+  const resolved = resolveSpan(definitionStart, ctx);
   const keyName = getFunctionName(
     prop as unknown as { type: string; key?: { type: string; value?: string } },
   );
@@ -1796,7 +1805,8 @@ function transformSetterProperty(
   ctx: TransformContext,
 ): void {
   if (!prop.body) return;
-  const resolved = resolveSpan(prop.span.start, ctx);
+  const definitionStart = spanStartOf(prop.key) ?? prop.span.start;
+  const resolved = resolveSpan(definitionStart, ctx);
   const keyName = getFunctionName(
     prop as unknown as { type: string; key?: { type: string; value?: string } },
   );
@@ -1897,7 +1907,8 @@ function transformClassMethod(cm: ClassMethod, ctx: TransformContext): void {
   const fn = cm.function;
   if (!fn.body) return;
 
-  const resolved = resolveSpan(cm.span.start, ctx);
+  const definitionStart = spanStartOf(cm.key) ?? cm.span.start;
+  const resolved = resolveSpan(definitionStart, ctx);
   const name = getFunctionName(
     cm as unknown as { type: string; key?: { type: string; value?: string } },
   );

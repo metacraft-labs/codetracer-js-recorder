@@ -227,6 +227,23 @@ greet("World");
     }
   });
 
+  it("anchors function declarations on the declaration line after comments", () => {
+    const result = inst(`/**
+ * Leading file comment.
+ */
+function greet(name) {
+  return "Hello, " + name;
+}
+`);
+
+    const greetFn = result.manifestSlice.functions.find(
+      (f) => f.name === "greet",
+    );
+
+    expect(greetFn).toBeDefined();
+    expect(greetFn!.line).toBe(4);
+  });
+
   it("assigns sequential siteIds (indices)", () => {
     const result = inst(`
 function foo() { return 1; }

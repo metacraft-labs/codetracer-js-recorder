@@ -34,22 +34,9 @@ jobs:
           path: codetracer-launcher
           gh-token: ${{ steps.app-token.outputs.token }}
 
-      - name: Install Nim
-        uses: jiro4989/setup-nim-action@v2
-        with:
-          nim-version: "2.2.4"
-
-      - name: Install musl-tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
       - name: Build launcher
         working-directory: codetracer-launcher
-        run: bash ./build.sh --target linux-musl-x86_64 --out launcher
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+        run: nix --extra-experimental-features "nix-command flakes" shell nixpkgs#nim2 nixpkgs#zig --command bash ./build.sh --target linux-musl-x86_64 --out launcher
 
       - name: Build bundled tarball
         working-directory: codetracer-launcher/packaging/npm
@@ -58,13 +45,16 @@ jobs:
           CT_LAUNCHER_BIN: ${{ github.workspace }}/codetracer-launcher/out/launcher
           CT_LAUNCHER_TARGET: linux-musl-x86_64
           CT_RECORDER_SRC: ${{ github.workspace }}/codetracer-js-recorder/packages
-        run: node build_npm.mjs
+        run: nix --extra-experimental-features "nix-command flakes" shell nixpkgs#nodejs_22 --command node build_npm.mjs
 
       - name: Smoke-test the tarball
         run: |
+          nix --extra-experimental-features "nix-command flakes" shell nixpkgs#nodejs_22 --command bash <<'EOF'
+          set -euo pipefail
           mkdir -p /tmp/m9-npm && cd /tmp/m9-npm
           npm init -y > /dev/null
           npm install --no-save "${GITHUB_WORKSPACE}/codetracer-launcher/packaging/npm/dist"/*.tgz
           out=$(./node_modules/.bin/ct --version)
           echo "$out"
           echo "$out" | grep -qE "^ct [0-9]+\.[0-9]+"
+          EOF

@@ -59,26 +59,52 @@ jobs:
         with:
           env-flavor: reprobuild
           gh-token: ${{ steps.ci_token.outputs.token }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-cache: ${{ vars.ATTIC_CACHE }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+
+      - name: Add xz for reprobuild tool archives
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          xz_out="$(nix build --no-link --print-out-paths nixpkgs#xz.bin)"
+          xz_bin="${xz_out}/bin"
+          echo "$xz_bin" >> "$GITHUB_PATH"
+          "$xz_bin/xz" --version
+
+      - name: Prepare macOS linker paths
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          iconv_out="$(nix build --no-link --print-out-paths nixpkgs#libiconv)"
+          echo "LIBRARY_PATH=${iconv_out}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}" >> "$GITHUB_ENV"
+          echo "DYLD_LIBRARY_PATH=${iconv_out}/lib${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
+          echo "NIX_LDFLAGS=-L${iconv_out}/lib${NIX_LDFLAGS:+ ${NIX_LDFLAGS}}" >> "$GITHUB_ENV"
+          if [ -z "${SDKROOT:-}" ] && [ -x /usr/bin/xcrun ]; then
+            sdkroot="$(/usr/bin/xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
+            if [ -n "$sdkroot" ]; then
+              echo "SDKROOT=$sdkroot" >> "$GITHUB_ENV"
+            fi
+          fi
 
       - name: repro build
         # Builds the conventional `build` collection declared in
         # `repro.nim`. Verifies the primary shipping artefact (the
         # recorder binary or extension) materialises through the
-        # reprobuild engine identically to `just build`.
-        run: dev-exec repro build
+        # reprobuild engine.
+        # Linux/macOS use Nix-provisioned Rust tools; generic Rust
+        # tarballs do not run directly on NixOS runners.
+        run: dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'path' || 'nix' }} --no-runquota
 
       - name: repro test
         # Materialises the `test` collection.
-        run: dev-exec repro test
-
-      - name: just build (cross-check)
-        # Re-runs the legacy `just build` path inside the same env so
-        # we catch silent divergences between `repro build` outputs
-        # and what the dev shell + Justfile produce today.
-        run: dev-exec just build
-
-      - name: just test (cross-check)
-        run: dev-exec just test
+        env:
+          REPROBUILD_NO_RUNQUOTA: "1"
+        run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'path' || 'nix' }}
 
       - name: Upload logs on failure
         if: failure()

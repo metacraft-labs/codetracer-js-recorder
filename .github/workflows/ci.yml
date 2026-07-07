@@ -23,13 +23,18 @@ jobs:
       - name: Setup dev env
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
-        # workspace-lock-pinned revisions before materialising the nix env.
+        # explicit refs used by the flake before materialising the nix env.
         # --impure lets the dev shell pick up CODETRACER_NIM_LIB_DIR from the
         # ambient environment (it defaults to ../codetracer-trace-format-nim).
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-cache: ${{ vars.ATTIC_CACHE }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
           nix-develop-args: --impure
 
       - name: Build Nim trace writer library
@@ -82,6 +87,11 @@ jobs:
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-cache: ${{ vars.ATTIC_CACHE }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
 
       - name: Build default package
         run: nix build .#default

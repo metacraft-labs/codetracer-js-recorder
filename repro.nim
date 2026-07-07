@@ -22,12 +22,22 @@ package codetracer_js_recorder:
     "nimble"
     "capnp"
     "zstd"
-    # ``node`` + ``npm`` drive the napi-rs binding step. With MR2's
-    # stdlib tarball entries the engine materialises a content-
-    # addressed Node 20.x LTS prefix and surfaces ``node`` / ``npm``
-    # from that prefix to the build edge.
+    "just >=1"
+    # ``node`` drives the napi-rs binding step. The Unix Node tarballs
+    # expose ``npm`` as a symlink, which the current tarball resolver
+    # does not materialise as an executable; the reprobuild cargo-only
+    # build/test edges do not need npm on Linux/macOS.
     "node >=20"
-    "npm"
+    when defined(windows):
+      "npm"
+    when defined(linux):
+      # Nim staticlib builds invoked from cargo expect a GNU archiver on
+      # Linux. Use gcc so Nim selects ``ar`` instead of ``llvm-ar``.
+      "gcc"
+    when defined(macosx):
+      # Cargo build scripts look for ``cc`` by default; pass ``CC=clang``
+      # below and make clang part of the macOS dev environment.
+      "clang"
     when not defined(windows):
       "pkg-config"
       "openssl"
@@ -43,8 +53,8 @@ package codetracer_js_recorder:
     # The Rust crate produces a cdylib that napi-rs renames to
     # `<addon>.<platform-suffix>.node` at packaging time. For the
     # `default` collection we materialise the cargo cdylib output;
-    # the platform-suffix rename happens at gem-packing time (the
-    # `package` collection's job, declared elsewhere).
+    # the platform-suffix rename happens at package time (outside this
+    # cargo edge). Cargo uses ``lib`` prefixes for Unix cdylibs.
     #
     # Path-mode caveat: the JS recorder's cargo crate lives at
     # ``crates/recorder_native/Cargo.toml`` (there is no workspace
@@ -54,11 +64,17 @@ package codetracer_js_recorder:
       when defined(windows): "dll"
       elif defined(macosx): "dylib"
       else: "so"
+    const dylibName =
+      when defined(windows): "codetracer_js_recorder_native"
+      else: "libcodetracer_js_recorder_native"
     const addonBinary =
-      "crates/recorder_native/target/release/codetracer_js_recorder_native." &
-      dylibExt
+      "crates/recorder_native/target/release/" & dylibName & "." & dylibExt
     const cargoManifest = "crates/recorder_native/Cargo.toml"
     const cargoLockfile = "crates/recorder_native/Cargo.lock"
+    let cargoCompilerEnv: seq[(string, string)] =
+      when defined(windows): @[]
+      elif defined(macosx): @[("CC", "clang")]
+      else: @[("CC", "gcc")]
 
     let addonBuild = cargo.build(
       release = true,
@@ -68,7 +84,8 @@ package codetracer_js_recorder:
         cargoManifest, cargoLockfile,
         "crates/recorder_native/src"
       ],
-      extraOutputs = @[addonBinary])
+      extraOutputs = @[addonBinary],
+      extraEnv = cargoCompilerEnv)
     discard collect("default", @[addonBuild])
 
     # ---- Rust-side cargo tests ---------------------------------------
@@ -79,7 +96,8 @@ package codetracer_js_recorder:
       actionId = "codetracer-js-recorder.cargo-test-build",
       extraInputs = @[cargoManifest, cargoLockfile,
                       "crates/recorder_native/src"],
-      extraOutputs = @["crates/recorder_native/target/debug/deps"])
+      extraOutputs = @["crates/recorder_native/target/debug/deps"],
+      extraEnv = cargoCompilerEnv)
 
     let cargoTestsRun = cargo.test(
       manifestPath = cargoManifest,
@@ -89,6 +107,7 @@ package codetracer_js_recorder:
         cargoManifest, cargoLockfile,
         "crates/recorder_native/src",
         "crates/recorder_native/target/debug/deps"
-      ])
+      ],
+      extraEnv = cargoCompilerEnv)
 
     discard collect("test", @[cargoTestsRun.action])

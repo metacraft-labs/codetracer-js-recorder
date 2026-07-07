@@ -59,7 +59,7 @@ describe("test_js_recorder_emits_destructuring_assignments", () => {
 
     // The instrumented source carries one `__ct.write` call per
     // unpacked element (plus any unrelated step calls).
-    const writeCalls = result.code.match(/__ct\.write\(\d+\)/g) ?? [];
+    const writeCalls = result.code.match(/__ct\.write\(\d+(?:,|\))/g) ?? [];
     expect(writeCalls.length).toBeGreaterThanOrEqual(2);
   });
 
