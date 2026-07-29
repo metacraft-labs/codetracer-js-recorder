@@ -315,7 +315,9 @@ describe("test_vite_plugin_instruments_during_dev_server_transform", () => {
     const result = plugin.transform(userSource, "/proj/src/app.js");
     expect(result).not.toBeNull();
     expect(result!.code).toMatch(/__ct\.step\(\d+\)/);
-    expect(result!.code).toMatch(/__ct\.write\(\d+\)/);
+    // `__ct.write` takes the site id *and* the assigned value; matching
+    // only the one-argument form would pass vacuously.
+    expect(result!.code).toMatch(/__ct\.write\(\d+\s*,/);
 
     // node_modules paths must be skipped.
     const ignored = plugin.transform(

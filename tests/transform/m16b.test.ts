@@ -58,8 +58,10 @@ describe("test_js_recorder_emits_destructuring_assignments", () => {
     expect(bSite!.rvalueField).toBe("b");
 
     // The instrumented source carries one `__ct.write` call per
-    // unpacked element (plus any unrelated step calls).
-    const writeCalls = result.code.match(/__ct\.write\(\d+\)/g) ?? [];
+    // unpacked element (plus any unrelated step calls). The call takes
+    // the site id *and* the assigned value — matching only the
+    // one-argument form would silently count zero.
+    const writeCalls = result.code.match(/__ct\.write\(\d+\s*,/g) ?? [];
     expect(writeCalls.length).toBeGreaterThanOrEqual(2);
   });
 
