@@ -49,6 +49,15 @@ function mkNumericLiteral(value: number): Expression {
   } as unknown as Expression;
 }
 
+/** Build an array literal expression (`[a, b, ...]`). */
+function mkArrayLiteral(elements: Expression[]): Expression {
+  return {
+    type: "ArrayExpression",
+    span: DUMMY_SPAN,
+    elements: elements.map((expression) => ({ spread: null, expression })),
+  } as unknown as Expression;
+}
+
 function mkMemberExpr(obj: string, prop: string): Expression {
   return {
     type: "MemberExpression",
@@ -173,6 +182,50 @@ function mkEnterCall(fnId: number): Statement {
     mkCallExpr(mkMemberExpr("__ct", "enter"), [
       mkNumericLiteral(fnId),
       mkIdentifier("arguments"),
+    ]),
+  );
+}
+
+/**
+ * `__ct.enter` for the synthetic module-level frame.
+ *
+ * Identical to {@link mkEnterCall} except that it passes an empty array
+ * instead of `arguments`. A module body is not a function body in an ES
+ * module, so `arguments` is simply not in scope there — referencing it
+ * throws `ReferenceError: arguments is not defined` on the very first
+ * instrumented line, before the program does anything.
+ *
+ * The CommonJS case gets away with it because Node wraps every module in
+ * a function, which is why this only surfaced once the instrumenter
+ * started feeding browser bundles.
+ */
+function mkModuleEnterCall(fnId: number): Statement {
+  return mkExprStmt(
+    mkCallExpr(mkMemberExpr("__ct", "enter"), [
+      mkNumericLiteral(fnId),
+      mkArrayLiteral([]),
+    ]),
+  );
+}
+
+/**
+ * `__ct.enter` for an arrow function.
+ *
+ * Arrow functions have no `arguments` binding of their own — the name
+ * resolves lexically to the enclosing function's, or to nothing at all
+ * when the arrow sits at module top level, where it throws
+ * `ReferenceError: arguments is not defined`.
+ *
+ * Passing the declared parameter names explicitly is both safe and more
+ * accurate: it captures exactly the values the arrow was called with,
+ * without the surprise of silently reporting an *enclosing* function's
+ * arguments when one happens to be in scope.
+ */
+function mkArrowEnterCall(fnId: number, paramNames: string[]): Statement {
+  return mkExprStmt(
+    mkCallExpr(mkMemberExpr("__ct", "enter"), [
+      mkNumericLiteral(fnId),
+      mkArrayLiteral(paramNames.map((name) => mkIdentifier(name))),
     ]),
   );
 }
@@ -914,7 +967,7 @@ export function transformModule(module: Module, ctx: TransformContext): void {
   }
 
   // Add __ct.enter for the module
-  newBody.push(mkEnterCall(moduleFnId) as unknown as ModuleItem);
+  newBody.push(mkModuleEnterCall(moduleFnId) as unknown as ModuleItem);
 
   // Process remaining items
   for (let i = directiveCount; i < module.body.length; i++) {
@@ -1699,6 +1752,7 @@ function transformArrowFunction(
       false,
       ctx,
       params,
+      /* isArrow */ true,
     );
   } else {
     // Arrow with expression body: (x) => expr
@@ -1723,7 +1777,7 @@ function transformArrowFunction(
     );
 
     const block = mkBlock([
-      mkEnterCall(fnId),
+      mkArrowEnterCall(fnId, params),
       mkStepCall(stepSiteId),
       mkReturnStmt(mkRetExpr(fnId, originalExpr)) as Statement,
     ]);
@@ -1948,7 +2002,12 @@ function instrumentFunctionBody(
   isDerivedCtor: boolean,
   ctx: TransformContext,
   paramNames?: string[],
+  // Arrow functions have no `arguments` binding, so their entry event
+  // has to name the parameters explicitly. See mkArrowEnterCall.
+  isArrow: boolean = false,
 ): void {
+  const mkEntry = (id: number): Statement =>
+    isArrow ? mkArrowEnterCall(id, paramNames ?? []) : mkEnterCall(id);
   const stmts = body.stmts;
 
   // First, recurse into all statements to handle nested functions
@@ -2014,7 +2073,7 @@ function instrumentFunctionBody(
       }
 
       // Insert __ct.enter after super()
-      withSteps.push(mkEnterCall(fnId));
+      withSteps.push(mkEntry(fnId));
       emitParamWrites();
 
       // Add remaining statements with steps
@@ -2030,7 +2089,7 @@ function instrumentFunctionBody(
       }
     } else {
       // No super() found — insert enter at beginning (after directives)
-      withSteps.push(mkEnterCall(fnId));
+      withSteps.push(mkEntry(fnId));
       emitParamWrites();
       for (let i = dirCount; i < stmts.length; i++) {
         if (isExecutableStatement(stmts[i])) {
@@ -2045,7 +2104,7 @@ function instrumentFunctionBody(
     }
   } else {
     // Normal function — insert enter after directive prologues
-    withSteps.push(mkEnterCall(fnId));
+    withSteps.push(mkEntry(fnId));
     emitParamWrites();
 
     for (let i = dirCount; i < stmts.length; i++) {
