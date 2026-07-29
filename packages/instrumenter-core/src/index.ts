@@ -38,3 +38,6 @@ export type {
   FunctionEntry,
   SiteEntry,
 } from "@codetracer/instrumenter";
+
+export { ManifestAccumulator } from "./manifest";
+export type { MergedManifest } from "./manifest";

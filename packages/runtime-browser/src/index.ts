@@ -74,6 +74,16 @@ export interface ReturnEvent {
 export interface AssignmentEvent {
   kind: "Assignment";
   siteId: number;
+  /**
+   * The assigned value.
+   *
+   * Carrying it is what gives a browser recording *variables* rather
+   * than just positions. Without it the trace records that a line ran
+   * but not what it produced, so nothing downstream that reasons about
+   * values — the state pane, and any origin query — has anything to
+   * work with.
+   */
+  value?: EncodedValue;
 }
 
 /** `Value` event — full value snapshot for a variable. */
@@ -98,6 +108,13 @@ export interface WriteEvent {
  */
 export interface CorrelationMarkerEvent {
   kind: "CorrelationMarker";
+  /**
+   * Name of the binding the value came from on this side of the
+   * boundary. A cross-process origin chain resumes its walk on this
+   * name in the sending recording, so omitting it leaves the boundary
+   * visible but its history unreachable.
+   */
+  showText?: string;
   direction: "send" | "recv";
   /** Boundary identifier (e.g. `"outbound"`, `"http-in"`). */
   boundary: string;
@@ -235,6 +252,31 @@ export function resolveEndpoint(
       : undefined);
   if (fromGlobal) return fromGlobal;
   return DEFAULT_ENDPOINT;
+}
+
+/**
+ * Resolve the effective instrumentation manifest.
+ *
+ * Lookup order mirrors {@link resolveEndpoint}: an explicit option wins,
+ * otherwise the `window.__codetracer_manifest` global the bundler plugin
+ * bakes into the page.  Returning `undefined` is normal and simply means
+ * the recording will carry opaque site ids instead of source locations.
+ *
+ * Having this here rather than in every app's bootstrap is what keeps
+ * `createBrowserRuntime()` a zero-argument call for the common case.
+ */
+export function resolveManifest(
+  optsManifest: unknown,
+  globalRef?: { __codetracer_manifest?: unknown },
+): unknown {
+  if (optsManifest != null) return optsManifest;
+  const fromGlobal =
+    globalRef?.__codetracer_manifest ??
+    (typeof globalThis !== "undefined"
+      ? (globalThis as { __codetracer_manifest?: unknown })
+          .__codetracer_manifest
+      : undefined);
+  return fromGlobal ?? undefined;
 }
 
 // ── Value encoding ───────────────────────────────────────────────────────
@@ -395,7 +437,7 @@ export interface CtBrowserRuntime {
   step(siteId: number): void;
   enter(fnId: number, argsLike: IArguments | unknown[]): void;
   ret(fnId: number, value?: unknown): unknown;
-  write(siteId: number): void;
+  write(siteId: number, value?: unknown): void;
   value(name: string, value: unknown): void;
   /**
    * M25 user-placed correlation marker.  Mirrors the Python helpers from
@@ -408,6 +450,7 @@ export interface CtBrowserRuntime {
     boundary: string,
     key: unknown,
     payload?: unknown,
+    showText?: string,
   ): void;
   /** Force any buffered events to be flushed to the transport. */
   flush(): void;
@@ -488,8 +531,9 @@ export function createBrowserRuntime(
     options.program ??
     (typeof document !== "undefined" ? document.title || "browser" : "browser");
   enqueue({ kind: "SessionStart", program, args: options.args ?? [] });
-  if (options.manifest != null) {
-    enqueue({ kind: "Manifest", manifest: options.manifest });
+  const resolvedManifest = resolveManifest(options.manifest);
+  if (resolvedManifest != null) {
+    enqueue({ kind: "Manifest", manifest: resolvedManifest });
   }
 
   function safeFlushOnLifecycle(): void {
@@ -552,8 +596,8 @@ export function createBrowserRuntime(
       });
       return value;
     },
-    write(siteId: number): void {
-      enqueue({ kind: "Assignment", siteId });
+    write(siteId: number, value?: unknown): void {
+      enqueue({ kind: "Assignment", siteId, value: encodeValue(value) });
     },
     value(name: string, value: unknown): void {
       enqueue({ kind: "Value", name, value: encodeValue(value) });
@@ -563,6 +607,7 @@ export function createBrowserRuntime(
       boundary: string,
       key: unknown,
       payload?: unknown,
+      showText?: string,
     ): void {
       const evt: CorrelationMarkerEvent = {
         kind: "CorrelationMarker",
@@ -571,6 +616,7 @@ export function createBrowserRuntime(
         key,
       };
       if (payload !== undefined) evt.payload = payload;
+      if (showText !== undefined) evt.showText = showText;
       enqueue(evt);
     },
     flush(): void {
