@@ -229,6 +229,50 @@ struct WriteEntryInput {
     content: String,
 }
 
+/// An M25 correlation-marker entry deserialized from the JS side.
+///
+/// Mirrors `MarkerEntry` in `packages/runtime/src/buffer.ts`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarkerEntryInput {
+    event_index: usize,
+    direction: String,
+    boundary: String,
+    key: String,
+    #[serde(default)]
+    payload: Option<String>,
+    /// Name of the binding the value came from on this side of the
+    /// boundary. A cross-process origin chain resumes its walk on this
+    /// name in the sending recording.
+    #[serde(default)]
+    show_text: Option<String>,
+}
+
+/// The `metadata` document a correlation marker rides in.
+///
+/// This is a **wire contract** with the db-backend: its
+/// `SessionHandler::pair_index` calls
+/// `MarkerPayload::decode(&event.metadata)` and silently skips any
+/// tracepoint firing that does not deserialize into the complete
+/// struct. A marker written with a partial or differently-named
+/// document is therefore not a degraded marker — it is an invisible
+/// one, and no cross-process origin chain can cross that boundary.
+///
+/// Field names and types must match `MarkerPayload` in
+/// `codetracer/src/db-backend/src/correlation_markers.rs`.
+#[derive(Debug, Clone, Serialize)]
+struct MarkerPayloadOut {
+    marker_id: usize,
+    boundary_id: String,
+    direction: String,
+    key_text: String,
+    key_value: String,
+    show_text: Option<String>,
+    show_value: Option<String>,
+    description: Option<String>,
+    format: Option<serde_json::Value>,
+}
+
 // ── TraceLowLevelEvent-compatible types (serialized to JSON) ─────────
 //
 // These types mirror the `codetracer_trace_types` crate's serialization
@@ -290,6 +334,14 @@ enum EventLogKind {
     Write = 0,
     /// `WriteOther` — stderr-style program output (console.warn / console.error).
     WriteOther = 2,
+    /// `TraceLogEvent` — the tracepoint channel. Correlation markers
+    /// ride this kind; the db-backend recognises them by decoding a
+    /// `MarkerPayload` out of the event's metadata slot.
+    ///
+    /// The discriminant must match `EventLogKind::TraceLogEvent` in
+    /// `codetracer_trace_types` (and the `EVENT_KIND_TRACE_LOG_EVENT`
+    /// constant the browser recorder writes).
+    TraceLogEvent = 12,
 }
 
 impl Serialize for EventLogKind {
@@ -985,6 +1037,7 @@ pub fn append_events(
     ids: napi::bindgen_prelude::Uint32Array,
     values_json: String,
     writes_json: Option<String>,
+    markers_json: Option<String>,
 ) -> Result<()> {
     let mut map = recorder_map()
         .lock()
@@ -1022,6 +1075,18 @@ pub fn append_events(
     let mut write_map: HashMap<usize, &WriteEntryInput> = HashMap::new();
     for entry in &write_entries {
         write_map.insert(entry.event_index, entry);
+    }
+
+    // Parse markers JSON — an array of MarkerEntryInput objects
+    let marker_entries: Vec<MarkerEntryInput> = match &markers_json {
+        Some(json) if !json.is_empty() && json != "[]" => {
+            serde_json::from_str(json).unwrap_or_default()
+        }
+        _ => vec![],
+    };
+    let mut marker_map: HashMap<usize, &MarkerEntryInput> = HashMap::new();
+    for entry in &marker_entries {
+        marker_map.insert(entry.event_index, entry);
     }
 
     let kinds = event_kinds.as_ref();
@@ -1256,6 +1321,54 @@ pub fn append_events(
                         from: rvalue,
                     },
                 ));
+            }
+            // M25 correlation marker -> tracepoint Event carrying a
+            // full MarkerPayload in its metadata slot.
+            8 => {
+                let Some(marker) = marker_map.get(&i) else {
+                    continue;
+                };
+                // Normalise the direction to the two tokens the
+                // db-backend's `MarkerDirection` deserialises. Anything
+                // else would decode to `None` and silently vanish from
+                // the pair index, so we default to "send" rather than
+                // writing an unpairable marker.
+                let direction = match marker.direction.as_str() {
+                    "recv" | "receive" => "recv",
+                    _ => "send",
+                };
+                let payload = MarkerPayloadOut {
+                    marker_id: 0,
+                    boundary_id: marker.boundary.clone(),
+                    direction: direction.to_string(),
+                    key_text: "key".to_string(),
+                    key_value: marker.key.clone(),
+                    // `show_text` names the binding the walk continues
+                    // on after crossing this boundary; without it the
+                    // debugger has nothing to resume from and the chain
+                    // stops at the boundary.
+                    show_text: marker.show_text.clone(),
+                    show_value: marker.payload.clone(),
+                    description: None,
+                    format: None,
+                };
+                let Ok(metadata) = serde_json::to_string(&payload) else {
+                    continue;
+                };
+                let content = serde_json::json!({
+                    "key": marker.key,
+                    "payload": marker.payload,
+                })
+                .to_string();
+                state.events.push(TraceEvent::Event(RecordEvent {
+                    // Markers ride the tracepoint event channel; the
+                    // db-backend distinguishes them from ordinary
+                    // program output by the decodable metadata, not by
+                    // the kind.
+                    kind: EventLogKind::TraceLogEvent,
+                    metadata,
+                    content,
+                }));
             }
             _ => {
                 // Unknown event kind — skip
@@ -1678,6 +1791,12 @@ fn write_binary_trace(
                 let upstream_kind = match re.kind {
                     EventLogKind::Write => codetracer_trace_types::EventLogKind::Write,
                     EventLogKind::WriteOther => codetracer_trace_types::EventLogKind::WriteOther,
+                    // M25 correlation markers ride the tracepoint
+                    // channel; the db-backend recognises them by
+                    // decoding a `MarkerPayload` out of `metadata`.
+                    EventLogKind::TraceLogEvent => {
+                        codetracer_trace_types::EventLogKind::TraceLogEvent
+                    }
                 };
                 writer.register_special_event(upstream_kind, &re.metadata, &re.content);
             }

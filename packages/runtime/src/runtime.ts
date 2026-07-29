@@ -20,17 +20,45 @@ import {
   EVENT_RET,
   EVENT_WRITE,
   EVENT_ASSIGNMENT,
+  EVENT_MARKER,
 } from "./buffer.js";
 import type {
   FlushCallback,
   EventBatch,
   EncodedValue,
   WriteEntry,
+  MarkerEntry,
 } from "./buffer.js";
 import { readConfig } from "./config.js";
 import type { RuntimeConfig } from "./config.js";
 import { installConsoleCapture, removeConsoleCapture } from "./io-capture.js";
 import { AsyncContextTracker } from "./async-context.js";
+
+// ── Correlation keys ────────────────────────────────────────────────
+
+/**
+ * Render a correlation key as the string the pair index matches on.
+ *
+ * Marker pairing is string equality, so both sides of a boundary must
+ * stringify the same logical identifier identically. Plain strings pass
+ * through untouched (the overwhelmingly common case: a request id, an
+ * order id, a `traceparent` header). Everything else goes through
+ * `JSON.stringify` so a numeric id recorded as `42` on one side matches
+ * a numeric id on the other — but a *string* `"42"` deliberately does
+ * not collide with it, because those are different values in the
+ * program and conflating them would pair unrelated crossings.
+ */
+function stringifyCorrelationKey(key: unknown): string {
+  if (typeof key === "string") return key;
+  if (key === undefined) return "undefined";
+  try {
+    return JSON.stringify(key) ?? String(key);
+  } catch {
+    // Circular or otherwise unserialisable — fall back to a coarse
+    // description rather than throwing inside the user's program.
+    return String(key);
+  }
+}
 
 // ── Value encoding ──────────────────────────────────────────────────
 
@@ -377,6 +405,12 @@ export interface NativeAddon {
     ids: Uint32Array,
     valuesJson: string,
     writesJson?: string,
+    /**
+     * M25 correlation markers for `EVENT_MARKER` slots, as a JSON array
+     * of `MarkerEntry`. Optional so an older addon build keeps working
+     * (it simply ignores the extra argument and the markers are lost).
+     */
+    markersJson?: string,
   ): void;
   flushAndStop(handle: number): string;
 }
@@ -467,6 +501,53 @@ export interface CtRuntime {
   write(siteId: number, value?: unknown): void;
 
   /**
+   * M25 correlation marker — record that a value crossed a process
+   * boundary at this point in the program.
+   *
+   * This is the user-facing half of cross-process debugging. CodeTracer
+   * deliberately runs no protocol shims: it does not hook `fetch`, HTTP
+   * servers, message queues, or any other transport. Instead the
+   * program itself declares the crossing at the source location where
+   * it happens, which is the only place that reliably knows *which*
+   * identifier correlates the two sides.
+   *
+   * Both processes must record a marker with the same `boundary` and
+   * the same `key` — pairing is string equality — and opposite
+   * directions:
+   *
+   * ```js
+   * // sender
+   * __ct.markCorrelation("send", "order-flow", orderId);
+   * await fetch("/api/orders", { body: JSON.stringify({ orderId, ... }) });
+   *
+   * // receiver, in the other process
+   * __ct.markCorrelation("recv", "order-flow", body.orderId);
+   * ```
+   *
+   * With both recordings loaded as one session, an origin query on a
+   * value derived from the request can then walk backwards out of the
+   * receiving process and continue inside the sender.
+   *
+   * Never throws: a failed marker must not take the host program down.
+   *
+   * @param direction `"send"` where the value leaves, `"recv"` where it arrives.
+   * @param boundary Identifier shared by both sides of the crossing.
+   * @param key Correlation key; stringified before it goes on the wire.
+   * @param payload Optional human-readable label for the boundary hop.
+   * @param showText Name of the binding the value came from on this side.
+   *   A chain crossing this boundary resumes its walk on this name, so
+   *   supplying it is what makes the history beyond the boundary
+   *   reachable.
+   */
+  markCorrelation(
+    direction: "send" | "recv",
+    boundary: string,
+    key: unknown,
+    payload?: unknown,
+    showText?: string,
+  ): void;
+
+  /**
    * Enable async context tracking.
    *
    * Once enabled, the runtime will automatically emit ThreadStart and
@@ -537,6 +618,13 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
         return value;
       },
       write(_siteId: number, _value?: unknown): void {},
+      markCorrelation(
+        _direction: "send" | "recv",
+        _boundary: string,
+        _key: unknown,
+        _payload?: unknown,
+        _showText?: string,
+      ): void {},
       enableAsyncTracking(): void {},
       disableAsyncTracking(): void {},
       get buffer() {
@@ -633,6 +721,38 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
         buffer.pushValue({
           eventIndex: buffer.length - 1,
           assignmentValue: encodeValue(value),
+        });
+      } catch {
+        // Never crash the user's program
+      }
+    },
+
+    markCorrelation(
+      direction: "send" | "recv",
+      boundary: string,
+      key: unknown,
+      payload?: unknown,
+      showText?: string,
+    ): void {
+      try {
+        asyncTracker.checkContext(buffer);
+        // The marker carries no site id of its own: its source position
+        // comes from the enclosing step, which is exactly the line the
+        // user wrote the call on. The native addon writes it as a
+        // tracepoint Event, and the trace reader attributes that event
+        // to the most recent Step — so the marker lands on the crossing
+        // line without the instrumenter needing to mint a site for it.
+        buffer.push(EVENT_MARKER, 0);
+        buffer.pushMarker({
+          eventIndex: buffer.length - 1,
+          direction,
+          boundary,
+          key: stringifyCorrelationKey(key),
+          payload:
+            payload === undefined
+              ? undefined
+              : stringifyCorrelationKey(payload),
+          showText,
         });
       } catch {
         // Never crash the user's program
@@ -779,12 +899,15 @@ export function startRecording(
           batch.values.length > 0 ? JSON.stringify(batch.values) : "[]";
         const writesJson =
           batch.writes.length > 0 ? JSON.stringify(batch.writes) : "[]";
+        const markersJson =
+          batch.markers.length > 0 ? JSON.stringify(batch.markers) : "[]";
         addon.appendEvents(
           handle,
           batch.eventKinds,
           batch.ids,
           valuesJson,
           writesJson,
+          markersJson,
         );
       } catch (err) {
         process.stderr.write(

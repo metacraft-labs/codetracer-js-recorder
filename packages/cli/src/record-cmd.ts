@@ -457,18 +457,36 @@ var valueEntries = [];
 
 var writeEntries = [];
 
+var markerEntries = [];
+
+// Correlation keys pair by string equality across processes, so both
+// sides must render the same logical identifier identically.  Mirrors
+// stringifyCorrelationKey() in packages/runtime/src/runtime.ts.
+function _ctStringifyKey(key) {
+  if (typeof key === "string") return key;
+  if (key === undefined) return "undefined";
+  try {
+    var s = JSON.stringify(key);
+    return s === undefined ? String(key) : s;
+  } catch(e) {
+    return String(key);
+  }
+}
+
 function flushBuffer() {
   if (bufLen === 0) return;
   try {
     var valuesJson = valueEntries.length > 0 ? JSON.stringify(valueEntries) : "[]";
     var writesJson = writeEntries.length > 0 ? JSON.stringify(writeEntries) : "[]";
-    addon.appendEvents(handle, eventKinds.slice(0, bufLen), ids.slice(0, bufLen), valuesJson, writesJson);
+    var markersJson = markerEntries.length > 0 ? JSON.stringify(markerEntries) : "[]";
+    addon.appendEvents(handle, eventKinds.slice(0, bufLen), ids.slice(0, bufLen), valuesJson, writesJson, markersJson);
   } catch(e) {
     process.stderr.write("[codetracer] Warning: failed to append events: " + e + "\\n");
   }
   bufLen = 0;
   valueEntries = [];
   writeEntries = [];
+  markerEntries = [];
 }
 
 function pushEvent(kind, id) {
@@ -543,6 +561,26 @@ globalThis.__ct = {
       checkAsyncContext();
       pushEvent(7, siteId);
       valueEntries.push({ eventIndex: bufLen - 1, assignmentValue: encodeValue(value) });
+    } catch(e) {}
+  },
+  // M25 correlation marker.  Event type 8 = EVENT_MARKER.  The user's
+  // own code calls this at a boundary crossing; CodeTracer runs no
+  // protocol shims, so this call is the only thing that tells the
+  // debugger which identifier correlates two processes.  The addon
+  // lowers it into a tracepoint Event whose metadata carries the full
+  // MarkerPayload the db-backend's correlation index decodes.
+  markCorrelation: function(direction, boundary, key, payload, showText) {
+    try {
+      checkAsyncContext();
+      pushEvent(8, 0);
+      markerEntries.push({
+        eventIndex: bufLen - 1,
+        direction: direction === "recv" || direction === "receive" ? "recv" : "send",
+        boundary: String(boundary),
+        key: _ctStringifyKey(key),
+        payload: payload === undefined ? undefined : _ctStringifyKey(payload),
+        showText: showText,
+      });
     } catch(e) {}
   },
 };
