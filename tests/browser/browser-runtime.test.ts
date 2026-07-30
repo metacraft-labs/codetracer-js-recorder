@@ -446,3 +446,151 @@ describe("browser runtime value encoder mirrors Node runtime", () => {
     expect(fields[0].value.typeKind).toBe("Raw");
   });
 });
+
+// ── M38d: the flush policy has a time bound as well as a count bound ─────
+//
+// `codetracer-specs/Recording-Backends/WASM-Replay-Snapshots-And-Slices.md`
+// §2 requires a consumer to be able to derive artefacts from this stream
+// *while the page is still running*. A count-only policy makes that
+// unreachable for any page producing fewer events than the threshold — most
+// short pages, and every fixture in this repo — because the whole recording
+// then reaches the daemon in one batch at `stop()`.
+//
+// These tests measure **arrival times against a transport that records
+// them**, not a final total: a total cannot tell "delivered during the run"
+// from "delivered at the end", which is the entire distinction under test.
+
+const sleep = (ms: number) => new Promise((resume) => setTimeout(resume, ms));
+
+/**
+ * The interval the runtime defaults to. Duplicated here rather than
+ * imported because it is not part of the package's public surface; the
+ * test that pins the default (below) is what keeps the two in step, and it
+ * fails loudly rather than silently waiting the wrong amount if they drift.
+ */
+const DEFAULT_FLUSH_INTERVAL_MS = 50;
+
+/** A transport that timestamps every frame it receives and its own close. */
+class TimingTransport implements BrowserTransport {
+  public readonly arrivals: { at: number; payload: string }[] = [];
+  public closedAt: number | null = null;
+  public readyState = 1; // OPEN
+  public onopen?: () => void;
+  send(payload: string): void {
+    this.arrivals.push({ at: performance.now(), payload });
+  }
+  close(): void {
+    this.closedAt = performance.now();
+  }
+  receivedEvents(): BrowserEvent[] {
+    const events: BrowserEvent[] = [];
+    for (const arrival of this.arrivals) {
+      for (const line of arrival.payload.split("\n")) {
+        const trimmed = line.trim();
+        if (trimmed) events.push(JSON.parse(trimmed));
+      }
+    }
+    return events;
+  }
+}
+
+describe("test_short_session_streams_before_stop", () => {
+  it("delivers a sub-threshold session to the transport during the run", async () => {
+    const transport = new TimingTransport();
+    // No `flushThreshold` and no `flushIntervalMs`: the DEFAULTS are what
+    // this pins, because "a default-configured page never streams" is the
+    // defect.
+    const rt = createBrowserRuntime({
+      transportFactory: makeTimingFactory(transport),
+      program: "short-page",
+    });
+
+    // `SessionStart` plus a handful of events — far below the 256-event
+    // count threshold, so under a count-only policy nothing would leave
+    // until `stop()`.
+    rt.step(1);
+    rt.enter(2, [7]);
+    rt.ret(2, 42);
+    expect(rt.bufferedCount).toBeGreaterThan(0);
+
+    await sleep(DEFAULT_FLUSH_INTERVAL_MS * 4);
+
+    // Asserted BEFORE anything stops the session. This observation is the
+    // whole point and is not recoverable from a final total.
+    expect(transport.arrivals.length).toBeGreaterThanOrEqual(1);
+    expect(rt.bufferedCount).toBe(0);
+    const kinds = transport.receivedEvents().map((e) => e.kind);
+    expect(kinds).toContain("SessionStart");
+    expect(kinds).toContain("Call");
+    expect(kinds).toContain("Return");
+
+    rt.stop();
+    for (const arrival of transport.arrivals.slice(0, -1)) {
+      expect(arrival.at).toBeLessThan(transport.closedAt as number);
+    }
+  });
+
+  it("holds everything to stop() when the time-based flush is disabled", async () => {
+    // The negative control. Without it the test above would pass equally
+    // against a runtime that shipped on every event, and would say nothing
+    // about which bound delivered the batch.
+    const transport = new TimingTransport();
+    const rt = createBrowserRuntime({
+      transportFactory: makeTimingFactory(transport),
+      program: "short-page",
+      flushIntervalMs: 0,
+    });
+    rt.step(1);
+    rt.enter(2, [7]);
+
+    await sleep(DEFAULT_FLUSH_INTERVAL_MS * 4);
+    expect(transport.arrivals.length).toBe(0);
+    expect(rt.bufferedCount).toBeGreaterThan(0);
+
+    rt.stop();
+    expect(transport.arrivals.length).toBe(1);
+  });
+
+  it("still honours an explicit flushThreshold exactly", async () => {
+    // The time bound is added ALONGSIDE the count bound, not in place of
+    // it: a page that asks for a frame per event still gets one, and a
+    // count-driven flush cancels the deadline it satisfied rather than
+    // leaving a timer to ship an empty frame later.
+    const transport = new TimingTransport();
+    const rt = createBrowserRuntime({
+      transportFactory: makeTimingFactory(transport),
+      program: "eager-page",
+      flushThreshold: 1,
+    });
+    const afterConstruction = transport.arrivals.length;
+    expect(afterConstruction).toBeGreaterThanOrEqual(1);
+    rt.step(1);
+    expect(transport.arrivals.length).toBe(afterConstruction + 1);
+
+    await sleep(DEFAULT_FLUSH_INTERVAL_MS * 4);
+    expect(transport.arrivals.length).toBe(afterConstruction + 1);
+    rt.stop();
+  });
+
+  it("measures the deadline from a batch's first event, not its last", async () => {
+    // A steady dribble must not be able to postpone its own delivery:
+    // re-arming on every event would let a page emitting one event every
+    // 10ms hold a batch indefinitely against a 40ms interval.
+    const transport = new TimingTransport();
+    const rt = createBrowserRuntime({
+      transportFactory: makeTimingFactory(transport),
+      program: "dribble-page",
+      flushIntervalMs: 40,
+    });
+    for (let i = 0; i < 8; i++) {
+      rt.step(i);
+      await sleep(10);
+    }
+    expect(transport.arrivals.length).toBeGreaterThanOrEqual(1);
+    rt.stop();
+  });
+});
+
+function makeTimingFactory(transport: TimingTransport): TransportFactory {
+  return () => transport;
+}

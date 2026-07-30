@@ -205,10 +205,18 @@ export interface BrowserRuntimeOptions {
   endpoint?: string;
   /**
    * Maximum number of events to buffer before flushing to the transport.
-   * Defaults to 256 — small enough to keep latency low, large enough to
-   * batch the per-event WebSocket message overhead.
+   * Defaults to {@link DEFAULT_FLUSH_THRESHOLD}; see the note there for
+   * why the count alone is not the whole policy.
    */
   flushThreshold?: number;
+  /**
+   * Maximum time, in milliseconds, that an event may sit in the buffer
+   * before it is shipped regardless of how full the buffer is.
+   *
+   * Defaults to {@link DEFAULT_FLUSH_INTERVAL_MS}. Set to `0` to disable
+   * the time-based flush and go back to a purely count-based policy.
+   */
+  flushIntervalMs?: number;
   /**
    * Override the WebSocket factory (mostly for tests).  When provided,
    * the runtime never touches the global `WebSocket` symbol.
@@ -237,7 +245,39 @@ export interface BrowserRuntimeOptions {
 }
 
 const DEFAULT_ENDPOINT = "ws://localhost:9230/ct-stream";
+
+// ── Flush policy ────────────────────────────────────────────────────────
+//
+// Two bounds, and the buffer drains at whichever is reached first. Both
+// numbers are here rather than inline because the trade-off between them is
+// the whole design and the count alone had no rationale recorded against it
+// (M38d).
+//
+// The cost being traded is a WebSocket frame per event against a recording
+// that only exists once the page has ended. `WASM-Replay-Snapshots-And-Slices.md`
+// §2 requires the second not to happen: a replaying consumer derives snapshots
+// from this stream *while the page runs*, so a recording delivered in one batch
+// at `stop()` makes §2's timeline unreachable however promptly everything
+// downstream works. A count-only policy does exactly that for any page
+// producing fewer events than the threshold — which is most short pages, and
+// every fixture in this repo.
+//
+// `DEFAULT_FLUSH_THRESHOLD` bounds the *memory* a burst can occupy and amortises
+// the per-frame overhead over a batch. 256 events is a few tens of kilobytes of
+// JSON, and it is what a hot loop is governed by.
+//
+// `DEFAULT_FLUSH_INTERVAL_MS` bounds the *latency* an event can suffer. It is
+// deliberately not "small": the interval caps timer-driven frames at
+// 1000/interval per second no matter how fast events arrive, so the policy's
+// cost is a constant rather than something proportional to the workload. At
+// 50ms that is 20 frames/second, and any page producing more than
+// 256/0.05 = 5120 events per second hits the count threshold first and never
+// arms the timer at all — a hot loop pays nothing. Below that rate the page is
+// human-scale, where 50ms is under the ~100ms at which a person perceives a
+// reaction as immediate, so a consumer acting on the stream acts *during* the
+// interaction rather than after the page.
 const DEFAULT_FLUSH_THRESHOLD = 256;
+const DEFAULT_FLUSH_INTERVAL_MS = 50;
 
 /** Resolve the effective endpoint URL per the §14.4 lookup order. */
 export function resolveEndpoint(
@@ -471,8 +511,10 @@ export interface CreateBrowserRuntimeOptions extends BrowserRuntimeOptions {}
  * Build a fresh `CtBrowserRuntime`.  The first event sent (after the
  * connection opens) is `SessionStart`; the optional `Manifest` event
  * follows.  All subsequent calls into `step` / `enter` / `ret` / `write`
- * push events onto the in-memory queue and flush when the threshold or
- * the visibility-change / `beforeunload` lifecycle hook fires.
+ * push events onto the in-memory queue and flush when the count threshold
+ * is reached, when `flushIntervalMs` elapses after the batch's first event,
+ * or when the visibility-change / `beforeunload` lifecycle hook fires.
+ * See {@link DEFAULT_FLUSH_THRESHOLD} for why both bounds exist.
  */
 export function createBrowserRuntime(
   options: CreateBrowserRuntimeOptions = {},
@@ -484,6 +526,7 @@ export function createBrowserRuntime(
 
   const endpoint = resolveEndpoint(options.endpoint);
   const threshold = options.flushThreshold ?? DEFAULT_FLUSH_THRESHOLD;
+  const flushIntervalMs = options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
   const factory = options.transportFactory ?? defaultWebSocketFactory;
 
   let transport: BrowserTransport | null = null;
@@ -499,12 +542,60 @@ export function createBrowserRuntime(
   // reaches `OPEN` asynchronously) and between forced flushes.
   let queue: BrowserEvent[] = [];
   let stopped = false;
+  // Pending time-based flush, armed when a batch starts and cleared the
+  // moment the batch leaves.  `null` means "no deadline outstanding".
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function cancelFlushTimer(): void {
+    if (flushTimer === null) return;
+    try {
+      clearTimeout(flushTimer);
+    } catch {
+      // Some sandboxed contexts restrict timers; never let it propagate.
+    }
+    flushTimer = null;
+  }
+
+  function armFlushTimer(): void {
+    if (flushIntervalMs <= 0 || flushTimer !== null || stopped) return;
+    if (typeof setTimeout !== "function") return;
+    try {
+      flushTimer = setTimeout(onFlushDeadline, flushIntervalMs);
+      // Node keeps its event loop alive for a pending timer.  A recorder
+      // must never be the reason a process (or a test runner) refuses to
+      // exit; browsers have no `unref` and need none.
+      (flushTimer as unknown as { unref?: () => void }).unref?.();
+    } catch {
+      flushTimer = null;
+    }
+  }
+
+  function onFlushDeadline(): void {
+    flushTimer = null;
+    flushNow();
+    // Still queued means the socket has not opened yet — `flushNow` is a
+    // no-op while CONNECTING.  Renew the deadline for as long as it is
+    // still trying, and no longer: a page with no daemon behind it must
+    // not poll forever, and `onopen` drains the backlog anyway.
+    if (queue.length > 0 && transport?.readyState === 0) {
+      armFlushTimer();
+    }
+  }
 
   function enqueue(event: BrowserEvent): void {
     if (stopped) return;
     queue.push(event);
     if (queue.length >= threshold) {
       flushNow();
+      return;
+    }
+    // The deadline is measured from the FIRST event of a batch, not the
+    // last, so a steady dribble of events cannot postpone its own delivery
+    // indefinitely.  Arming on the empty-to-non-empty transition is what
+    // makes that true, and it also keeps the per-event cost to one integer
+    // comparison on every event but the first.
+    if (queue.length === 1) {
+      armFlushTimer();
     }
   }
 
@@ -523,6 +614,9 @@ export function createBrowserRuntime(
       // down mid-recording.
     }
     queue = [];
+    // The batch this deadline belonged to has left; the next one arms its
+    // own.
+    cancelFlushTimer();
   }
 
   // Seed the session.  We push the SessionStart + (optional) Manifest
@@ -627,6 +721,7 @@ export function createBrowserRuntime(
       enqueue({ kind: "SessionEnd" });
       flushNow();
       stopped = true;
+      cancelFlushTimer();
       try {
         transport?.close();
       } catch {
