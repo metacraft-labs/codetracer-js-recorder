@@ -33,7 +33,12 @@ npm run bench
 This is a monorepo managed with npm workspaces:
 
 * `packages/cli` — CLI entry point (`codetracer-js-recorder` binary).
-  Provides `instrument` and `record` subcommands.
+  Provides `instrument`, `record` and `read-spans` subcommands.
+* `packages/express` — Express middleware emitting one web-request span per
+  request into the recorded `.ct` container (RS-M9); see
+  `docs/web-request-spans.md`.
+* `test-programs/web/express` — the recorded Express demo app + its in-process
+  request driver, shared by `just demo-request-panel-js` and the span tests.
 * `packages/instrumenter` — Source-to-source JavaScript/TypeScript
   instrumentation using Babel.
 * `packages/runtime` — Runtime library injected into instrumented programs

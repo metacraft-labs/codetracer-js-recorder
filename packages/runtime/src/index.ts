@@ -43,6 +43,19 @@ export { installConsoleCapture, removeConsoleCapture } from "./io-capture.js";
 
 export { AsyncContextTracker } from "./async-context.js";
 
+export {
+  SPAN_STATUS_UNKNOWN,
+  SPAN_STATUS_OK,
+  SPAN_STATUS_ERROR,
+  SPAN_META_KEYS,
+} from "./spans.js";
+export type {
+  SpanMetadata,
+  SpanSink,
+  SpanStatus,
+  WebRequestSpanSurface,
+} from "./spans.js";
+
 export { createRuntime, loadNativeAddon, startRecording } from "./runtime.js";
 export type {
   CtRuntime,

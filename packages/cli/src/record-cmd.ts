@@ -71,6 +71,59 @@ function collectFiles(dir: string, filterOpts?: FilterOptions): string[] {
 }
 
 /**
+ * Nearest `node_modules` directory at or above `from`, or null.
+ *
+ * Mirrors the directory walk CommonJS `require()` performs
+ * (https://nodejs.org/api/modules.html#loading-from-node_modules-folders):
+ * the first `node_modules` found walking up from the requiring file's
+ * directory wins.
+ */
+export function findNodeModules(from: string): string | null {
+  let dir = path.resolve(from);
+  for (;;) {
+    const candidate = path.join(dir, "node_modules");
+    if (fs.existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/**
+ * Make the recorded program's dependencies resolvable from the instrumented
+ * copy.
+ *
+ * The instrumented sources are written to a fresh directory under the OS temp
+ * dir and executed from there, so Node's `node_modules` walk starts at `/tmp`
+ * and finds nothing — `require("express")` in an otherwise perfectly
+ * installed project throws MODULE_NOT_FOUND. Linking the project's real
+ * `node_modules` into the temp root puts it exactly where the walk looks
+ * first, without copying a dependency tree.
+ *
+ * A symlink is attempted first and a junction second (Windows refuses
+ * directory symlinks to unprivileged users); if both fail the recording still
+ * proceeds, because a program with no dependencies does not need this at all.
+ */
+export function linkNodeModules(tmpDir: string, baseDir: string): void {
+  const realNodeModules = findNodeModules(baseDir);
+  if (!realNodeModules) return;
+  const link = path.join(tmpDir, "node_modules");
+  if (fs.existsSync(link)) return;
+  try {
+    fs.symlinkSync(realNodeModules, link, "junction");
+  } catch {
+    try {
+      fs.symlinkSync(realNodeModules, link, "dir");
+    } catch (err) {
+      process.stderr.write(
+        `[codetracer-js-recorder] Warning: could not link '${realNodeModules}' into the ` +
+          `instrumented copy (${err}); require() of installed packages may fail.\n`,
+      );
+    }
+  }
+}
+
+/**
  * Merge multiple manifest slices into a single manifest, re-indexing
  * paths, functions, and sites so IDs are globally unique.
  */
@@ -545,6 +598,41 @@ globalThis.__ct = {
       valueEntries.push({ eventIndex: bufLen - 1, assignmentValue: encodeValue(value) });
     } catch(e) {}
   },
+  // RS-M9: web-request span boundaries.  Called by framework middleware
+  // (see @codetracer/express) — never by instrumented user code — to
+  // partition this recording's one timeline into request-sized intervals
+  // written straight into the container's spans.dat stream.
+  //
+  // Both calls do the same two things before touching the addon:
+  //
+  //   1. checkAsyncContext() — so the exec stream records the async
+  //      context (== container thread) the boundary happens on BEFORE the
+  //      mark is taken.  Without it the thread the span binds to would be
+  //      whatever the last instrumented event happened to run on, and the
+  //      contiguity bit would be measured against the wrong thread.
+  //   2. flushBuffer() — so the addon's event vector really does end at
+  //      this instant.  A span's mark is a position in that vector, so an
+  //      unflushed buffer would place the boundary in the past.
+  //
+  // Neither call can throw into the host program: a recorder failure must
+  // not change how a server answers a request.
+  webRequestStart: function(label, metadata) {
+    try {
+      checkAsyncContext();
+      flushBuffer();
+      return addon.spanOpen(handle, "web-request", String(label), JSON.stringify(metadata || []));
+    } catch(e) {
+      return 0;
+    }
+  },
+  webRequestStop: function(spanId, status, metadata) {
+    if (!spanId) return;
+    try {
+      checkAsyncContext();
+      flushBuffer();
+      addon.spanClose(handle, spanId, status, JSON.stringify(metadata || []));
+    } catch(e) {}
+  },
 };
 
 // Install console capture for IO recording
@@ -720,6 +808,11 @@ export function recordCommand(args: string[]): void {
 
   // Create temp directory for instrumented output
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ct-record-"));
+
+  // The instrumented copy runs from `tmpDir`, so give Node's module walk the
+  // project's real `node_modules` to find there.  Without this a recorded
+  // Express app cannot even `require("express")`.
+  linkNodeModules(tmpDir, baseDir);
 
   try {
     // Instrument each file.  For files that look minified, run the
@@ -947,6 +1040,18 @@ export function recordCommand(args: string[]): void {
       );
     }
   } finally {
+    // Remove the node_modules link BEFORE the recursive delete.  `fs.rmSync`
+    // does unlink symlinks rather than descend into them, but the cost of
+    // being wrong here is deleting the user's real dependency tree, so the
+    // link is taken down explicitly rather than trusted to that behaviour.
+    try {
+      const link = path.join(tmpDir, "node_modules");
+      if (fs.lstatSync(link, { throwIfNoEntry: false })?.isSymbolicLink()) {
+        fs.unlinkSync(link);
+      }
+    } catch {
+      // Ignore — the recursive delete below handles it.
+    }
     // Clean up temp directory
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });

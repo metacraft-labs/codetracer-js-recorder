@@ -12,6 +12,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { instrumentCommand } from "./instrument-cmd.js";
 import { recordCommand } from "./record-cmd.js";
+import { readSpansCommand } from "./read-spans-cmd.js";
 
 const pkgJsonPath = path.join(__dirname, "..", "package.json");
 const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8")) as {
@@ -35,10 +36,12 @@ if (!command || command === "--help" || command === "-h") {
   console.log(`Usage:
   codetracer-js-recorder instrument <src> --out <dir>
   codetracer-js-recorder record <file> [-- app-args...]
+  codetracer-js-recorder read-spans <trace-dir|container.ct> [--all]
 
 Commands:
   instrument    Instrument source files and write to output directory
   record        Instrument and run a program, producing a CTFS trace
+  read-spans    Print a recording's web-request span stream as JSON
 
 Instrument options:
   --out <dir>             Output directory for instrumented files (required)
@@ -52,6 +55,11 @@ Record options:
   --exclude <glob>        Exclude glob pattern (repeatable)
   --help                  Show this help message
   --version               Print version and exit
+
+Read-spans options:
+  --all                   Every span record in append order (open records
+                          included) instead of the settled, last-record-wins
+                          view a panel displays
 
 Environment variables:
   CODETRACER_JS_RECORDER_OUT_DIR    Output directory (overridden by --out-dir)
@@ -68,6 +76,8 @@ if (command === "instrument") {
   instrumentCommand(args.slice(1));
 } else if (command === "record") {
   recordCommand(args.slice(1));
+} else if (command === "read-spans") {
+  readSpansCommand(args.slice(1));
 } else {
   console.error(`Unknown command '${command}'. Use --help for usage.`);
   process.exit(1);

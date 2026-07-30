@@ -13,6 +13,13 @@ use std::sync::Mutex;
 // We alias the upstream types to avoid name clashes with the local mirror types.
 use codetracer_trace_writer_nim::{NimTraceWriter, TraceEventsFileFormat as NimTraceFormat};
 
+// RS-M9: web-request spans written straight into the `.ct` container's
+// `spans.dat` stream (no `codetracer_spans.jsonl` sidecar).  See
+// `spans.rs` for why the JS recorder resolves a span's step range during
+// the trace-flush replay rather than at request time.
+mod spans;
+use spans::{build_span_records, parse_metadata, PendingSpan, SpanResolver};
+
 #[cfg(test)]
 mod shared_trace_storage_adapter_tests {
     use codetracer_ctfs::trace_storage::{
@@ -672,6 +679,11 @@ struct RecorderState {
     /// `StartRecordingOptions.columnAware` flag and the CLI's
     /// `--column-aware` / `--no-column-aware` toggle).
     column_aware: bool,
+    /// RS-M9: web-request spans opened through `span_open` / `span_close`,
+    /// in open order.  Each carries marks into `events` rather than step
+    /// ids; `write_binary_trace` resolves the marks against the writer's
+    /// own `next_step_index()` while it replays the events.
+    spans: Vec<PendingSpan>,
 }
 
 // Global handle counter
@@ -968,6 +980,7 @@ pub fn start_recording(opts: JsObject) -> Result<u32> {
         type_registry,
         var_name_registry,
         column_aware,
+        spans: Vec::new(),
     };
 
     recorder_map()
@@ -976,6 +989,113 @@ pub fn start_recording(opts: JsObject) -> Result<u32> {
         .insert(handle, state);
 
     Ok(handle)
+}
+
+/// Current wall clock in UNIX epoch nanoseconds.
+///
+/// Taken on the Rust side rather than passed in from JS: `Date.now()` is
+/// millisecond-resolution and `performance.now()` is not epoch-based, so a
+/// caller-supplied "nanosecond" timestamp would be a fiction the panel then
+/// renders as fact.
+fn wall_clock_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// RS-M9: open a span at the current position of the buffered event stream.
+///
+/// The caller (the runner's `__ct.webRequestStart`, or the runtime package's
+/// equivalent) MUST have flushed its event buffer immediately before calling
+/// this, so `state.events.len()` really is "everything recorded so far".
+///
+/// `metadata_json` is a `[[key, value], ...]` array — see
+/// [`spans::parse_metadata`] for why it is not an object.  Returns the new
+/// span's id, which the caller passes back to [`span_close`].
+#[napi]
+pub fn span_open(
+    handle: u32,
+    span_type: String,
+    label: String,
+    metadata_json: String,
+) -> Result<u32> {
+    let mut map = recorder_map()
+        .lock()
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Lock poisoned: {e}")))?;
+    let state = map.get_mut(&handle).ok_or_else(|| {
+        Error::new(
+            Status::InvalidArg,
+            format!("Invalid recorder handle: {handle}"),
+        )
+    })?;
+
+    // 1-based and monotonic within the container, per the record model.
+    let span_id = state.spans.len() as u64 + 1;
+    let start_event_index = state.events.len();
+    state.spans.push(PendingSpan {
+        span_id,
+        span_type,
+        label,
+        start_wall_ns: wall_clock_ns(),
+        end_wall_ns: 0,
+        status: spans::status_from_u32(0),
+        open_metadata: parse_metadata(&metadata_json),
+        close_metadata: Vec::new(),
+        start_event_index,
+        end_event_index: None,
+    });
+    Ok(span_id as u32)
+}
+
+/// RS-M9: settle a span opened by [`span_open`].
+///
+/// As with `span_open`, the caller must flush its event buffer first.  Closing
+/// an unknown or already-closed span is a no-op rather than an error: a
+/// middleware that double-settles (e.g. both `res.end` and a `finish`
+/// fallback fired) must not take down the recording.
+#[napi]
+pub fn span_close(handle: u32, span_id: u32, status: u32, metadata_json: String) -> Result<()> {
+    let mut map = recorder_map()
+        .lock()
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Lock poisoned: {e}")))?;
+    let state = map.get_mut(&handle).ok_or_else(|| {
+        Error::new(
+            Status::InvalidArg,
+            format!("Invalid recorder handle: {handle}"),
+        )
+    })?;
+
+    let end_event_index = state.events.len();
+    let Some(span) = state
+        .spans
+        .iter_mut()
+        .find(|s| s.span_id == u64::from(span_id))
+    else {
+        return Ok(());
+    };
+    if span.end_event_index.is_some() {
+        return Ok(());
+    }
+    span.end_event_index = Some(end_event_index);
+    span.end_wall_ns = wall_clock_ns();
+    span.status = spans::status_from_u32(status);
+    span.close_metadata = parse_metadata(&metadata_json);
+    Ok(())
+}
+
+/// Decode a recorded container's span stream to JSON through the canonical
+/// Nim reader (`initSpanStreamReader`), the same decoder `ct print -f http`
+/// uses.
+///
+/// Exposed so the recorder's own tests can assert on what it wrote without a
+/// second, drifting decoder implementation.  `settled` applies
+/// last-record-wins per span id and sorts by span id (what a panel displays);
+/// `false` returns every record in append order, open records included.
+#[napi]
+pub fn read_span_stream(container_path: String, settled: bool) -> Result<String> {
+    codetracer_trace_writer_nim::read_span_stream_json(Path::new(&container_path), settled)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))
 }
 
 #[napi]
@@ -1445,7 +1565,17 @@ fn write_binary_trace(
     let mut paths_with_line_lengths: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
 
-    for event in &state.events {
+    // RS-M9: translate the span marks (positions in `state.events`) into real
+    // step ids by sampling the writer's own exec-event counter as the replay
+    // passes each marked position.  See `spans.rs` for why this is the only
+    // correct source for a step id in a batch-writing recorder.
+    let mut span_resolver = SpanResolver::new(&state.spans);
+    let track_spans = !span_resolver.is_empty();
+
+    for (event_index, event) in state.events.iter().enumerate() {
+        if track_spans {
+            span_resolver.at_event_index(event_index, writer.next_step_index());
+        }
         match event {
             TraceEvent::Path(p) => {
                 // P2.5: when column-aware mode is on and the manifest
@@ -1689,12 +1819,41 @@ fn write_binary_trace(
             // packages/runtime/src/async-context.ts).
             TraceEvent::ThreadStart(tid) => {
                 writer.register_thread_start(*tid);
+                // RS-M9: a Node async context IS the container thread here, so
+                // this is where a span learns that execution left the context
+                // it opened on (an `await`, or a sibling request taking the
+                // event loop).
+                if track_spans {
+                    span_resolver.observe_thread(*tid);
+                }
             }
             TraceEvent::ThreadSwitch(tid) => {
                 writer.register_thread_switch(*tid);
+                if track_spans {
+                    span_resolver.observe_thread(*tid);
+                }
             }
             TraceEvent::ThreadExit(tid) => {
                 writer.register_thread_exit(*tid);
+            }
+        }
+    }
+
+    // RS-M9: a span that settled after the last buffered event marks
+    // `events.len()`, so the resolver needs one final sample.
+    if track_spans {
+        span_resolver.at_event_index(state.events.len(), writer.next_step_index());
+        let resolved = span_resolver.finish();
+        for record in build_span_records(&state.spans, &resolved) {
+            // A span-registration failure must be loud but must not lose the
+            // recording: the exec stream is already complete and is far more
+            // valuable than the request index.
+            if let Err(err) = writer.register_span(&record) {
+                eprintln!(
+                    "[codetracer-js-recorder] register_span(span_id={}) failed: {} \
+                     (the trace is written without this request's span record)",
+                    record.span_id, err,
+                );
             }
         }
     }

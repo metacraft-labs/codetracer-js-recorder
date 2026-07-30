@@ -10,6 +10,7 @@
     "packages/runtime",
     "packages/runtime-browser",
     "packages/cli",
+    "packages/express",
     "packages/vite-plugin",
     "packages/webpack-plugin",
     "packages/esbuild-plugin",
@@ -17,13 +18,15 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces",
-    "test": "vitest run && npm run test:verify-cli-convention",
+    "test": "vitest run && npm run test:verify-cli-convention && npm run test:verify-request-spans",
     "test:watch": "vitest",
-    "test:verify-cli-convention": "bash tests/verify-cli-convention-no-silent-skip.sh"
+    "test:verify-cli-convention": "bash tests/verify-cli-convention-no-silent-skip.sh",
+    "test:verify-request-spans": "bash tests/verify-request-spans-no-silent-skip.sh"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.5.1",
     "@types/node": "^22.0.0",
+    "express": "^4.21.2",
     "prettier": "^3.4.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"

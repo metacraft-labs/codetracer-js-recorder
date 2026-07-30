@@ -1,0 +1,15 @@
+{
+  "name": "@codetracer/express",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "description": "Express middleware emitting CodeTracer web-request spans into the recorded .ct container (RS-M9)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

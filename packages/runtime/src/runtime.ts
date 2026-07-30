@@ -31,6 +31,7 @@ import { readConfig } from "./config.js";
 import type { RuntimeConfig } from "./config.js";
 import { installConsoleCapture, removeConsoleCapture } from "./io-capture.js";
 import { AsyncContextTracker } from "./async-context.js";
+import type { SpanMetadata, SpanSink, SpanStatus } from "./spans.js";
 
 // ── Value encoding ──────────────────────────────────────────────────
 
@@ -379,6 +380,31 @@ export interface NativeAddon {
     writesJson?: string,
   ): void;
   flushAndStop(handle: number): string;
+  /**
+   * RS-M9: open a span at the current end of the addon's buffered event
+   * stream.  The caller must have flushed its own buffer first — a span's
+   * extent is a position in that stream, so an unflushed buffer would place
+   * the boundary in the past.  `metadataJson` is a `[[key, value], ...]`
+   * array; order is part of the wire contract.  Returns the new span id.
+   */
+  spanOpen(
+    handle: number,
+    spanType: string,
+    label: string,
+    metadataJson: string,
+  ): number;
+  /** RS-M9: settle a span opened by `spanOpen`.  Idempotent. */
+  spanClose(
+    handle: number,
+    spanId: number,
+    status: number,
+    metadataJson: string,
+  ): void;
+  /**
+   * RS-M9: decode a recorded container's span stream to JSON through the
+   * canonical Nim reader — the same decoder `ct print -f http` uses.
+   */
+  readSpanStream(containerPath: string, settled: boolean): string;
 }
 
 /** Options for starting a recording session. */
@@ -480,6 +506,35 @@ export interface CtRuntime {
    */
   disableAsyncTracking(): void;
 
+  /**
+   * RS-M9: open a web-request span at this instant of the recording.
+   *
+   * Called by framework middleware (see `@codetracer/express`), never by
+   * instrumented user code.  Returns the span id to pass to
+   * `webRequestStop`, or 0 when no recording is active — in which case
+   * `webRequestStop` is a no-op, so middleware can stay installed
+   * unconditionally.
+   *
+   * Before the boundary is taken this checks the async context, so the exec
+   * stream records which context (== container thread) the request entered
+   * on, and flushes the event buffer, so the span's mark really is "the end
+   * of everything recorded so far".
+   */
+  webRequestStart(label: string, metadata: SpanMetadata): number;
+
+  /** RS-M9: settle a span opened by `webRequestStart`.  A 0 id is a no-op. */
+  webRequestStop(
+    spanId: number,
+    status: SpanStatus,
+    metadata: SpanMetadata,
+  ): void;
+
+  /**
+   * Install (or clear, with `null`) the sink span boundaries are forwarded
+   * to.  `startRecording` installs one backed by the native addon.
+   */
+  attachSpanSink(sink: SpanSink | null): void;
+
   // ── testing / inspection helpers ──
   /** The underlying event buffer (exposed for testing). */
   readonly buffer: EventBuffer;
@@ -527,6 +582,9 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
 
   const asyncTracker = new AsyncContextTracker();
 
+  /** Where web-request span boundaries go once a recording is active. */
+  let spanSink: SpanSink | null = null;
+
   // ── Disabled mode ───────────────────────────────────────────────
   if (config.disabled) {
     const noop: CtRuntime = {
@@ -539,6 +597,15 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
       write(_siteId: number, _value?: unknown): void {},
       enableAsyncTracking(): void {},
       disableAsyncTracking(): void {},
+      webRequestStart(_label: string, _metadata: SpanMetadata): number {
+        return 0;
+      },
+      webRequestStop(
+        _spanId: number,
+        _status: SpanStatus,
+        _metadata: SpanMetadata,
+      ): void {},
+      attachSpanSink(_sink: SpanSink | null): void {},
       get buffer() {
         return buffer;
       },
@@ -645,6 +712,41 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
 
     disableAsyncTracking(): void {
       asyncTracker.disable();
+    },
+
+    webRequestStart(label: string, metadata: SpanMetadata): number {
+      if (!spanSink) return 0;
+      try {
+        // Record the async context the request entered on BEFORE the mark is
+        // taken; otherwise the span binds to whichever context the last
+        // instrumented event happened to run on, and the contiguity bit is
+        // then measured against the wrong thread.
+        asyncTracker.checkContext(buffer);
+        flush();
+        return spanSink.open("web-request", label, metadata);
+      } catch {
+        // A recorder failure must never change how a server answers.
+        return 0;
+      }
+    },
+
+    webRequestStop(
+      spanId: number,
+      status: SpanStatus,
+      metadata: SpanMetadata,
+    ): void {
+      if (!spanSink || !spanId) return;
+      try {
+        asyncTracker.checkContext(buffer);
+        flush();
+        spanSink.close(spanId, status, metadata);
+      } catch {
+        // As above.
+      }
+    },
+
+    attachSpanSink(sink: SpanSink | null): void {
+      spanSink = sink;
     },
 
     get buffer() {
@@ -794,6 +896,20 @@ export function startRecording(
     }
   };
 
+  // RS-M9: forward web-request span boundaries into the container's span
+  // stream.  Installed before async tracking is enabled so a middleware that
+  // opens a span in the very first tick still lands.
+  runtime.attachSpanSink({
+    open(spanType: string, label: string, metadata: SpanMetadata): number {
+      if (stopped) return 0;
+      return addon.spanOpen(handle, spanType, label, JSON.stringify(metadata));
+    },
+    close(spanId: number, status: SpanStatus, metadata: SpanMetadata): void {
+      if (stopped) return;
+      addon.spanClose(handle, spanId, status, JSON.stringify(metadata));
+    },
+  });
+
   // Enable async context tracking for the recording session
   runtime.enableAsyncTracking();
 
@@ -819,6 +935,7 @@ export function startRecording(
     // Remove console capture and disable async tracking before flushing
     removeConsoleCapture();
     runtime.disableAsyncTracking();
+    runtime.attachSpanSink(null);
 
     // Flush any remaining buffered events first (while onFlush is still active)
     runtime.flush();
