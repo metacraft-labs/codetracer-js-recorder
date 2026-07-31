@@ -74,6 +74,16 @@ export interface ReturnEvent {
 export interface AssignmentEvent {
   kind: "Assignment";
   siteId: number;
+  /**
+   * The assigned value.
+   *
+   * Carrying it is what gives a browser recording *variables* rather
+   * than just positions. Without it the trace records that a line ran
+   * but not what it produced, so nothing downstream that reasons about
+   * values — the state pane, and any origin query — has anything to
+   * work with.
+   */
+  value?: EncodedValue;
 }
 
 /** `Value` event — full value snapshot for a variable. */
@@ -98,6 +108,13 @@ export interface WriteEvent {
  */
 export interface CorrelationMarkerEvent {
   kind: "CorrelationMarker";
+  /**
+   * Name of the binding the value came from on this side of the
+   * boundary. A cross-process origin chain resumes its walk on this
+   * name in the sending recording, so omitting it leaves the boundary
+   * visible but its history unreachable.
+   */
+  showText?: string;
   direction: "send" | "recv";
   /** Boundary identifier (e.g. `"outbound"`, `"http-in"`). */
   boundary: string;
@@ -188,10 +205,18 @@ export interface BrowserRuntimeOptions {
   endpoint?: string;
   /**
    * Maximum number of events to buffer before flushing to the transport.
-   * Defaults to 256 — small enough to keep latency low, large enough to
-   * batch the per-event WebSocket message overhead.
+   * Defaults to {@link DEFAULT_FLUSH_THRESHOLD}; see the note there for
+   * why the count alone is not the whole policy.
    */
   flushThreshold?: number;
+  /**
+   * Maximum time, in milliseconds, that an event may sit in the buffer
+   * before it is shipped regardless of how full the buffer is.
+   *
+   * Defaults to {@link DEFAULT_FLUSH_INTERVAL_MS}. Set to `0` to disable
+   * the time-based flush and go back to a purely count-based policy.
+   */
+  flushIntervalMs?: number;
   /**
    * Override the WebSocket factory (mostly for tests).  When provided,
    * the runtime never touches the global `WebSocket` symbol.
@@ -220,7 +245,39 @@ export interface BrowserRuntimeOptions {
 }
 
 const DEFAULT_ENDPOINT = "ws://localhost:9230/ct-stream";
+
+// ── Flush policy ────────────────────────────────────────────────────────
+//
+// Two bounds, and the buffer drains at whichever is reached first. Both
+// numbers are here rather than inline because the trade-off between them is
+// the whole design and the count alone had no rationale recorded against it
+// (M38d).
+//
+// The cost being traded is a WebSocket frame per event against a recording
+// that only exists once the page has ended. `WASM-Replay-Snapshots-And-Slices.md`
+// §2 requires the second not to happen: a replaying consumer derives snapshots
+// from this stream *while the page runs*, so a recording delivered in one batch
+// at `stop()` makes §2's timeline unreachable however promptly everything
+// downstream works. A count-only policy does exactly that for any page
+// producing fewer events than the threshold — which is most short pages, and
+// every fixture in this repo.
+//
+// `DEFAULT_FLUSH_THRESHOLD` bounds the *memory* a burst can occupy and amortises
+// the per-frame overhead over a batch. 256 events is a few tens of kilobytes of
+// JSON, and it is what a hot loop is governed by.
+//
+// `DEFAULT_FLUSH_INTERVAL_MS` bounds the *latency* an event can suffer. It is
+// deliberately not "small": the interval caps timer-driven frames at
+// 1000/interval per second no matter how fast events arrive, so the policy's
+// cost is a constant rather than something proportional to the workload. At
+// 50ms that is 20 frames/second, and any page producing more than
+// 256/0.05 = 5120 events per second hits the count threshold first and never
+// arms the timer at all — a hot loop pays nothing. Below that rate the page is
+// human-scale, where 50ms is under the ~100ms at which a person perceives a
+// reaction as immediate, so a consumer acting on the stream acts *during* the
+// interaction rather than after the page.
 const DEFAULT_FLUSH_THRESHOLD = 256;
+const DEFAULT_FLUSH_INTERVAL_MS = 50;
 
 /** Resolve the effective endpoint URL per the §14.4 lookup order. */
 export function resolveEndpoint(
@@ -235,6 +292,31 @@ export function resolveEndpoint(
       : undefined);
   if (fromGlobal) return fromGlobal;
   return DEFAULT_ENDPOINT;
+}
+
+/**
+ * Resolve the effective instrumentation manifest.
+ *
+ * Lookup order mirrors {@link resolveEndpoint}: an explicit option wins,
+ * otherwise the `window.__codetracer_manifest` global the bundler plugin
+ * bakes into the page.  Returning `undefined` is normal and simply means
+ * the recording will carry opaque site ids instead of source locations.
+ *
+ * Having this here rather than in every app's bootstrap is what keeps
+ * `createBrowserRuntime()` a zero-argument call for the common case.
+ */
+export function resolveManifest(
+  optsManifest: unknown,
+  globalRef?: { __codetracer_manifest?: unknown },
+): unknown {
+  if (optsManifest != null) return optsManifest;
+  const fromGlobal =
+    globalRef?.__codetracer_manifest ??
+    (typeof globalThis !== "undefined"
+      ? (globalThis as { __codetracer_manifest?: unknown })
+          .__codetracer_manifest
+      : undefined);
+  return fromGlobal ?? undefined;
 }
 
 // ── Value encoding ───────────────────────────────────────────────────────
@@ -395,7 +477,7 @@ export interface CtBrowserRuntime {
   step(siteId: number): void;
   enter(fnId: number, argsLike: IArguments | unknown[]): void;
   ret(fnId: number, value?: unknown): unknown;
-  write(siteId: number): void;
+  write(siteId: number, value?: unknown): void;
   value(name: string, value: unknown): void;
   /**
    * M25 user-placed correlation marker.  Mirrors the Python helpers from
@@ -408,6 +490,7 @@ export interface CtBrowserRuntime {
     boundary: string,
     key: unknown,
     payload?: unknown,
+    showText?: string,
   ): void;
   /** Force any buffered events to be flushed to the transport. */
   flush(): void;
@@ -428,8 +511,10 @@ export interface CreateBrowserRuntimeOptions extends BrowserRuntimeOptions {}
  * Build a fresh `CtBrowserRuntime`.  The first event sent (after the
  * connection opens) is `SessionStart`; the optional `Manifest` event
  * follows.  All subsequent calls into `step` / `enter` / `ret` / `write`
- * push events onto the in-memory queue and flush when the threshold or
- * the visibility-change / `beforeunload` lifecycle hook fires.
+ * push events onto the in-memory queue and flush when the count threshold
+ * is reached, when `flushIntervalMs` elapses after the batch's first event,
+ * or when the visibility-change / `beforeunload` lifecycle hook fires.
+ * See {@link DEFAULT_FLUSH_THRESHOLD} for why both bounds exist.
  */
 export function createBrowserRuntime(
   options: CreateBrowserRuntimeOptions = {},
@@ -441,6 +526,7 @@ export function createBrowserRuntime(
 
   const endpoint = resolveEndpoint(options.endpoint);
   const threshold = options.flushThreshold ?? DEFAULT_FLUSH_THRESHOLD;
+  const flushIntervalMs = options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
   const factory = options.transportFactory ?? defaultWebSocketFactory;
 
   let transport: BrowserTransport | null = null;
@@ -456,12 +542,60 @@ export function createBrowserRuntime(
   // reaches `OPEN` asynchronously) and between forced flushes.
   let queue: BrowserEvent[] = [];
   let stopped = false;
+  // Pending time-based flush, armed when a batch starts and cleared the
+  // moment the batch leaves.  `null` means "no deadline outstanding".
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function cancelFlushTimer(): void {
+    if (flushTimer === null) return;
+    try {
+      clearTimeout(flushTimer);
+    } catch {
+      // Some sandboxed contexts restrict timers; never let it propagate.
+    }
+    flushTimer = null;
+  }
+
+  function armFlushTimer(): void {
+    if (flushIntervalMs <= 0 || flushTimer !== null || stopped) return;
+    if (typeof setTimeout !== "function") return;
+    try {
+      flushTimer = setTimeout(onFlushDeadline, flushIntervalMs);
+      // Node keeps its event loop alive for a pending timer.  A recorder
+      // must never be the reason a process (or a test runner) refuses to
+      // exit; browsers have no `unref` and need none.
+      (flushTimer as unknown as { unref?: () => void }).unref?.();
+    } catch {
+      flushTimer = null;
+    }
+  }
+
+  function onFlushDeadline(): void {
+    flushTimer = null;
+    flushNow();
+    // Still queued means the socket has not opened yet — `flushNow` is a
+    // no-op while CONNECTING.  Renew the deadline for as long as it is
+    // still trying, and no longer: a page with no daemon behind it must
+    // not poll forever, and `onopen` drains the backlog anyway.
+    if (queue.length > 0 && transport?.readyState === 0) {
+      armFlushTimer();
+    }
+  }
 
   function enqueue(event: BrowserEvent): void {
     if (stopped) return;
     queue.push(event);
     if (queue.length >= threshold) {
       flushNow();
+      return;
+    }
+    // The deadline is measured from the FIRST event of a batch, not the
+    // last, so a steady dribble of events cannot postpone its own delivery
+    // indefinitely.  Arming on the empty-to-non-empty transition is what
+    // makes that true, and it also keeps the per-event cost to one integer
+    // comparison on every event but the first.
+    if (queue.length === 1) {
+      armFlushTimer();
     }
   }
 
@@ -480,6 +614,9 @@ export function createBrowserRuntime(
       // down mid-recording.
     }
     queue = [];
+    // The batch this deadline belonged to has left; the next one arms its
+    // own.
+    cancelFlushTimer();
   }
 
   // Seed the session.  We push the SessionStart + (optional) Manifest
@@ -488,8 +625,9 @@ export function createBrowserRuntime(
     options.program ??
     (typeof document !== "undefined" ? document.title || "browser" : "browser");
   enqueue({ kind: "SessionStart", program, args: options.args ?? [] });
-  if (options.manifest != null) {
-    enqueue({ kind: "Manifest", manifest: options.manifest });
+  const resolvedManifest = resolveManifest(options.manifest);
+  if (resolvedManifest != null) {
+    enqueue({ kind: "Manifest", manifest: resolvedManifest });
   }
 
   function safeFlushOnLifecycle(): void {
@@ -552,8 +690,8 @@ export function createBrowserRuntime(
       });
       return value;
     },
-    write(siteId: number): void {
-      enqueue({ kind: "Assignment", siteId });
+    write(siteId: number, value?: unknown): void {
+      enqueue({ kind: "Assignment", siteId, value: encodeValue(value) });
     },
     value(name: string, value: unknown): void {
       enqueue({ kind: "Value", name, value: encodeValue(value) });
@@ -563,6 +701,7 @@ export function createBrowserRuntime(
       boundary: string,
       key: unknown,
       payload?: unknown,
+      showText?: string,
     ): void {
       const evt: CorrelationMarkerEvent = {
         kind: "CorrelationMarker",
@@ -571,6 +710,7 @@ export function createBrowserRuntime(
         key,
       };
       if (payload !== undefined) evt.payload = payload;
+      if (showText !== undefined) evt.showText = showText;
       enqueue(evt);
     },
     flush(): void {
@@ -581,6 +721,7 @@ export function createBrowserRuntime(
       enqueue({ kind: "SessionEnd" });
       flushNow();
       stopped = true;
+      cancelFlushTimer();
       try {
         transport?.close();
       } catch {

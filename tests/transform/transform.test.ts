@@ -32,6 +32,15 @@ function createNoopCt() {
 // =============================================
 // test_step_insertion_basic
 // =============================================
+/**
+ * Collapse whitespace so an assertion can name the emitted call without
+ * also pinning the code generator's line breaking, which is free to
+ * change without the instrumentation being any different.
+ */
+function normalised(code: string): string {
+  return code.replace(/\s+/g, " ");
+}
+
 describe("test_step_insertion_basic", () => {
   it("inserts __ct.step calls before statements in a function", () => {
     const result = inst(`
@@ -130,8 +139,11 @@ const x = 1;
 console.log(x);
 `);
     const code = result.code;
-    // Module-level enter
-    expect(code).toContain("__ct.enter(0, arguments)");
+    // Module-level enter passes an empty argument list, not `arguments`:
+    // an ES module body is not a function body, so `arguments` is not in
+    // scope there and referencing it throws on the very first
+    // instrumented line.
+    expect(code).toContain("__ct.enter(0, [])");
     // Module-level ret at the end
     const lines = code.trim().split("\n");
     const lastLine = lines[lines.length - 1].trim();
@@ -146,8 +158,11 @@ describe("test_arrow_function_instrumentation", () => {
   it("transforms arrow function with expression body", () => {
     const result = inst(`const add = (a, b) => a + b;`);
     const code = result.code;
-    // Arrow should be expanded to block body
-    expect(code).toContain("__ct.enter(1, arguments)");
+    // Arrow should be expanded to block body. Arrows have no `arguments`
+    // binding of their own, so the entry event names the declared
+    // parameters instead — which is also more accurate, since a lexical
+    // `arguments` would report the *enclosing* function's arguments.
+    expect(normalised(code)).toContain("__ct.enter(1, [ a, b ]);");
     expect(code).toContain("return __ct.ret(1, a + b)");
   });
 
@@ -158,7 +173,7 @@ const add = (a, b) => {
 };
 `);
     const code = result.code;
-    expect(code).toContain("__ct.enter(1, arguments)");
+    expect(normalised(code)).toContain("__ct.enter(1, [ a, b ]);");
     expect(code).toContain("return __ct.ret(1, a + b)");
   });
 
@@ -169,7 +184,7 @@ const log = (msg) => {
 };
 `);
     const code = result.code;
-    expect(code).toContain("__ct.enter(1, arguments)");
+    expect(normalised(code)).toContain("__ct.enter(1, [ msg ]);");
     // Should have implicit ret at end
     expect(code).toContain("__ct.ret(1)");
   });

@@ -18,6 +18,11 @@
  *                   addon resolves it to the manifest's write-site
  *                   metadata and synthesises a `BindVariable +
  *                   Assignment` pair into the trace stream)
+ *   8 = marker (M25 correlation marker placed by user code at a
+ *               boundary crossing; the native addon writes it as a
+ *               tracepoint `Event` whose metadata carries the full
+ *               `MarkerPayload` the db-backend's correlation index
+ *               decodes)
  */
 
 /** Numeric event kind codes matching the instrumenter output. */
@@ -29,6 +34,7 @@ export const EVENT_THREAD_START = 4 as const;
 export const EVENT_THREAD_SWITCH = 5 as const;
 export const EVENT_THREAD_EXIT = 6 as const;
 export const EVENT_ASSIGNMENT = 7 as const;
+export const EVENT_MARKER = 8 as const;
 
 export type EventKind =
   | typeof EVENT_STEP
@@ -38,7 +44,8 @@ export type EventKind =
   | typeof EVENT_THREAD_START
   | typeof EVENT_THREAD_SWITCH
   | typeof EVENT_THREAD_EXIT
-  | typeof EVENT_ASSIGNMENT;
+  | typeof EVENT_ASSIGNMENT
+  | typeof EVENT_MARKER;
 
 /** Encoded representation of a JS value for tracing. */
 export interface EncodedValue {
@@ -68,6 +75,41 @@ export interface WriteEntry {
   content: string;
 }
 
+/**
+ * A correlation-marker entry associated with an `EVENT_MARKER` event.
+ *
+ * Markers are how a value's journey across a process boundary becomes
+ * traceable: the sending process records one at the point the value
+ * leaves, the receiving process records one where it arrives, and the
+ * debugger pairs them by `(boundary, key)`. The pairing is string
+ * equality on the key, so the *same* logical identifier must be passed
+ * on both sides.
+ *
+ * See `codetracer-specs/GUI/Debugging-Features/Correlation-Markers.md`.
+ */
+export interface MarkerEntry {
+  /** Index of the event in the batch this marker belongs to. */
+  eventIndex: number;
+  /** `"send"` at the point the value leaves, `"recv"` where it arrives. */
+  direction: "send" | "recv";
+  /** Boundary identifier shared by both sides of the crossing. */
+  boundary: string;
+  /** Correlation key, stringified — pairing is string equality. */
+  key: string;
+  /** Optional human-readable value shown on the boundary hop. */
+  payload?: string;
+  /**
+   * Name of the binding the value came from on this side of the
+   * boundary.
+   *
+   * This is load-bearing for cross-process origin: when a chain crosses
+   * here, the debugger continues the walk on *this* name in the sending
+   * recording. Without it the walk resumes on a placeholder and finds
+   * nothing, so the chain shows the boundary but no history beyond it.
+   */
+  showText?: string;
+}
+
 /** A flushed batch — a snapshot of the typed arrays at flush time. */
 export interface EventBatch {
   /** Event kind per slot (0=step, 1=enter, 2=ret, 3=write, 4=thread_start, 5=thread_switch, 6=thread_exit). */
@@ -80,6 +122,8 @@ export interface EventBatch {
   values: ValueEntry[];
   /** Captured writes for write events (console output). */
   writes: WriteEntry[];
+  /** Captured correlation markers for marker events. */
+  markers: MarkerEntry[];
 }
 
 /** Callback invoked when the buffer is flushed. */
@@ -110,6 +154,9 @@ export class EventBuffer {
 
   /** Pending write entries for the current buffer window. */
   private _writes: WriteEntry[] = [];
+
+  /** Pending correlation-marker entries for the current buffer window. */
+  private _markers: MarkerEntry[] = [];
 
   /** User-provided flush callback. */
   private _onFlush: FlushCallback | null = null;
@@ -168,6 +215,13 @@ export class EventBuffer {
   }
 
   /**
+   * Attach a correlation-marker entry to the most recently pushed event.
+   */
+  pushMarker(entry: MarkerEntry): void {
+    this._markers.push(entry);
+  }
+
+  /**
    * Flush all buffered events.
    *
    * Creates a snapshot batch (copies of the typed arrays up to _length),
@@ -185,6 +239,7 @@ export class EventBuffer {
       length: this._length,
       values: this._values,
       writes: this._writes,
+      markers: this._markers,
     };
 
     this.flushedBatches.push(batch);
@@ -197,5 +252,6 @@ export class EventBuffer {
     this._length = 0;
     this._values = [];
     this._writes = [];
+    this._markers = [];
   }
 }
