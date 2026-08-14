@@ -306,6 +306,11 @@ function buildBrowserRuntimeStub(endpoint: string, manifest: unknown): string {
     } catch (e) {}
   }
   globalThis.__ct = {
+    // The M37 per-step locals array (second argument) is accepted and
+    // dropped: the browser transport's "Step" message carries only a
+    // site id, and widening it is a wire-protocol change of its own.
+    // Browser recordings therefore keep the pre-M37 shape, where a
+    // binding's value arrives with its assignment.
     step: function (siteId) { enqueue({ kind: "Step", siteId: siteId }); },
     enter: function (fnId, argsLike) {
       var args = [];

@@ -167,6 +167,16 @@ struct ManifestSite {
     rvalue_field: Option<String>,
     #[serde(default)]
     rvalue_index: Option<i64>,
+    /// M37: names of the locals a `step` site captures, in the same
+    /// order as the `locals` array the runtime sends for that event.
+    ///
+    /// The names live here rather than on the wire so a step costs one
+    /// array of encoded values and no string traffic.  Empty for sites
+    /// with nothing in scope and for manifests produced before M37, in
+    /// which case the step emits no `Value` events and the trace keeps
+    /// its previous shape.
+    #[serde(default)]
+    vars: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -225,6 +235,10 @@ struct ValueEntry {
     return_value: Option<EncodedValue>,
     #[serde(default)]
     assignment_value: Option<EncodedValue>,
+    /// M37: values of the locals visible at a step event, positionally
+    /// aligned with the step site's `vars` list in the manifest.
+    #[serde(default)]
+    locals: Option<Vec<EncodedValue>>,
 }
 
 /// A write entry deserialized from the JS side (console output).
@@ -1220,25 +1234,69 @@ pub fn append_events(
         match kind {
             // step
             0 => {
-                if let Some(site) = state.manifest.sites.get(id) {
-                    // P2.2: forward the SWC byte offset (0-based) to the
-                    // step record.  The column-aware writer pass below
-                    // converts the offset to a 1-based column when it
-                    // emits the canonical `DeltaColumn` event (tag 0x07).
-                    // The manifest's `col` is `0` when the site predates
-                    // P2 — we surface that as `None` to preserve the
-                    // line-only step shape downstream readers expect from
-                    // pre-P2 traces.
-                    let column = if state.column_aware {
-                        Some(site.col as i64)
-                    } else {
-                        None
-                    };
-                    state.events.push(TraceEvent::Step(StepRecord {
-                        path_id: site.path_index,
-                        line: site.line as i64,
-                        column,
-                    }));
+                // Cloned rather than borrowed: emitting the step's
+                // captured locals below mutates the variable-name and
+                // type registries, which live in the same `state`.
+                let Some(site) = state.manifest.sites.get(id).cloned() else {
+                    continue;
+                };
+
+                // P2.2: forward the SWC byte offset (0-based) to the
+                // step record.  The column-aware writer pass below
+                // converts the offset to a 1-based column when it
+                // emits the canonical `DeltaColumn` event (tag 0x07).
+                // The manifest's `col` is `0` when the site predates
+                // P2 — we surface that as `None` to preserve the
+                // line-only step shape downstream readers expect from
+                // pre-P2 traces.
+                let column = if state.column_aware {
+                    Some(site.col as i64)
+                } else {
+                    None
+                };
+                state.events.push(TraceEvent::Step(StepRecord {
+                    path_id: site.path_index,
+                    line: site.line as i64,
+                    column,
+                }));
+
+                // M37: emit one `Value` event per local visible at this
+                // step, so the trace is point-in-time queryable — asking
+                // "what is in scope on this line" no longer requires
+                // replaying every assignment in the frame.  The names
+                // come from the manifest and the values from the runtime
+                // side channel; they are zipped positionally, and `zip`
+                // stops at the shorter of the two so a manifest/runtime
+                // version skew truncates rather than misattributing a
+                // value to the wrong name.
+                //
+                // These are pushed AFTER the Step so the CTFS writer
+                // attributes them to it — `register_step` resets the
+                // current step's value list on every call.
+                if site.vars.is_empty() {
+                    continue;
+                }
+                let Some(locals) = value_map.get(&i).and_then(|e| e.locals.as_ref()) else {
+                    continue;
+                };
+
+                let mut pending_events: Vec<TraceEvent> = Vec::new();
+                let mut values: Vec<FullValueRecord> = Vec::with_capacity(locals.len());
+                for (name, encoded) in site.vars.iter().zip(locals.iter()) {
+                    let (variable_id, var_event) = state.var_name_registry.get_or_register(name);
+                    if let Some(ve) = var_event {
+                        pending_events.push(ve);
+                    }
+                    let value = encoded_to_value_record(
+                        encoded,
+                        &mut state.type_registry,
+                        &mut pending_events,
+                    );
+                    values.push(FullValueRecord { variable_id, value });
+                }
+                state.events.extend(pending_events);
+                for value in values {
+                    state.events.push(TraceEvent::Value(value));
                 }
             }
             // enter (call)

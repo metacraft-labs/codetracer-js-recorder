@@ -52,8 +52,11 @@ function foo() {
 `);
     const code = result.code;
 
-    // Should have step calls before each statement
-    const stepMatches = code.match(/__ct\.step\(\d+\)/g);
+    // Should have step calls before each statement.
+    // A step site that captures visible locals (M37) takes a second
+    // argument — `__ct.step(7, [x])` — so the match is on the call head
+    // rather than on the one-argument form.
+    const stepMatches = code.match(/__ct\.step\(\d+[,)]/g);
     expect(stepMatches).not.toBeNull();
     // At least 3 step calls inside the function (let x, let y, return)
     // plus 1 for the function declaration itself at module level

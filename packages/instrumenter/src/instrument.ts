@@ -1,9 +1,11 @@
 import { parseSync, printSync } from "@swc/core";
 import type { ParserConfig } from "@swc/types";
 import type { InstrumentOptions, InstrumentResult } from "./index.js";
+import { DEFAULT_MAX_STEP_LOCALS } from "./index.js";
 import { ManifestBuilder } from "./manifest.js";
 import { LineColMapper, transformModule } from "./visitor.js";
 import type { TransformContext } from "./visitor.js";
+import { computeStepLocals } from "./scopes.js";
 import {
   detectAndLoadSourceMap,
   SourceMapResolver,
@@ -98,6 +100,45 @@ export function computeLineLengths(source: string): number[] {
     lengths.push(Buffer.byteLength(line, "utf-8"));
   }
   return lengths;
+}
+
+/**
+ * Resolve whether per-step local capture (M37) is enabled.
+ *
+ * The explicit option wins; otherwise `CODETRACER_JS_STEP_LOCALS` acts
+ * as a process-wide kill switch (`0` / `false` / `off` disable it).  The
+ * feature is on by default because a State panel that shows nothing on
+ * a `return` line is the failure this exists to prevent.
+ */
+function resolveStepLocalsEnabled(explicit: boolean | undefined): boolean {
+  if (explicit !== undefined) return explicit;
+  const raw = process.env.CODETRACER_JS_STEP_LOCALS;
+  if (raw === undefined) return true;
+  const normalized = raw.trim().toLowerCase();
+  return !(
+    normalized === "0" ||
+    normalized === "false" ||
+    normalized === "off"
+  );
+}
+
+/**
+ * Resolve the per-step capture cap.
+ *
+ * A malformed or non-positive `CODETRACER_JS_MAX_STEP_LOCALS` falls back
+ * to the default rather than disabling capture silently — an operator
+ * typo should not quietly turn the feature off.
+ */
+function resolveMaxStepLocals(explicit: number | undefined): number {
+  if (explicit !== undefined && Number.isFinite(explicit) && explicit > 0) {
+    return Math.floor(explicit);
+  }
+  const raw = process.env.CODETRACER_JS_MAX_STEP_LOCALS;
+  if (raw !== undefined) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return DEFAULT_MAX_STEP_LOCALS;
 }
 
 /**
@@ -211,6 +252,17 @@ export function instrument(
     return { pathIndex, line, col };
   };
 
+  // M37: compute the per-step visible-locals map BEFORE any rewriting.
+  // The analysis is keyed on original AST node identity and reads the
+  // program's own declaration order, so it must see the untouched tree —
+  // once `transformModule` has spliced `__ct.*` statements in, the
+  // textual order it depends on no longer describes the user's code.
+  const stepLocalsEnabled = resolveStepLocalsEnabled(options.stepLocals);
+  const stepLocals =
+    module.type === "Module" && stepLocalsEnabled
+      ? computeStepLocals(module)
+      : undefined;
+
   // Build transform context
   const ctx: TransformContext = {
     manifest,
@@ -218,6 +270,8 @@ export function instrument(
     mapper,
     sourceMapResolver: resolver ?? undefined,
     resolveLocation,
+    stepLocals,
+    maxStepLocals: resolveMaxStepLocals(options.maxStepLocals),
   };
 
   // Transform the AST

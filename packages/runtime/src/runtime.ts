@@ -72,6 +72,36 @@ const DEFAULT_MAX_DEPTH = 5;
 /** Default maximum number of elements/fields captured per object/array. */
 const DEFAULT_MAX_SIZE = 100;
 
+/**
+ * M37: breadth budget for the per-step visible-locals snapshot.
+ *
+ * A step snapshot re-encodes every live binding, so a collection that a
+ * loop grows costs `O(steps × size)` — a 20k-iteration loop appending to
+ * one array spends far more time encoding that array than running the
+ * program.  Capping breadth (not depth: depth is what makes a nested
+ * value readable, breadth is what makes it quadratic) keeps a step's
+ * cost bounded by the number of *bindings* rather than by how much data
+ * they happen to hold.
+ *
+ * Nothing is lost from the trace as a whole: the write event for a
+ * binding still records it at the full {@link DEFAULT_MAX_SIZE} budget
+ * on the step that assigns it, so the complete value remains in the
+ * recording — the per-step snapshot is a summary of what is in scope.
+ *
+ * Override with `CODETRACER_JS_STEP_LOCALS_MAX_SIZE`.
+ */
+export const DEFAULT_STEP_LOCALS_MAX_SIZE = 32;
+
+/** Resolve the per-step breadth budget from the environment, once. */
+function readStepLocalsMaxSize(): number {
+  const raw = process.env.CODETRACER_JS_STEP_LOCALS_MAX_SIZE;
+  if (raw !== undefined) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return DEFAULT_STEP_LOCALS_MAX_SIZE;
+}
+
 /** Options for controlling deep value encoding behavior. */
 export interface EncodeValueOptions {
   /** Maximum nesting depth before values are encoded as "[depth limit]". Default: 5. */
@@ -503,7 +533,18 @@ export interface TraceManifest {
 
 export interface CtRuntime {
   init(manifestPath: string): void;
-  step(siteId: number): void;
+  /**
+   * Record that execution reached the source position `siteId` names.
+   *
+   * @param siteId Manifest step-site id minted by the instrumenter.
+   * @param locals M37: the values of the locals visible at this step,
+   *   in the same order as the site's `vars` list in the manifest.
+   *   Instrumented code passes a plain array literal of the live
+   *   bindings; the names stay in the manifest so nothing but values
+   *   crosses the boundary.  Omitted when the site captures nothing,
+   *   which is also what pre-M37 instrumented code emits.
+   */
+  step(siteId: number, locals?: readonly unknown[]): void;
   enter(fnId: number, argsLike: IArguments): void;
   ret(fnId: number, value?: unknown): unknown;
   /**
@@ -653,6 +694,11 @@ export interface CreateRuntimeOptions {
 export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
   const config = readConfig();
   const buffer = new EventBuffer(opts.bufferCapacity ?? 4096);
+  // Resolved once per runtime: the budget must not change between steps
+  // or the same binding would encode to different shapes over time.
+  const stepLocalsEncodeOptions: EncodeValueOptions = {
+    maxSize: readStepLocalsMaxSize(),
+  };
 
   if (opts.onFlush) {
     buffer.onFlush = opts.onFlush;
@@ -670,7 +716,7 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
   if (config.disabled) {
     const noop: CtRuntime = {
       init(_manifestPath: string): void {},
-      step(_siteId: number): void {},
+      step(_siteId: number, _locals?: readonly unknown[]): void {},
       enter(_fnId: number, _argsLike: IArguments): void {},
       ret(_fnId: number, value?: unknown): unknown {
         return value;
@@ -731,10 +777,27 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
       manifest = JSON.parse(raw) as TraceManifest;
     },
 
-    step(siteId: number): void {
+    step(siteId: number, locals?: readonly unknown[]): void {
       try {
         asyncTracker.checkContext(buffer);
-        buffer.push(EVENT_STEP, siteId);
+        // M37: attach the frame's visible locals so the trace answers
+        // "what is in scope here" at every step, not only at the steps
+        // that happen to write a binding.  Encoding is bounded by
+        // `encodeValue`'s depth/size limits and by the instrumenter's
+        // per-step name cap, so a pathological object graph cannot make
+        // a single step unbounded.
+        let encoded: EncodedValue[] | undefined;
+        if (locals !== undefined && locals.length > 0) {
+          encoded = new Array(locals.length);
+          for (let i = 0; i < locals.length; i++) {
+            encoded[i] = encodeValue(locals[i], stepLocalsEncodeOptions);
+          }
+        }
+        buffer.push(
+          EVENT_STEP,
+          siteId,
+          encoded === undefined ? undefined : { value: { locals: encoded } },
+        );
       } catch {
         // Never crash the user's program
       }
@@ -743,16 +806,12 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
     enter(fnId: number, argsLike: IArguments): void {
       try {
         asyncTracker.checkContext(buffer);
-        buffer.push(EVENT_ENTER, fnId);
         // Capture argument values in the side channel
         const encodedArgs: EncodedValue[] = [];
         for (let i = 0; i < argsLike.length; i++) {
           encodedArgs.push(encodeValue(argsLike[i]));
         }
-        buffer.pushValue({
-          eventIndex: buffer.length - 1,
-          args: encodedArgs,
-        });
+        buffer.push(EVENT_ENTER, fnId, { value: { args: encodedArgs } });
       } catch {
         // Never crash the user's program
       }
@@ -761,11 +820,9 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
     ret(fnId: number, value?: unknown): unknown {
       try {
         asyncTracker.checkContext(buffer);
-        buffer.push(EVENT_RET, fnId);
         // Capture return value in the side channel
-        buffer.pushValue({
-          eventIndex: buffer.length - 1,
-          returnValue: encodeValue(value),
+        buffer.push(EVENT_RET, fnId, {
+          value: { returnValue: encodeValue(value) },
         });
       } catch {
         // Never crash the user's program
@@ -784,10 +841,8 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
       // step-level value-snapshot pass.
       try {
         asyncTracker.checkContext(buffer);
-        buffer.push(EVENT_ASSIGNMENT, siteId);
-        buffer.pushValue({
-          eventIndex: buffer.length - 1,
-          assignmentValue: encodeValue(value),
+        buffer.push(EVENT_ASSIGNMENT, siteId, {
+          value: { assignmentValue: encodeValue(value) },
         });
       } catch {
         // Never crash the user's program
@@ -809,17 +864,17 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
         // tracepoint Event, and the trace reader attributes that event
         // to the most recent Step — so the marker lands on the crossing
         // line without the instrumenter needing to mint a site for it.
-        buffer.push(EVENT_MARKER, 0);
-        buffer.pushMarker({
-          eventIndex: buffer.length - 1,
-          direction,
-          boundary,
-          key: stringifyCorrelationKey(key),
-          payload:
-            payload === undefined
-              ? undefined
-              : stringifyCorrelationKey(payload),
-          showText,
+        buffer.push(EVENT_MARKER, 0, {
+          marker: {
+            direction,
+            boundary,
+            key: stringifyCorrelationKey(key),
+            payload:
+              payload === undefined
+                ? undefined
+                : stringifyCorrelationKey(payload),
+            showText,
+          },
         });
       } catch {
         // Never crash the user's program
@@ -1039,12 +1094,7 @@ export function startRecording(
   // Install console capture to record Write events
   installConsoleCapture((kind: string, content: string) => {
     try {
-      runtime.buffer.push(EVENT_WRITE, 0);
-      runtime.buffer.pushWrite({
-        eventIndex: runtime.buffer.length - 1,
-        kind,
-        content,
-      });
+      runtime.buffer.push(EVENT_WRITE, 0, { write: { kind, content } });
     } catch {
       // Never let capture errors affect the program
     }

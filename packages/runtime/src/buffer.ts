@@ -63,6 +63,15 @@ export interface ValueEntry {
   returnValue?: EncodedValue;
   /** Encoded assignment target value (for assignment events). */
   assignmentValue?: EncodedValue;
+  /**
+   * M37: encoded values of the locals visible at a step event.
+   *
+   * Positionally aligned with the step site's `vars` list in the
+   * manifest — the names live there, not on the wire, so a step costs
+   * one array of encoded values and no string traffic.  Absent when the
+   * site captures nothing.
+   */
+  locals?: EncodedValue[];
 }
 
 /** A write entry associated with a Write event (console output). */
@@ -130,6 +139,26 @@ export interface EventBatch {
 export type FlushCallback = (batch: EventBatch) => void;
 
 /**
+ * Side-channel data to attach to an event as part of the same push.
+ *
+ * The `eventIndex` is filled in by {@link EventBuffer.push}, which is
+ * the point of this type: an event that reaches the buffer's capacity is
+ * flushed the moment it is written, so attaching its side channel in a
+ * *separate* call would land the entry in the next (empty) window with a
+ * stale index, silently losing the values for one event out of every
+ * `capacity`. Passing the attachment in with the event makes the pair
+ * atomic.
+ */
+export interface EventAttachments {
+  /** Values for step / enter / ret / assignment events. */
+  value?: Omit<ValueEntry, "eventIndex">;
+  /** Console output for write events. */
+  write?: Omit<WriteEntry, "eventIndex">;
+  /** Correlation payload for marker events. */
+  marker?: Omit<MarkerEntry, "eventIndex">;
+}
+
+/**
  * Fixed-capacity ring buffer backed by typed arrays.
  *
  * Usage:
@@ -185,14 +214,32 @@ export class EventBuffer {
   }
 
   /**
-   * Append one event to the buffer.
-   * If the buffer is full after this push, it is automatically flushed.
+   * Append one event to the buffer, optionally with its side-channel
+   * data.
+   *
+   * If the buffer is full after this push, it is automatically flushed —
+   * which is exactly why `attachments` exists rather than a follow-up
+   * `pushValue` call: the attachment is recorded against the event's
+   * index *before* that flush can fire, so the two always travel in the
+   * same batch.
    */
-  push(kind: EventKind, id: number): void {
+  push(kind: EventKind, id: number, attachments?: EventAttachments): void {
     const idx = this._length;
     this.eventKinds[idx] = kind;
     this.ids[idx] = id;
     this._length = idx + 1;
+
+    if (attachments !== undefined) {
+      if (attachments.value !== undefined) {
+        this._values.push({ eventIndex: idx, ...attachments.value });
+      }
+      if (attachments.write !== undefined) {
+        this._writes.push({ eventIndex: idx, ...attachments.write });
+      }
+      if (attachments.marker !== undefined) {
+        this._markers.push({ eventIndex: idx, ...attachments.marker });
+      }
+    }
 
     if (this._length >= this.capacity) {
       this.flush();
@@ -200,22 +247,30 @@ export class EventBuffer {
   }
 
   /**
-   * Attach a value entry to the most recently pushed event.
-   * The eventIndex is automatically set to the current buffer position - 1.
+   * Attach a value entry to the current buffer window.
+   *
+   * Prefer passing the entry to {@link push} instead: a standalone call
+   * cannot see whether the event it describes was just flushed away, so
+   * it is only safe when the caller knows the buffer did not reach
+   * capacity. Retained for callers outside this package.
    */
   pushValue(entry: ValueEntry): void {
     this._values.push(entry);
   }
 
   /**
-   * Attach a write entry to the most recently pushed event.
+   * Attach a write entry to the current buffer window.
+   *
+   * Same caveat as {@link pushValue} — prefer {@link push}.
    */
   pushWrite(entry: WriteEntry): void {
     this._writes.push(entry);
   }
 
   /**
-   * Attach a correlation-marker entry to the most recently pushed event.
+   * Attach a correlation-marker entry to the current buffer window.
+   *
+   * Same caveat as {@link pushValue} — prefer {@link push}.
    */
   pushMarker(entry: MarkerEntry): void {
     this._markers.push(entry);

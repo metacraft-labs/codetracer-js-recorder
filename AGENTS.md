@@ -40,12 +40,39 @@ This is a monorepo managed with npm workspaces:
 * `test-programs/web/express` — the recorded Express demo app + its in-process
   request driver, shared by `just demo-request-panel-js` and the span tests.
 * `packages/instrumenter` — Source-to-source JavaScript/TypeScript
-  instrumentation using Babel.
+  instrumentation using SWC.
 * `packages/runtime` — Runtime library injected into instrumented programs
   to capture trace events.
 * `crates/recorder_native` — Rust N-API addon (via napi-rs) for writing
   trace files in binary (CBOR+zstd) and JSON formats.
 * `tests/` — End-to-end integration tests.
+
+## There are THREE implementations of the `__ct` runtime
+
+Changing the runtime surface (adding a method, or an argument to one) means
+changing all three, or the change silently does nothing on the path you did not
+touch:
+
+1. `packages/runtime/src/runtime.ts` — the real library, used when a program
+   embeds the recorder itself (bundler plugins, `startRecording`).
+2. `packages/cli/src/record-cmd.ts` `generateRunner()` — a hand-inlined
+   duplicate emitted as `__ct_runner.js`. **This is what `record` actually
+   runs**, so a fix applied only to (1) will not show up in a recorded trace.
+   It must stay dependency-free CommonJS, which is why it is duplicated rather
+   than imported; constants shared with (1) are imported at *generation* time so
+   the budgets cannot drift.
+3. `packages/cli/src/instrument-cmd.ts` and `packages/runtime-browser` — the
+   browser transport, which speaks a different (message-based) wire protocol to
+   the recording daemon. New instrumenter arguments are accepted and ignored
+   here unless that protocol is extended too.
+
+## Event side channels must be attached in the same `push`
+
+`EventBuffer.push` (and the runner's `pushEvent`) auto-flush when the buffer
+reaches capacity. Attaching a value/write/marker in a *separate* call after the
+push therefore lands it in the next, empty window with a stale index — losing
+the data for one event out of every `BUFFER_CAPACITY`. Pass the attachment to
+`push` instead.
 
 # You don't have access to the internet
 

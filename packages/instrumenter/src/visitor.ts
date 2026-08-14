@@ -25,6 +25,7 @@ import type {
 } from "@swc/types";
 import { ManifestBuilder } from "./manifest.js";
 import type { SourceMapResolver } from "./sourcemap.js";
+import type { StepLocalsMap } from "./scopes.js";
 
 // ---------- helpers for building AST nodes ----------
 
@@ -171,10 +172,46 @@ function extractParamNames(params: unknown[]): string[] {
 
 // ---------- __ct call builders ----------
 
-function mkStepCall(siteId: number): Statement {
-  return mkExprStmt(
-    mkCallExpr(mkMemberExpr("__ct", "step"), [mkNumericLiteral(siteId)]),
-  );
+/**
+ * Build a `__ct.step(siteId)` — or, when the site captures locals,
+ * `__ct.step(siteId, [a, b, …])`.
+ *
+ * The value array is a plain array literal of live bindings: the only
+ * way to read a JS scope from inside the program is to name the
+ * bindings, so the instrumenter names exactly the ones its static scope
+ * analysis proved to be declared and past their temporal dead zone at
+ * this point (see `scopes.ts`).  The names travel in the manifest, not
+ * in the emitted code, so the per-step runtime cost is one array
+ * allocation plus the value encoding — no string work.
+ *
+ * The one-argument form is kept for sites with nothing to capture so
+ * the emitted code (and the manifest) stays identical to pre-M37 output
+ * for programs with no locals.
+ */
+function mkStepCall(siteId: number, varNames?: string[]): Statement {
+  const args: Expression[] = [mkNumericLiteral(siteId)];
+  if (varNames && varNames.length > 0) {
+    args.push(mkArrayLiteral(varNames.map((name) => mkIdentifier(name))));
+  }
+  return mkExprStmt(mkCallExpr(mkMemberExpr("__ct", "step"), args));
+}
+
+/**
+ * Resolve the locals a step site should capture for an AST node.
+ *
+ * Returns an empty array when per-step capture is disabled, when the
+ * scope analysis has no entry for the node (an AST shape the visitor
+ * instruments but the analysis does not model — degrade to the pre-M37
+ * behaviour rather than guess), or when nothing is in scope.
+ */
+function stepLocalsFor(node: unknown, ctx: TransformContext): string[] {
+  if (!ctx.stepLocals) return [];
+  if (!node || typeof node !== "object") return [];
+  const names = ctx.stepLocals.get(node as object);
+  if (!names || names.length === 0) return [];
+  return names.length > ctx.maxStepLocals
+    ? names.slice(0, ctx.maxStepLocals)
+    : names;
 }
 
 function mkEnterCall(fnId: number): Statement {
@@ -914,6 +951,17 @@ export interface TransformContext {
     line: number,
     col: number,
   ) => { pathIndex: number; line: number; col: number };
+  /**
+   * M37: statically computed per-step visible-locals map, keyed by the
+   * AST node the step site belongs to.  `undefined` disables per-step
+   * capture entirely (the pre-M37 shape).  See `scopes.ts`.
+   */
+  stepLocals?: StepLocalsMap;
+  /**
+   * M37: upper bound on locals captured per step.  Always set when
+   * `stepLocals` is; see `DEFAULT_MAX_STEP_LOCALS`.
+   */
+  maxStepLocals: number;
 }
 
 /**
@@ -978,12 +1026,14 @@ export function transformModule(module: Module, ctx: TransformContext): void {
     if (isExecutableModuleItem(item)) {
       const span = (item as unknown as { span: Span }).span;
       const resolved = resolveSpan(span.start, ctx);
+      const locals = stepLocalsFor(item, ctx);
       const siteId = ctx.manifest.addStepSite(
         resolved.pathIndex,
         resolved.line,
         resolved.col,
+        locals,
       );
-      newBody.push(mkStepCall(siteId) as unknown as ModuleItem);
+      newBody.push(mkStepCall(siteId, locals) as unknown as ModuleItem);
     }
 
     newBody.push(item);
@@ -1277,12 +1327,14 @@ function transformBlockBody(stmts: Statement[], ctx: TransformContext): void {
     if (isExecutableStatement(stmt)) {
       const span = (stmt as unknown as { span: Span }).span;
       const resolved = resolveSpan(span.start, ctx);
+      const locals = stepLocalsFor(stmt, ctx);
       const siteId = ctx.manifest.addStepSite(
         resolved.pathIndex,
         resolved.line,
         resolved.col,
+        locals,
       );
-      newStmts.push(mkStepCall(siteId));
+      newStmts.push(mkStepCall(siteId, locals));
     }
     newStmts.push(stmt);
 
@@ -1764,10 +1816,14 @@ function transformArrowFunction(
       (originalExpr as unknown as { span: Span }).span.start,
       ctx,
     );
+    // The concise body's only step sees the arrow's parameters — the
+    // scope analysis keys that set on the body expression node.
+    const bodyLocals = stepLocalsFor(originalExpr, ctx);
     const stepSiteId = ctx.manifest.addStepSite(
       bodyResolved.pathIndex,
       bodyResolved.line,
       bodyResolved.col,
+      bodyLocals,
     );
     ctx.manifest.addReturnSite(
       fnId,
@@ -1778,7 +1834,7 @@ function transformArrowFunction(
 
     const block = mkBlock([
       mkArrowEnterCall(fnId, params),
-      mkStepCall(stepSiteId),
+      mkStepCall(stepSiteId, bodyLocals),
       mkReturnStmt(mkRetExpr(fnId, originalExpr)) as Statement,
     ]);
 
@@ -1984,16 +2040,25 @@ function transformClassMethod(cm: ClassMethod, ctx: TransformContext): void {
  * 4. Append implicit __ct.ret(fnId) if no explicit return
  */
 /**
- * Helper to add a step site for a statement, resolving through source maps.
+ * Build the `__ct.step` call for a statement, registering its site and
+ * resolving the location through source maps.
+ *
+ * Returns the statement to emit rather than the raw site id so the
+ * site's captured-locals list is guaranteed to match the array the call
+ * passes — the native addon zips the two positionally, so they must be
+ * produced together.
  */
-function addStepSiteForStmt(stmt: Statement, ctx: TransformContext): number {
+function mkStepCallForStmt(stmt: Statement, ctx: TransformContext): Statement {
   const span = (stmt as unknown as { span: Span }).span;
   const resolved = resolveSpan(span.start, ctx);
-  return ctx.manifest.addStepSite(
+  const locals = stepLocalsFor(stmt, ctx);
+  const siteId = ctx.manifest.addStepSite(
     resolved.pathIndex,
     resolved.line,
     resolved.col,
+    locals,
   );
+  return mkStepCall(siteId, locals);
 }
 
 function instrumentFunctionBody(
@@ -2063,8 +2128,7 @@ function instrumentFunctionBody(
       // Add everything up to and including super(), with steps
       for (let i = dirCount; i <= superIdx; i++) {
         if (isExecutableStatement(stmts[i])) {
-          const siteId = addStepSiteForStmt(stmts[i], ctx);
-          withSteps.push(mkStepCall(siteId));
+          withSteps.push(mkStepCallForStmt(stmts[i], ctx));
         }
         withSteps.push(stmts[i]);
         for (const site of collectAssignmentSitesFromStatement(stmts[i], ctx)) {
@@ -2079,8 +2143,7 @@ function instrumentFunctionBody(
       // Add remaining statements with steps
       for (let i = superIdx + 1; i < stmts.length; i++) {
         if (isExecutableStatement(stmts[i])) {
-          const siteId = addStepSiteForStmt(stmts[i], ctx);
-          withSteps.push(mkStepCall(siteId));
+          withSteps.push(mkStepCallForStmt(stmts[i], ctx));
         }
         withSteps.push(stmts[i]);
         for (const site of collectAssignmentSitesFromStatement(stmts[i], ctx)) {
@@ -2093,8 +2156,7 @@ function instrumentFunctionBody(
       emitParamWrites();
       for (let i = dirCount; i < stmts.length; i++) {
         if (isExecutableStatement(stmts[i])) {
-          const siteId = addStepSiteForStmt(stmts[i], ctx);
-          withSteps.push(mkStepCall(siteId));
+          withSteps.push(mkStepCallForStmt(stmts[i], ctx));
         }
         withSteps.push(stmts[i]);
         for (const site of collectAssignmentSitesFromStatement(stmts[i], ctx)) {
@@ -2109,8 +2171,7 @@ function instrumentFunctionBody(
 
     for (let i = dirCount; i < stmts.length; i++) {
       if (isExecutableStatement(stmts[i])) {
-        const siteId = addStepSiteForStmt(stmts[i], ctx);
-        withSteps.push(mkStepCall(siteId));
+        withSteps.push(mkStepCallForStmt(stmts[i], ctx));
       }
       withSteps.push(stmts[i]);
       for (const site of collectAssignmentSitesFromStatement(stmts[i], ctx)) {

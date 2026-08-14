@@ -72,10 +72,27 @@ export class ManifestBuilder {
 
   /**
    * Register a step site and return its siteId (index in the sites array).
+   *
+   * M37: `vars` names the local bindings the instrumented `__ct.step`
+   * call passes alongside the site id, in the same order.  The native
+   * addon zips the two to emit one `Value` event per visible local on
+   * every step, which is what makes the trace point-in-time queryable
+   * (see `scopes.ts`).  It is omitted when the step captures nothing, so
+   * manifests for programs with no locals stay byte-for-byte identical
+   * to pre-M37 output.
    */
-  addStepSite(pathIndex: number, line: number, col: number): number {
+  addStepSite(
+    pathIndex: number,
+    line: number,
+    col: number,
+    vars?: string[],
+  ): number {
     const siteId = this.sites.length;
-    this.sites.push({ kind: "step", pathIndex, line, col });
+    const entry: SiteEntry = { kind: "step", pathIndex, line, col };
+    if (vars && vars.length > 0) {
+      entry.vars = [...vars];
+    }
+    this.sites.push(entry);
     return siteId;
   }
 

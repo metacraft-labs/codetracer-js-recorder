@@ -474,7 +474,18 @@ function encodeObject(
  * explicitly at boundary-crossing sites.
  */
 export interface CtBrowserRuntime {
-  step(siteId: number): void;
+  /**
+   * Record that execution reached the source position `siteId` names.
+   *
+   * `locals` is the M37 per-step visible-locals array the Node
+   * instrumenter emits.  It is accepted so browser bundles instrumented
+   * by the same pass load and run unchanged, but it is not forwarded:
+   * the `Step` message on the daemon transport carries only a site id,
+   * and widening that is a wire-protocol change of its own.  Locals in a
+   * browser recording therefore still arrive via the `write` /
+   * assignment path, exactly as before M37.
+   */
+  step(siteId: number, locals?: readonly unknown[]): void;
   enter(fnId: number, argsLike: IArguments | unknown[]): void;
   ret(fnId: number, value?: unknown): unknown;
   write(siteId: number, value?: unknown): void;
@@ -668,7 +679,10 @@ export function createBrowserRuntime(
   }
 
   const runtime: CtBrowserRuntime = {
-    step(siteId: number): void {
+    step(siteId: number, _locals?: readonly unknown[]): void {
+      // See CtBrowserRuntime.step — the locals array is deliberately
+      // dropped rather than silently reshaped into a message the daemon
+      // does not understand.
       enqueue({ kind: "Step", siteId });
     },
     enter(fnId: number, argsLike: IArguments | unknown[]): void {

@@ -36,7 +36,7 @@ export type {
   WriteEntry,
 } from "./buffer.js";
 
-export { encodeValue } from "./runtime.js";
+export { encodeValue, DEFAULT_STEP_LOCALS_MAX_SIZE } from "./runtime.js";
 export type { EncodeValueOptions } from "./runtime.js";
 
 export { installConsoleCapture, removeConsoleCapture } from "./io-capture.js";

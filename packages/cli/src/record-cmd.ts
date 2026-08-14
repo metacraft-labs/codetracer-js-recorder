@@ -33,6 +33,10 @@ import {
   shouldInstrument,
   tryAutoformat,
 } from "@codetracer/instrumenter";
+// The generated runner re-implements the runtime inline (it must be a
+// dependency-free CommonJS script), but the *budgets* it encodes with
+// are imported from the real runtime so the two cannot drift.
+import { DEFAULT_STEP_LOCALS_MAX_SIZE } from "@codetracer/runtime";
 import type {
   ManifestSlice,
   FunctionEntry,
@@ -358,6 +362,25 @@ JSON / text conversion of the produced bundle.`,
 }
 
 /**
+ * Resolve the M37 per-step visible-locals breadth budget.
+ *
+ * Mirrors `readStepLocalsMaxSize` in `packages/runtime/src/runtime.ts`,
+ * reading the same `CODETRACER_JS_STEP_LOCALS_MAX_SIZE` variable, so the
+ * two recording paths (the `@codetracer/runtime` package and this
+ * command's generated runner) never disagree about how much of a
+ * collection a step snapshot captures.  A malformed value falls back to
+ * the default rather than disabling capture.
+ */
+function resolveStepLocalsMaxSize(): number {
+  const raw = process.env.CODETRACER_JS_STEP_LOCALS_MAX_SIZE;
+  if (raw !== undefined) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return DEFAULT_STEP_LOCALS_MAX_SIZE;
+}
+
+/**
  * Generate the runner script content.
  *
  * The runner is a standalone CommonJS script that:
@@ -382,6 +405,12 @@ function generateRunner(opts: {
    * flag.
    */
   columnAware: boolean;
+  /**
+   * M37: breadth budget for the per-step visible-locals snapshot,
+   * baked into the generated runner.  Resolved in the parent process so
+   * the recorded program's own environment cannot change it midway.
+   */
+  stepLocalsMaxSize: number;
 }): string {
   // Escape paths for embedding in JS strings (handle backslashes on Windows)
   const esc = (s: string) => JSON.stringify(s);
@@ -413,10 +442,22 @@ var handle = addon.startRecording({
 var MAX_STRING_LENGTH = 1000;
 var DEFAULT_MAX_DEPTH = 5;
 var DEFAULT_MAX_SIZE = 100;
+// M37: breadth budget for the per-step visible-locals snapshot.  Kept in
+// sync with DEFAULT_STEP_LOCALS_MAX_SIZE in packages/runtime/src/runtime.ts
+// and resolved from the same environment variable.
+var STEP_LOCALS_MAX_SIZE = ${JSON.stringify(opts.stepLocalsMaxSize)};
 
-function encodeValue(value, depth, seen) {
+// \`maxSize\` is the per-collection breadth budget.  It is a parameter
+// rather than a constant because the M37 per-step visible-locals
+// snapshot re-encodes every live binding on every step: a collection a
+// loop grows would otherwise cost O(steps x size), and encoding it would
+// dominate the recording.  Step snapshots pass a tighter budget; the
+// write event that records a binding on the step it is assigned still
+// uses the full one, so the complete value stays in the trace.
+function encodeValue(value, depth, seen, maxSize) {
   if (depth === undefined) depth = 0;
   if (seen === undefined) seen = new WeakSet();
+  if (maxSize === undefined) maxSize = DEFAULT_MAX_SIZE;
   try {
     if (value === undefined) return { value: null, typeKind: "None" };
     if (value === null) return { value: null, typeKind: "None" };
@@ -442,53 +483,53 @@ function encodeValue(value, depth, seen) {
           if (value instanceof Error) return { value: value.message, typeKind: "Error" };
           if (Array.isArray(value)) {
             var total = value.length;
-            var limit = Math.min(total, DEFAULT_MAX_SIZE);
+            var limit = Math.min(total, maxSize);
             var elements = [];
-            for (var i = 0; i < limit; i++) elements.push(encodeValue(value[i], depth + 1, seen));
-            if (total > DEFAULT_MAX_SIZE) elements.push({ value: "[... " + (total - DEFAULT_MAX_SIZE) + " more]", typeKind: "Raw" });
+            for (var i = 0; i < limit; i++) elements.push(encodeValue(value[i], depth + 1, seen, maxSize));
+            if (total > maxSize) elements.push({ value: "[... " + (total - maxSize) + " more]", typeKind: "Raw" });
             return { value: elements, typeKind: "Seq" };
           }
           if (value instanceof Map) {
             var mapTotal = value.size;
-            var mapLimit = Math.min(mapTotal, DEFAULT_MAX_SIZE);
+            var mapLimit = Math.min(mapTotal, maxSize);
             var mapEntries = [];
             var mapCount = 0;
             value.forEach(function(v, k) {
               if (mapCount < mapLimit) {
-                mapEntries.push({ key: encodeValue(k, depth + 1, seen), value: encodeValue(v, depth + 1, seen) });
+                mapEntries.push({ key: encodeValue(k, depth + 1, seen, maxSize), value: encodeValue(v, depth + 1, seen, maxSize) });
                 mapCount++;
               }
             });
-            if (mapTotal > DEFAULT_MAX_SIZE) mapEntries.push({ key: { value: "[... " + (mapTotal - DEFAULT_MAX_SIZE) + " more]", typeKind: "Raw" }, value: { value: null, typeKind: "None" } });
+            if (mapTotal > maxSize) mapEntries.push({ key: { value: "[... " + (mapTotal - maxSize) + " more]", typeKind: "Raw" }, value: { value: null, typeKind: "None" } });
             return { value: mapEntries, typeKind: "TableKind" };
           }
           if (value instanceof Set) {
             var setTotal = value.size;
-            var setLimit = Math.min(setTotal, DEFAULT_MAX_SIZE);
+            var setLimit = Math.min(setTotal, maxSize);
             var setElements = [];
             var setCount = 0;
             value.forEach(function(v) {
               if (setCount < setLimit) {
-                setElements.push(encodeValue(v, depth + 1, seen));
+                setElements.push(encodeValue(v, depth + 1, seen, maxSize));
                 setCount++;
               }
             });
-            if (setTotal > DEFAULT_MAX_SIZE) setElements.push({ value: "[... " + (setTotal - DEFAULT_MAX_SIZE) + " more]", typeKind: "Raw" });
+            if (setTotal > maxSize) setElements.push({ value: "[... " + (setTotal - maxSize) + " more]", typeKind: "Raw" });
             return { value: setElements, typeKind: "Set" };
           }
           // Plain object
           var keys;
           try { keys = Object.keys(value); } catch(e) { return { value: "[object]", typeKind: "Raw" }; }
           var objTotal = keys.length;
-          var objLimit = Math.min(objTotal, DEFAULT_MAX_SIZE);
+          var objLimit = Math.min(objTotal, maxSize);
           var fields = [];
           for (var j = 0; j < objLimit; j++) {
             var k = keys[j];
             var v;
             try { v = value[k]; } catch(e) { v = "[access error]"; }
-            fields.push({ name: k, value: encodeValue(v, depth + 1, seen) });
+            fields.push({ name: k, value: encodeValue(v, depth + 1, seen, maxSize) });
           }
-          if (objTotal > DEFAULT_MAX_SIZE) fields.push({ name: "[... " + (objTotal - DEFAULT_MAX_SIZE) + " more]", value: { value: null, typeKind: "None" } });
+          if (objTotal > maxSize) fields.push({ name: "[... " + (objTotal - maxSize) + " more]", value: { value: null, typeKind: "None" } });
           return { value: { fields: fields }, typeKind: "Struct" };
         } finally {
           seen.delete(value);
@@ -542,10 +583,21 @@ function flushBuffer() {
   markerEntries = [];
 }
 
-function pushEvent(kind, id) {
-  eventKinds[bufLen] = kind;
-  ids[bufLen] = id;
-  bufLen++;
+// Append one event, together with any side-channel data it carries.
+//
+// The attachment MUST be recorded here rather than by the caller after
+// the fact: an event that fills the buffer is flushed the instant it is
+// written, so a follow-up push would land the entry in the next (empty)
+// window under a stale index — silently losing the values for one event
+// out of every BUFFER_CAPACITY.
+function pushEvent(kind, id, value, write, marker) {
+  var idx = bufLen;
+  eventKinds[idx] = kind;
+  ids[idx] = id;
+  bufLen = idx + 1;
+  if (value !== undefined) { value.eventIndex = idx; valueEntries.push(value); }
+  if (write !== undefined) { write.eventIndex = idx; writeEntries.push(write); }
+  if (marker !== undefined) { marker.eventIndex = idx; markerEntries.push(marker); }
   if (bufLen >= BUFFER_CAPACITY) {
     flushBuffer();
   }
@@ -580,25 +632,39 @@ function checkAsyncContext() {
 
 // Set up globalThis.__ct
 globalThis.__ct = {
-  step: function(siteId) {
-    try { checkAsyncContext(); pushEvent(0, siteId); } catch(e) {}
+  // M37: \`locals\` is the array of live bindings visible at this step,
+  // positionally aligned with the step site's \`vars\` list in the
+  // manifest.  Emitting it on every step is what makes the trace
+  // point-in-time queryable — without it a binding's value only exists
+  // on the step that wrote it, so stopping on a \`return\` line shows an
+  // empty state view.  Matches the Ruby / Python recorders.
+  step: function(siteId, locals) {
+    try {
+      checkAsyncContext();
+      var encodedLocals;
+      if (locals !== undefined && locals.length > 0) {
+        encodedLocals = new Array(locals.length);
+        for (var i = 0; i < locals.length; i++) {
+          encodedLocals[i] = encodeValue(locals[i], 0, undefined, STEP_LOCALS_MAX_SIZE);
+        }
+      }
+      pushEvent(0, siteId, encodedLocals === undefined ? undefined : { locals: encodedLocals });
+    } catch(e) {}
   },
   enter: function(fnId, argsLike) {
     try {
       checkAsyncContext();
-      pushEvent(1, fnId);
       var encodedArgs = [];
       for (var i = 0; i < argsLike.length; i++) {
         encodedArgs.push(encodeValue(argsLike[i]));
       }
-      valueEntries.push({ eventIndex: bufLen - 1, args: encodedArgs });
+      pushEvent(1, fnId, { args: encodedArgs });
     } catch(e) {}
   },
   ret: function(fnId, value) {
     try {
       checkAsyncContext();
-      pushEvent(2, fnId);
-      valueEntries.push({ eventIndex: bufLen - 1, returnValue: encodeValue(value) });
+      pushEvent(2, fnId, { returnValue: encodeValue(value) });
     } catch(e) {}
     return value;
   },
@@ -612,8 +678,7 @@ globalThis.__ct = {
   write: function(siteId, value) {
     try {
       checkAsyncContext();
-      pushEvent(7, siteId);
-      valueEntries.push({ eventIndex: bufLen - 1, assignmentValue: encodeValue(value) });
+      pushEvent(7, siteId, { assignmentValue: encodeValue(value) });
     } catch(e) {}
   },
   // RS-M9: web-request span boundaries.  Called by framework middleware
@@ -660,9 +725,7 @@ globalThis.__ct = {
   markCorrelation: function(direction, boundary, key, payload, showText) {
     try {
       checkAsyncContext();
-      pushEvent(8, 0);
-      markerEntries.push({
-        eventIndex: bufLen - 1,
+      pushEvent(8, 0, undefined, undefined, {
         direction: direction === "recv" || direction === "receive" ? "recv" : "send",
         boundary: String(boundary),
         key: _ctStringifyKey(key),
@@ -688,29 +751,25 @@ function _formatArgs(args) {
 console.log = function() {
   _origLog.apply(console, arguments);
   try {
-    pushEvent(3, 0);
-    writeEntries.push({ eventIndex: bufLen - 1, kind: "stdout", content: _formatArgs(arguments) });
+    pushEvent(3, 0, undefined, { kind: "stdout", content: _formatArgs(arguments) });
   } catch(e) {}
 };
 console.info = function() {
   _origInfo.apply(console, arguments);
   try {
-    pushEvent(3, 0);
-    writeEntries.push({ eventIndex: bufLen - 1, kind: "stdout", content: _formatArgs(arguments) });
+    pushEvent(3, 0, undefined, { kind: "stdout", content: _formatArgs(arguments) });
   } catch(e) {}
 };
 console.warn = function() {
   _origWarn.apply(console, arguments);
   try {
-    pushEvent(3, 0);
-    writeEntries.push({ eventIndex: bufLen - 1, kind: "stderr", content: _formatArgs(arguments) });
+    pushEvent(3, 0, undefined, { kind: "stderr", content: _formatArgs(arguments) });
   } catch(e) {}
 };
 console.error = function() {
   _origError.apply(console, arguments);
   try {
-    pushEvent(3, 0);
-    writeEntries.push({ eventIndex: bufLen - 1, kind: "stderr", content: _formatArgs(arguments) });
+    pushEvent(3, 0, undefined, { kind: "stderr", content: _formatArgs(arguments) });
   } catch(e) {}
 };
 
@@ -1038,6 +1097,7 @@ export function recordCommand(args: string[]): void {
       program: path.resolve(mainEntry),
       appArgs,
       columnAware,
+      stepLocalsMaxSize: resolveStepLocalsMaxSize(),
     });
 
     const runnerPath = path.join(tmpDir, "__ct_runner.js");
