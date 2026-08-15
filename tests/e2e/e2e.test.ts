@@ -338,7 +338,11 @@ describe("e2e_record_simple_program", () => {
     // ----- Path table: the canonical fixture path must appear ---------
     // Node.js path equivalent of cairo's `ends_with(".cairo")` —
     // assert the bundle records `examples/hello.js` somewhere.
-    expect(full.paths.some((p) => p.endsWith("examples/hello.js"))).toBe(true);
+    expect(
+      full.paths.some((p) =>
+        p.replace(/\\/g, "/").endsWith("examples/hello.js"),
+      ),
+    ).toBe(true);
 
     // ----- Step / call counts -----------------------------------------
     // hello.js produces a stable number of recorder events:
