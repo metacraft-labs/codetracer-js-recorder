@@ -1,0 +1,147 @@
+# =============================================================================
+# Launcher <-> recorder compatibility contract for codetracer-js-recorder.
+#
+# WHAT THIS FILE IS
+#   The checked-in contract between this recorder and the `ct` launcher, read
+#   at test time by the shared end-to-end driver
+#   `codetracer/ci/test/launcher-recorder-e2e.sh`
+#   (design: codetracer-specs/Testing/Launcher-Recorder-Compatibility-Tests.md
+#   §5.6; this edge is milestone LRC-4, the schema is LRC-2's).
+#
+#   The driver builds the real launcher, the real desktop core and this
+#   recorder, stages the real `codetracer-desktop` component bundle, and then
+#   runs each scenario below through the LAUNCHER binary, validating the
+#   produced trace with `ct-print` from codetracer-trace-format-nim.
+#
+#   Everything the driver asserts comes from this file.  That is the point: if
+#   this recorder changes its CLI, its output layout, the extensions it must be
+#   routed for, or the shape of the traces it produces, this file has to change
+#   in the SAME commit -- and the launcher/desktop side finds out on its next
+#   cross-repo run instead of silently diverging.
+#
+#   The schema (`launcher-compat/v1`) is documented normatively in the header of
+#   codetracer-python-recorder/cross-repo/launcher-compat.yml.  Read that file
+#   for the YAML subset, the key list and the rules `validate_fixture()`
+#   enforces; only what is SPECIFIC TO JAVASCRIPT is explained here.
+#
+# WHY THIS EDGE MATTERS MORE THAN THE OTHER FAN-OUT ROWS
+#   `.js` is the extension milestone LRC-1 ADDED to
+#   codetracer/resources/codetracer-desktop-capabilities.  Before that fix the
+#   capability file declared `record .py .rb .nr .styl .wasm`, so the launcher
+#   returned `mkNone` for `ct record app.js` and refused to route it — this
+#   recorder was unreachable through `ct` even though it worked when the core
+#   was driven directly.  This edge is the end-to-end proof of that fix.  It is
+#   wired with no skip path of any kind: if `.js` ever stops being declared, the
+#   happy-path scenario fails on `launcher exited 0 (expected '0', got '1')`
+#   and the run is red.
+#
+# WHY `discovery.method: detect-siblings`
+#   The desktop core resolves this recorder with
+#   `findTool("codetracer-js-recorder")` -- a plain PATH search (`jsRecorderExe`,
+#   codetracer/src/common/paths.nim).  `codetracer/scripts/detect-siblings.sh`
+#   already prepends this repo's `node_modules/.bin` (or the
+#   `.install-shadow/node_modules/.bin` fallback), where npm's workspace bin
+#   linking puts the `codetracer-js-recorder` -> `packages/cli/dist/index.js`
+#   shim declared by packages/cli/package.json's `bin` field.  So no extra
+#   `path-prepend` is needed -- verified, not assumed: the driver asserts the
+#   `codetracer-js-recorder` it resolved lives INSIDE this checkout.
+#
+# WHY `discovery.runtime: node`
+#   The CLI shim is `#!/usr/bin/env node`, and `crates/recorder_native` is a
+#   napi-rs addon loaded into that interpreter.  The codetracer `ci` dev shell
+#   happens to ship a nodejs today, but this edge should not depend on that
+#   coincidence: the driver takes `node` from THIS repo's own pinned dev shell,
+#   which is the one `just build` compiled the addon against.  (Honest caveat:
+#   both flakes pin the same nixpkgs nodejs today, so the resolved store path is
+#   currently identical either way -- the declaration is what makes the edge
+#   independent of the codetracer shell if that ever stops being true.  The
+#   driver hard-fails on a runtime it cannot resolve, and on one that resolves
+#   to a binary that is not flake-pinned at all.)
+#
+# WHY `recorder.default-out-dir: ct-traces`
+#   The driver proves the core passed `--out-dir` by showing this recorder did
+#   NOT write to its own default location.  `resolveRecordOptions` in
+#   packages/cli/src/record-cmd.ts resolves
+#   `--out-dir` -> `CODETRACER_JS_RECORDER_OUT_DIR` -> `./ct-traces/`, which is
+#   also what Recorder-CLI-Conventions.md §3 documents as the convention.
+#
+# WHY THE SAMPLE PRINTS ${CODETRACER_COMPONENT_DIR}
+#   It is the gate's only proof of hop 1 -- see the sample's own header and
+#   `validate_fixture()` in the driver.
+# =============================================================================
+
+schema: launcher-compat/v1
+
+recorder:
+  repo: codetracer-js-recorder
+  lang: js
+  binary: codetracer-js-recorder
+  version-prefix: "codetracer-js-recorder "
+  default-out-dir: ct-traces
+
+build:
+  # `just build` = `npm install` + `npx napi build --release` (the
+  # crates/recorder_native addon) + `npm run build` (TypeScript -> dist for
+  # every workspace).  The artifact is the compiled CLI entrypoint that
+  # node_modules/.bin/codetracer-js-recorder points at.
+  sibling-key: codetracer-js-recorder
+  artifact: packages/cli/dist/index.js
+
+discovery:
+  method: detect-siblings
+  runtime:
+    - node
+
+scenarios:
+  - id: record-js-happy-path
+    kind: record
+    command: record
+    extension: .js
+    sample: cross-repo/samples/launcher_compat_sample.js
+    recorder-flag:
+      - --out-dir
+    expect:
+      exit-code: 0
+      # NOT `*.ct`: this recorder treats `--out-dir` as a CONTAINER of
+      # recordings and writes `<out-dir>/trace-<n>/<program>.ct` (plus that
+      # recording's `files/` source bundle), where the python and ruby
+      # recorders write the `.ct` directly into the directory they are given.
+      # The glob is per-recorder in the schema precisely so a difference like
+      # this is stated rather than smoothed over -- and it still fails loudly
+      # if the recording lands anywhere else.
+      trace-glob: "trace-*/*.ct"
+      min-events: 20
+      function:
+        - accumulate
+        - describeLauncherRoute
+        - main
+      stdout-contains:
+        - "launcher-recorder-e2e: total=15"
+        - "launcher-recorder-e2e: component-dir=${CODETRACER_COMPONENT_DIR}"
+
+  - id: negative-unhandled-extension
+    kind: negative-routing
+    command: record
+    extension: .rs
+    sample: cross-repo/samples/launcher_compat_unhandled.rs
+    expect:
+      exit-code: nonzero
+      stderr-contains:
+        - "no component handles"
+        - "record"
+
+  - id: launcher-version-shape
+    kind: launcher-version
+    expect:
+      exit-code: 0
+      stdout-matches: "^ct [0-9]+\.[0-9]+"
+
+  - id: empty-component-root-breaks-routing
+    kind: isolation
+    command: record
+    extension: .js
+    sample: cross-repo/samples/launcher_compat_sample.js
+    expect:
+      exit-code: nonzero
+      stderr-contains:
+        - "no component handles"
