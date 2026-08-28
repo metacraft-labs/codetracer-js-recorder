@@ -26,7 +26,7 @@ jobs:
         # workspace-lock-pinned revisions before materialising the nix env.
         # --impure lets the dev shell pick up CODETRACER_NIM_LIB_DIR from the
         # ambient environment (it defaults to ../codetracer-trace-format-nim).
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -78,7 +78,7 @@ jobs:
           owner: metacraft-labs
 
       - name: Setup dev env
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
