@@ -57,7 +57,7 @@ jobs:
         with:
           path: codetracer-js-recorder
 
-      - uses: metacraft-labs/metacraft-github-actions/clone-repo@main
+      - uses: metacraft-labs/metacraft-github-actions/clone-repo@dev
         with:
           repo: metacraft-labs/codetracer-launcher
           ref: main
