@@ -1035,13 +1035,45 @@ export function recordCommand(args: string[]): void {
         },
       });
     } catch (err: unknown) {
-      // The child process may exit with a non-zero code but still produce a trace.
-      // We continue to check for the trace directory marker.
-      const exitErr = err as { status?: number };
-      if (exitErr.status !== undefined && exitErr.status !== 0) {
+      // The child may exit non-zero and still have produced a usable
+      // (if truncated) trace, so we keep going and finish writing it.
+      // But the recorder's OWN exit code must mirror the target's —
+      // `Recorder-CLI-Conventions.md` §6: "If the target exits with code
+      // 42, the recorder exits with code 42. This allows CI pipelines to
+      // detect target program failures."
+      //
+      // This used to only print a warning and still exit 0, which turned
+      // every caller's `status.success()` check into a silent self-pass:
+      // `codetracer/src/db-backend/tests/javascript_hcr_ctfs_integration.rs`
+      // reported success for two months against a program that died at
+      // its first `require`.
+      //
+      // `process.exitCode` rather than `process.exit()`: the `finally`
+      // block below still has to take down the `node_modules` symlink
+      // and the staging directory, and stdout still has to flush.
+      const exitErr = err as { status?: number | null; signal?: string | null };
+      if (typeof exitErr.status === "number" && exitErr.status !== 0) {
         console.error(
           `Warning: recorded program exited with code ${exitErr.status}`,
         );
+        process.exitCode = exitErr.status;
+      } else if (exitErr.signal) {
+        // Killed by a signal: there is no exit status to mirror, so use
+        // the shell's 128+N convention when the signal is one we know,
+        // and a plain failure otherwise.
+        console.error(
+          `Warning: recorded program was killed by signal ${exitErr.signal}`,
+        );
+        const signum = (os.constants.signals as Record<string, number>)[
+          exitErr.signal
+        ];
+        process.exitCode = signum === undefined ? 1 : 128 + signum;
+      } else {
+        // `execFileSync` threw without a status or a signal — the child
+        // could not be spawned at all (missing interpreter, bad cwd).
+        // That is a recorder failure, which the convention gives code 1.
+        console.error(`Error: failed to run the recorded program: ${err}`);
+        process.exitCode = 1;
       }
     }
 
