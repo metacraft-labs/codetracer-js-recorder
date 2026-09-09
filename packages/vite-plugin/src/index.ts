@@ -220,7 +220,17 @@ export function codetracerVitePlugin(
       if (isNonUserModule(path)) return null;
       if (!shouldInstrument(path, filter)) return null;
       try {
-        const result = instrument(code, { filename: path });
+        // The ids the instrumenter bakes into this module's `__ct.*`
+        // calls are resolved by indexing the MERGED manifest, so they
+        // have to be minted in the merged numbering.  Ask the
+        // accumulator where this module's block starts before
+        // instrumenting; a module numbered from zero and merged behind
+        // another one reports steps that land on the earlier module's
+        // lines.
+        const result = instrument(code, {
+          filename: path,
+          idBases: manifest.idBasesFor(path),
+        });
         // Keyed by the resolved id so an HMR re-transform replaces the
         // module's previous contribution rather than duplicating it.
         manifest.add(path, result.manifestSlice);

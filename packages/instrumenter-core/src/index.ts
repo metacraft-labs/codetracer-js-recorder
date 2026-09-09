@@ -35,6 +35,7 @@ export type {
   InstrumentOptions,
   InstrumentResult,
   ManifestSlice,
+  ManifestIdBases,
   FunctionEntry,
   SiteEntry,
 } from "@codetracer/instrumenter";

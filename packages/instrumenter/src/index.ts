@@ -1,5 +1,11 @@
 export { instrument } from "./instrument.js";
 export {
+  mergeManifestSlices,
+  nextManifestIdBases,
+  ManifestIdBaseMismatchError,
+} from "./merge.js";
+export type { MergedManifest } from "./merge.js";
+export {
   shouldInstrument,
   DEFAULT_INCLUDE,
   DEFAULT_EXCLUDE,
@@ -20,9 +26,43 @@ export type {
   PrettierOutcome,
 } from "./autoformat.js";
 
+/**
+ * Where a slice's id blocks start in the manifest it will be merged into.
+ *
+ * The instrumented code carries site and function ids as bare numeric
+ * literals (`__ct.step(20)`, `__ct.enter(2)`) and the recorder resolves
+ * them by indexing into the merged manifest's `sites` / `functions`
+ * arrays. Ids therefore have to be minted in the FINAL numbering — a
+ * merger cannot renumber them after the fact, because the emitted source
+ * has already been written.
+ *
+ * A caller that merges several slices passes the running totals of the
+ * slices it has already collected; a caller instrumenting a single file
+ * omits this entirely and gets the natural `0` / `0`.
+ *
+ * The invariant is pinned by
+ * `tests/transform/manifest-id-spaces.test.ts`.
+ */
+export interface ManifestIdBases {
+  /** Index of this slice's first entry in the merged `functions` array. */
+  functionIdBase: number;
+  /** Index of this slice's first entry in the merged `sites` array. */
+  siteIdBase: number;
+}
+
 export interface InstrumentOptions {
   /** Source file path (used for manifest and source map resolution) */
   filename: string;
+  /**
+   * Where this file's ids start in the manifest the caller will merge
+   * this slice into. Omit when the slice is the whole manifest.
+   *
+   * Getting this wrong is not a cosmetic problem: every `__ct.*` call in
+   * the emitted code carries the id, so a slice numbered from zero and
+   * then merged behind another file attributes all of its steps to that
+   * other file's lines. See {@link ManifestIdBases}.
+   */
+  idBases?: ManifestIdBases;
   /** Include/exclude globs for filtering */
   include?: string[];
   exclude?: string[];
@@ -86,6 +126,18 @@ export interface ManifestSlice {
   paths: string[];
   functions: FunctionEntry[];
   sites: SiteEntry[];
+  /**
+   * The {@link ManifestIdBases} this slice was minted with — i.e. the
+   * index its first function occupies in the merged `functions` array.
+   * `fnId` references inside {@link ManifestSlice.sites} are already
+   * expressed in that global numbering and must NOT be offset again.
+   *
+   * Optional only for backward compatibility with slices produced by
+   * pre-fix builds; absent means `0`.
+   */
+  functionIdBase?: number;
+  /** The index this slice's first site occupies in the merged `sites` array. */
+  siteIdBase?: number;
   /**
    * Original source contents keyed by source path, extracted from
    * input source maps. Used by the native addon to write files/

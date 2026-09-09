@@ -66,6 +66,39 @@ touch:
    the recording daemon. New instrumenter arguments are accepted and ignored
    here unless that protocol is extended too.
 
+## Manifest ids are minted in the MERGED numbering, never per file
+
+`__ct.step(siteId)` / `__ct.write(siteId)` / `__ct.enter(fnId)` / `__ct.ret(fnId)`
+carry their ids as **bare numeric literals in the instrumented source**, and the
+recorder resolves them by indexing the merged manifest's `sites` / `functions`
+arrays. A merge therefore cannot renumber them — the code that reports them has
+already been written.
+
+So a caller that instruments several files must ask
+`nextManifestIdBases(slicesSoFar)` **before** each `instrument()` call and pass
+it as `idBases`, then merge in the same order with `mergeManifestSlices`. That
+merge is the single implementation (`packages/instrumenter/src/merge.ts`), used
+by `record`, `instrument` and the vite plugin's `ManifestAccumulator`; it places
+each slice at its declared base and throws `ManifestIdBaseMismatchError` rather
+than mis-attributing.
+
+Until 2026-09-09 every slice was numbered from zero and the merge "repaired" it
+by offsetting `fnId` references *inside* the manifest — which made the manifest
+self-consistent and nothing else. The second file's `__ct.step(k)` still resolved
+against the first file's site `k`, so **every step recorded outside the first
+instrumented file pointed at an unrelated line of that first file**, silently.
+Pinned by `tests/transform/manifest-id-spaces.test.ts`.
+
+**This was not a corner case.** It needed no reload, no bundler and no unusual
+input — only more than one instrumented file. **Every multi-file JavaScript
+recording this recorder ever produced had wrong step attribution**, and the
+larger the first file, the more of the rest of the program it absorbed. Measured
+2026-09-09 on a two-file program with no reload of any kind (a 7-line `index.js`
+requiring a 14-line `lib.js`, recorded and decoded from the `.ct`): the six steps
+that belong to `lib.js` decoded, before the fix, as `index.js` lines 1, 6, 7, 5,
+6 plus one stray `lib.js:1`; after it, all six decode correctly as `lib.js` lines
+1, 10, 14, 10, 11, 12. Nothing errored in either run.
+
 ## Event side channels must be attached in the same `push`
 
 `EventBuffer.push` (and the runner's `pushEvent`) auto-flush when the buffer

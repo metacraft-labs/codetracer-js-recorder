@@ -198,8 +198,11 @@ export function instrument(
   const baseOffset = computeSwcBaseOffset(cleanCode, module.span.start);
   const mapper = new LineColMapper(cleanCode, baseOffset);
 
-  // Create manifest builder
-  const manifest = new ManifestBuilder();
+  // Create manifest builder.  `idBases` places this file's ids inside
+  // the manifest the caller will merge the slice into; the ids the
+  // builder mints are baked into the emitted `__ct.*` calls below and
+  // cannot be renumbered afterwards.
+  const manifest = new ManifestBuilder(options.idBases);
   const pathIndex = manifest.addPath(filename);
   // P2.3: register the per-line byte-length table for the source
   // we're instrumenting.  The native addon forwards this through
