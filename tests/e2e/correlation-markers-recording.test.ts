@@ -171,6 +171,10 @@ const MARK_LINES = FIXTURE.split("\n")
   .filter(({ text }) => /^\s*mark\(/.test(text))
   .map(({ line }) => line);
 
+/** The 1-based line of the fixture's single `cover(...)` call. */
+const COVER_LINE =
+  FIXTURE.split("\n").findIndex((text) => /^\s*cover\(/.test(text)) + 1;
+
 describe("test_correlation_markers_recorded_end_to_end", () => {
   let tmpDir: string;
   let declared: Recording;
@@ -201,6 +205,9 @@ describe("test_correlation_markers_recorded_end_to_end", () => {
       throw new Error(
         `expected 3 mark() calls in the fixture, derived ${MARK_LINES.length}`,
       );
+    }
+    if (COVER_LINE < 1) {
+      throw new Error("could not locate the fixture's cover() call");
     }
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ct-markers-"));
     declared = record(tmpDir, true);
@@ -384,50 +391,55 @@ describe("test_correlation_markers_recorded_end_to_end", () => {
     }
   });
 
-  it("attributes markers one step earlier than the index does", () => {
-    // ── KNOWN DEFECT, PINNED DELIBERATELY ──────────────────────────────
+  it("attaches each marker to the step for its own source line", () => {
+    // A marker attaches to the ENCLOSING step — the line the call sits on
+    // (contract §11a.6) — and the two places that record which step that
+    // was must agree, because a marker that reports two different
+    // coordinates is a marker whose location is undefined.
     //
-    // This asserts what the tree DOES, and what it does is wrong. Read
-    // this before changing it.
+    // Both halves of this are load-bearing and each catches a different
+    // bug, so neither is redundant:
     //
-    // A marker must attach to the enclosing step — the line the call sits
-    // on (contract §11a.6). Two coordinates record that, and they
-    // disagree:
+    //   * `geid` in `corrmark.ns` is what an indexed lookup returns.
+    //   * `step_id` on the IO event is what a consumer walking the event
+    //     stream sees, and it is the one the debugger renders a marker at.
     //
-    //   * `corrmark.ns` stores `geid = stepCount`, the index the pending
-    //     step will take. Correct.
-    //   * the IO event is registered through `registerIOEvent` with no
-    //     explicit step id, so it defaults to `stepCount - 1` — the
-    //     PREVIOUS step. One too early.
-    //
-    // The FFI's `trace_writer_register_special_event` — the entry point
-    // this recorder used before it became a binding — computes the step
-    // id explicitly for exactly this reason (issue #601, "the flow view
-    // rendered the output one source line too high"), because the C FFI
-    // BUFFERS a step so late-arriving variable values can still attach to
-    // it. `trace_writer_mark_correlation_by_id` does not do that
-    // accounting and takes no `step_id` argument, so a binding cannot
-    // supply it: the fix belongs in the shared writer, and working around
-    // it here is precisely what contract §11a.2 says not to do.
-    //
-    // When the shared writer is fixed this test goes red. That is its
-    // job: flip the assertion to `toBe(correct)` and delete this comment.
-    const correctSteps = MARK_LINES.map((l) =>
+    // Getting the second wrong by one is issue #601's failure ("the flow
+    // view rendered the output one source line too high"), and it is not
+    // hypothetical here: this recorder hit exactly that when it moved onto
+    // the shared marker API, because `register_step` only BUFFERS its step
+    // so that late-arriving values still attach to it, which means at the
+    // moment a marker is declared the step for the marker's own line has
+    // not been emitted yet and a naive `stepCount - 1` names the previous
+    // one. The shared writer now derives one step id for both coordinates
+    // (`enclosingStepId` in `codetracer_trace_writer_ffi.nim`), so this
+    // asserts they are the same number AND that the number is right.
+    const markerSteps = MARK_LINES.map((l) =>
       stepIndexOfLine(declared.bundle, l),
     );
 
-    // The index gets it right...
+    const eventSteps = markerEvents(declared.bundle)
+      .map((m) => m.step_id)
+      .sort((a, b) => a - b);
+    expect(eventSteps).toEqual([...markerSteps].sort((a, b) => a - b));
+
     const geids = declared.index.entries
       .filter((e) => e.kind === "boundary")
       .map((e) => e.geid)
       .sort((a, b) => a - b);
-    expect(geids).toEqual([...correctSteps].sort((a, b) => a - b));
+    expect(geids).toEqual(eventSteps);
+  });
 
-    // ...and the event stream is one step behind it.
-    const eventSteps = markerEvents(declared.bundle)
-      .map((m) => m.step_id)
-      .sort((a, b) => a - b);
-    expect(eventSteps).toEqual(geids.map((g) => g - 1));
+  it("attaches the span-coverage declaration to its own source line too", () => {
+    // Span coverage writes no event, so `geid` is its ONLY coordinate and
+    // nothing cross-checks it — which is exactly why it is worth pinning
+    // separately rather than assuming the boundary-crossing assertion
+    // above covers it. It goes through a different shared-writer entry
+    // point (`registerSpanCoverageHex`), and an entry point that forgot
+    // the step id would still produce a findable, correct-looking index.
+    const span = declared.index.entries.find((e) => e.kind === "span_coverage");
+    expect(span).toBeDefined();
+    expect(span?.geid).toBe(stepIndexOfLine(declared.bundle, COVER_LINE));
   });
 
   it("still records the program's own output alongside the markers", () => {

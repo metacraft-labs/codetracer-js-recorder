@@ -2119,22 +2119,23 @@ fn write_binary_trace(
             // anywhere, which is why the API lives in the writer library
             // (contract §11a.1 / §11a.2).
             //
-            // KNOWN DEFECT IN THE SHARED API, not worked around here.
-            // `mark_correlation_by_id` takes no step id and does not do
-            // the pending-step accounting that
-            // `trace_writer_register_special_event` does (issue #601): the
-            // C FFI buffers a step so late-arriving variable values can
-            // still attach to it, so at the moment a marker is written the
-            // step for the marker's own line has not been emitted yet.
-            // The marker's IO event therefore lands on the PREVIOUS step,
-            // while `corrmark.ns` records the correct one — the two
-            // coordinates for the same marker disagree by one. Contract
-            // §11a.2 says a binding that cannot be thin is a signal about
-            // the API's shape rather than something to route around, so
-            // the fix belongs in
-            // `codetracer-trace-format-nim`'s `registerCorrelationMarkerById`
-            // (an explicit `stepId`, as `registerIOEvent` already accepts).
-            // Pinned by `tests/e2e/correlation-markers-recording.test.ts`.
+            // Step attribution is the shared writer's job and needs no
+            // argument from here: its C ABI derives the enclosing step
+            // itself (`enclosingStepId` in
+            // `codetracer_trace_writer_ffi.nim`) and feeds that one number
+            // to both the `MarkerPayload` event's `step_id` and the
+            // index entry's `geid`, so the two coordinates for a marker
+            // cannot disagree.
+            //
+            // Worth knowing WHY that is not simply `stepCount - 1`, since
+            // it is what this binding depends on: `register_step` only
+            // BUFFERS its step so that values registered afterwards still
+            // attach to it, so at the moment a marker is declared the step
+            // for the marker's own line has not been emitted yet.
+            // Subtracting one names the PREVIOUS step — issue #601, the
+            // flow view rendering output a source line too high. Pinned
+            // from this side by
+            // `tests/e2e/correlation-markers-recording.test.ts`.
             TraceEvent::CorrelationMarker(cm) => {
                 // The numeric-id call is the primary one (§11a.4): the
                 // label is interned ONCE per distinct boundary and the
