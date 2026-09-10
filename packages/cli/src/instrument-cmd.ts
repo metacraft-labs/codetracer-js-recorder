@@ -322,11 +322,23 @@ function buildBrowserRuntimeStub(endpoint: string, manifest: unknown): string {
       return value;
     },
     write: function (siteId) { enqueue({ kind: "Assignment", siteId: siteId }); },
-    markCorrelation: function (direction, boundary, key, payload) {
+    markCorrelation: function (direction, boundary, key, payload, showText) {
       var evt = { kind: "CorrelationMarker", direction: direction, boundary: boundary, key: key };
       if (payload !== undefined) evt.payload = payload;
+      // showText names the binding a cross-process origin chain resumes
+      // its walk on in the sending recording; dropping it leaves the
+      // marker visible with its history unreachable.  The daemon's
+      // CorrelationMarker message already carries it (see
+      // packages/runtime-browser/src/index.ts).
+      if (showText !== undefined) evt.showText = showText;
       enqueue(evt);
     },
+    // Accepted and dropped: span coverage is written into corrmark.ns by
+    // the CTFS writer at close, and this stub has no writer — it speaks
+    // the daemon's message protocol, which has no span-coverage message
+    // yet.  Accepting it keeps a page instrumented by the same pass from
+    // throwing where a Node program records.
+    markSpanCoverage: function () {},
     flush: flush,
     stop: function () {
       if (stopped) return;

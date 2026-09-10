@@ -224,7 +224,135 @@ export type CtFullEvent =
       text?: string;
       bytes_b64: string;
       bytes_len: number;
+      /**
+       * The event's raw metadata slot, when it has one.  Ordinary program
+       * output puts the sink name here; a correlation marker puts a whole
+       * `MarkerPayload` JSON document.
+       */
+      metadata?: string;
+      /**
+       * The decoded `MarkerPayload`, present only when the metadata slot
+       * holds one.  `boundary_id` / `direction` / `key_value` are ALSO
+       * hoisted to the top level of the event (below) so a marker is
+       * greppable without decoding the slot.
+       */
+      correlation_marker?: CtMarkerPayload;
+      boundary_id?: string;
+      direction?: string;
+      key_value?: string;
     };
+
+/**
+ * The `MarkerPayload` document a correlation marker rides in.
+ *
+ * Written by the shared CTFS writer (`registerCorrelationMarkerById` in
+ * `codetracer-trace-format-nim`), NOT by any individual recorder — the
+ * field names are a wire contract with `db-backend`'s
+ * `correlation_markers.rs`, and a recorder whose names drifted would write
+ * markers that are invisible rather than broken.
+ */
+export interface CtMarkerPayload {
+  /** The interned boundary-label id the correlation index keys on. */
+  marker_id: number;
+  /** The boundary label, as text, for the debugger. */
+  boundary_id: string;
+  /** `"send"` or `"recv"` — anything else is normalised to `"send"`. */
+  direction: string;
+  /** The name the key was read under. */
+  key_text: string;
+  /** The correlation key; pairing is string equality on this. */
+  key_value: string;
+  /**
+   * The name the shown value's binding had on the recording side.  A
+   * cross-process origin chain resumes its walk on this name, so a marker
+   * that carries the placeholder `"show"` instead of a real binding name
+   * is visible with its history unreachable.
+   */
+  show_text?: string;
+  /** The shown value, already stringified by the recorder. */
+  show_value?: string;
+  /** Optional human-readable description of the hop. */
+  description?: string;
+}
+
+/**
+ * One entry of the recording's correlation index (`corrmark.ns`), as
+ * `ct-print --correlation-index --json-out` reports it.
+ *
+ * Boundary crossings and span-coverage declarations share the index and
+ * are told apart by `kind` — see
+ * `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md` §10.2.
+ */
+export type CtCorrelationIndexEntry =
+  | {
+      kind: "span_coverage";
+      trace_id: string;
+      span_id: string;
+      wall_time_unix_ns: number;
+      monotonic_time_ns: number;
+      geid: number;
+      thread_id: number;
+      exit: boolean;
+    }
+  | {
+      kind: "boundary";
+      marker_id: number;
+      wall_time_unix_ns: number;
+      monotonic_time_ns: number;
+      geid: number;
+      thread_id: number;
+      exit: boolean;
+    };
+
+/**
+ * The correlation index as reported by ct-print.
+ *
+ * `correlation_index` distinguishes a recording that was never indexed
+ * (`"absent"` — it says nothing about any span) from one that was indexed
+ * and covers nothing (`"present"` with no entries).  Collapsing the two
+ * into "0 entries" is what the contract's §9 exists to prevent.
+ */
+export interface CtCorrelationIndex {
+  correlation_index: "present" | "absent";
+  entries: CtCorrelationIndexEntry[];
+}
+
+/**
+ * Read a recording's correlation index via
+ * `ct-print --correlation-index --json-out`.
+ *
+ * THE ONLY VIEW OF SPAN COVERAGE: a span-coverage declaration writes no
+ * `MarkerPayload` and no event, so without this a recorder that declared
+ * coverage and one that dropped the call produce byte-identical output.
+ */
+export function ctPrintCorrelationIndex(ctFile: string): CtCorrelationIndex {
+  const bin = ctPrintPath();
+  const stdout = execFileSync(
+    bin,
+    ["--correlation-index", "--json-out", ctFile],
+    { encoding: "utf-8", timeout: 30000 },
+  );
+  return JSON.parse(stdout) as CtCorrelationIndex;
+}
+
+/**
+ * The same report in its textual form.
+ *
+ * Needed alongside {@link ctPrintCorrelationIndex} for one specific
+ * reason: the index stores nanosecond timestamps as u64, and
+ * `JSON.parse` turns those into JS numbers, which stop being exact above
+ * 9.0e15 — so a test that asserted an exact nanosecond timestamp through
+ * the JSON view would be asserting on a rounded value and could not tell
+ * a precision bug from a correct recorder.  The text view prints the
+ * digits verbatim.
+ */
+export function ctPrintCorrelationIndexText(ctFile: string): string {
+  const bin = ctPrintPath();
+  return execFileSync(bin, ["--correlation-index", ctFile], {
+    encoding: "utf-8",
+    timeout: 30000,
+  });
+}
 
 /**
  * One alternate source view as surfaced by `ct-print --full` under the
@@ -266,6 +394,18 @@ export interface CtFullBundle {
        * (Alternate Source Views, P6.2 → canonical migration).
        */
       has_alternate_source_views?: boolean;
+      /**
+       * `meta.dat` bit 14 — the recording carries a `corrmark.ns`
+       * correlation index.
+       *
+       * A stream-presence HINT, not a gate: the container's file entry is
+       * the authority. Its value is that a consumer can tell "never
+       * indexed" from "indexed and covers nothing" without opening the
+       * namespace. See
+       * `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`
+       * §9 and §12.
+       */
+      has_correlation_index?: boolean;
     };
   };
   paths: string[];
