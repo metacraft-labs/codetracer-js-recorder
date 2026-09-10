@@ -395,7 +395,7 @@ export interface CtFullBundle {
        */
       has_alternate_source_views?: boolean;
       /**
-       * `meta.dat` bit 14 — the recording carries a `corrmark.ns`
+       * `meta.dat` bit 15 — the recording carries a `corrmark.ns`
        * correlation index.
        *
        * A stream-presence HINT, not a gate: the container's file entry is
