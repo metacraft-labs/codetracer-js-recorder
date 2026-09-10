@@ -61,6 +61,29 @@ function stringifyCorrelationKey(key: unknown): string {
   }
 }
 
+/**
+ * Render a nanosecond timestamp as the decimal string the wire carries.
+ *
+ * Nanoseconds since the Unix epoch are ~1.8e18, and JavaScript numbers
+ * stop being exact above 9.0e15, so the value crosses into the addon as
+ * text rather than as a JSON number: a `bigint` (what a
+ * `process.hrtime.bigint()` / OTel-style clock hands you) keeps every
+ * digit, and a plain `number` at least does not lose *more* on the way.
+ *
+ * Never throws — a bad timestamp must not take a marker down with it, so
+ * anything unrecognisable becomes `"0"` and the declaration is still
+ * written with its ids intact, which is what the index keys on.
+ */
+function stringifyNanoTimestamp(value: number | bigint | string): string {
+  if (typeof value === "bigint") return value < 0n ? "0" : value.toString();
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) return "0";
+    return Math.trunc(value).toFixed(0);
+  }
+  if (typeof value === "string" && /^[0-9]+$/.test(value)) return value;
+  return "0";
+}
+
 // ── Value encoding ──────────────────────────────────────────────────
 
 /** Maximum string length before truncation. */
@@ -615,6 +638,45 @@ export interface CtRuntime {
   ): void;
 
   /**
+   * Declare that this recording covers a distributed-trace span.
+   *
+   * The other half of cross-process debugging, and the one an
+   * observability stack drives: a consumer holding an OTel
+   * `(trace_id, span_id)` pair — from a Jaeger link, a Grafana data link,
+   * a failing request's `traceparent` — can then decide whether this
+   * recording covers that span with a single index lookup, instead of
+   * downloading and decoding the trace to find out.
+   *
+   * ```js
+   * const ctx = otelSpan.spanContext();
+   * __ct.markSpanCoverage(ctx.traceId, ctx.spanId, wallNs, monoNs);
+   * ```
+   *
+   * This is NOT a correlation marker and does not pair with anything: a
+   * span has no send/recv sense and no pairing domain. Both kinds land in
+   * the same `corrmark.ns` index under different kind discriminators —
+   * see `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`
+   * §10.2.
+   *
+   * Never throws, and mints no step, exactly like {@link markCorrelation}.
+   *
+   * @param traceIdHex 32 hex characters, either case.
+   * @param spanIdHex 16 hex characters, either case.
+   * @param wallTimeUnixNs Wall-clock nanoseconds since the Unix epoch.
+   *   Accepts a `bigint` or a decimal string as well as a `number`,
+   *   because that count exceeds `Number.MAX_SAFE_INTEGER` — a plain
+   *   `Date.now() * 1e6` has already lost its low digits by the time it
+   *   gets here.
+   * @param monotonicTimeNs Monotonic-clock nanoseconds, same accepted forms.
+   */
+  markSpanCoverage(
+    traceIdHex: string,
+    spanIdHex: string,
+    wallTimeUnixNs: number | bigint | string,
+    monotonicTimeNs: number | bigint | string,
+  ): void;
+
+  /**
    * Enable async context tracking.
    *
    * Once enabled, the runtime will automatically emit ThreadStart and
@@ -728,6 +790,12 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
         _key: unknown,
         _payload?: unknown,
         _showText?: string,
+      ): void {},
+      markSpanCoverage(
+        _traceIdHex: string,
+        _spanIdHex: string,
+        _wallTimeUnixNs: number | bigint | string,
+        _monotonicTimeNs: number | bigint | string,
       ): void {},
       enableAsyncTracking(): void {},
       disableAsyncTracking(): void {},
@@ -866,6 +934,7 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
         // line without the instrumenter needing to mint a site for it.
         buffer.push(EVENT_MARKER, 0, {
           marker: {
+            kind: "correlation",
             direction,
             boundary,
             key: stringifyCorrelationKey(key),
@@ -874,6 +943,33 @@ export function createRuntime(opts: CreateRuntimeOptions = {}): CtRuntime {
                 ? undefined
                 : stringifyCorrelationKey(payload),
             showText,
+          },
+        });
+      } catch {
+        // Never crash the user's program
+      }
+    },
+
+    markSpanCoverage(
+      traceIdHex: string,
+      spanIdHex: string,
+      wallTimeUnixNs: number | bigint | string,
+      monotonicTimeNs: number | bigint | string,
+    ): void {
+      try {
+        asyncTracker.checkContext(buffer);
+        // Like a correlation marker this carries no site id and mints no
+        // step: it is a fact about the whole recording, and inserting an
+        // exec-stream event no user code executed would shift every
+        // later step index — which is what spans' start_step / end_step
+        // are measured in.
+        buffer.push(EVENT_MARKER, 0, {
+          marker: {
+            kind: "spanCoverage",
+            traceId: String(traceIdHex),
+            spanId: String(spanIdHex),
+            wallTimeUnixNs: stringifyNanoTimestamp(wallTimeUnixNs),
+            monotonicTimeNs: stringifyNanoTimestamp(monotonicTimeNs),
           },
         });
       } catch {

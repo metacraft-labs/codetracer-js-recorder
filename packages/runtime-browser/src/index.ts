@@ -503,6 +503,27 @@ export interface CtBrowserRuntime {
     payload?: unknown,
     showText?: string,
   ): void;
+  /**
+   * Declare that this recording covers a distributed-trace span.
+   *
+   * Accepted so a page instrumented by the same pass loads and runs
+   * unchanged, and then **dropped**: span coverage is written into
+   * `corrmark.ns` by the CTFS writer at close, and this runtime does not
+   * own a writer — it speaks a message-based protocol to the recording
+   * daemon, whose vocabulary has no span-coverage message. Extending it
+   * is a wire-protocol change of its own, exactly as it is for the M37
+   * per-step locals `step()` already drops.
+   *
+   * This is the same silent-acceptance shape `markCorrelation` had before
+   * the daemon protocol grew `CorrelationMarker`, and it is deliberate:
+   * the alternative is a page that throws where a Node program records.
+   */
+  markSpanCoverage(
+    traceIdHex: string,
+    spanIdHex: string,
+    wallTimeUnixNs: number | bigint | string,
+    monotonicTimeNs: number | bigint | string,
+  ): void;
   /** Force any buffered events to be flushed to the transport. */
   flush(): void;
   /**
@@ -727,6 +748,15 @@ export function createBrowserRuntime(
       if (showText !== undefined) evt.showText = showText;
       enqueue(evt);
     },
+    markSpanCoverage(
+      _traceIdHex: string,
+      _spanIdHex: string,
+      _wallTimeUnixNs: number | bigint | string,
+      _monotonicTimeNs: number | bigint | string,
+    ): void {
+      // Accepted and dropped — see the interface declaration for why the
+      // daemon transport cannot carry it yet.
+    },
     flush(): void {
       flushNow();
     },
@@ -763,6 +793,7 @@ function noopRuntime(endpoint = ""): CtBrowserRuntime {
     write(): void {},
     value(): void {},
     markCorrelation(): void {},
+    markSpanCoverage(): void {},
     flush(): void {},
     stop(): void {},
     get bufferedCount() {

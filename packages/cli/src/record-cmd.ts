@@ -474,6 +474,20 @@ function _ctStringifyKey(key) {
   }
 }
 
+// Nanosecond timestamps cross into the addon as DECIMAL STRINGS: ns since
+// the Unix epoch is ~1.8e18 and JS numbers stop being exact above 9.0e15,
+// so a JSON number would silently corrupt the low digits.  Mirrors
+// stringifyNanoTimestamp() in packages/runtime/src/runtime.ts.
+function _ctStringifyNanos(value) {
+  if (typeof value === "bigint") return value < 0n ? "0" : value.toString();
+  if (typeof value === "number") {
+    if (!isFinite(value) || value < 0) return "0";
+    return Math.trunc(value).toFixed(0);
+  }
+  if (typeof value === "string" && /^[0-9]+$/.test(value)) return value;
+  return "0";
+}
+
 function flushBuffer() {
   if (bufLen === 0) return;
   try {
@@ -627,17 +641,35 @@ globalThis.__ct = {
   // own code calls this at a boundary crossing; CodeTracer runs no
   // protocol shims, so this call is the only thing that tells the
   // debugger which identifier correlates two processes.  The addon
-  // lowers it into a tracepoint Event whose metadata carries the full
-  // MarkerPayload the db-backend's correlation index decodes.
+  // forwards it to the shared CTFS writer, which builds the
+  // MarkerPayload the db-backend's correlation index decodes and indexes
+  // the marker into corrmark.ns.
   markCorrelation: function(direction, boundary, key, payload, showText) {
     try {
       checkAsyncContext();
       pushEvent(8, 0, undefined, undefined, {
+        kind: "correlation",
         direction: direction === "recv" || direction === "receive" ? "recv" : "send",
         boundary: String(boundary),
         key: _ctStringifyKey(key),
         payload: payload === undefined ? undefined : _ctStringifyKey(payload),
         showText: showText,
+      });
+    } catch(e) {}
+  },
+  // Declare that this recording covers a distributed-trace span.  Shares
+  // the EVENT_MARKER slot with markCorrelation but not its shape: a span
+  // has no send/recv sense and no pairing domain, so it lands in
+  // corrmark.ns under a different kind discriminator.
+  markSpanCoverage: function(traceIdHex, spanIdHex, wallTimeUnixNs, monotonicTimeNs) {
+    try {
+      checkAsyncContext();
+      pushEvent(8, 0, undefined, undefined, {
+        kind: "spanCoverage",
+        traceId: String(traceIdHex),
+        spanId: String(spanIdHex),
+        wallTimeUnixNs: _ctStringifyNanos(wallTimeUnixNs),
+        monotonicTimeNs: _ctStringifyNanos(monotonicTimeNs),
       });
     } catch(e) {}
   },

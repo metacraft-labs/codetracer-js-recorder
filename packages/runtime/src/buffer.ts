@@ -18,11 +18,11 @@
  *                   addon resolves it to the manifest's write-site
  *                   metadata and synthesises a `BindVariable +
  *                   Assignment` pair into the trace stream)
- *   8 = marker (M25 correlation marker placed by user code at a
- *               boundary crossing; the native addon writes it as a
- *               tracepoint `Event` whose metadata carries the full
- *               `MarkerPayload` the db-backend's correlation index
- *               decodes)
+ *   8 = marker (M25 declaration placed by user code — either a
+ *               correlation marker at a boundary crossing or a
+ *               span-coverage declaration; the native addon forwards
+ *               both to the shared CTFS writer, which builds the
+ *               `MarkerPayload` and indexes them into `corrmark.ns`)
  */
 
 /** Numeric event kind codes matching the instrumenter output. */
@@ -96,7 +96,9 @@ export interface WriteEntry {
  *
  * See `codetracer-specs/GUI/Debugging-Features/Correlation-Markers.md`.
  */
-export interface MarkerEntry {
+export interface CorrelationMarkerEntry {
+  /** Discriminates the two kinds the correlation index holds. */
+  kind: "correlation";
   /** Index of the event in the batch this marker belongs to. */
   eventIndex: number;
   /** `"send"` at the point the value leaves, `"recv"` where it arrives. */
@@ -119,6 +121,59 @@ export interface MarkerEntry {
   showText?: string;
 }
 
+/**
+ * A span-coverage declaration associated with an `EVENT_MARKER` event.
+ *
+ * It says "this recording covers that OTel span", so a consumer holding a
+ * `(trace_id, span_id)` pair can decide whether to fetch the recording
+ * with one index lookup instead of decoding the event stream.
+ *
+ * It deliberately shares the marker side channel with
+ * {@link CorrelationMarkerEntry} but NOT its shape: a span has no
+ * send/recv sense and no pairing domain, so forcing it into a
+ * `MarkerPayload` would make the pair index try to pair spans with each
+ * other. See
+ * `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md` §10.2 —
+ * one namespace, two kinds.
+ */
+export interface SpanCoverageMarkerEntry {
+  /** Discriminates the two kinds the correlation index holds. */
+  kind: "spanCoverage";
+  /** Index of the event in the batch this declaration belongs to. */
+  eventIndex: number;
+  /** 32 hex characters, either case (the OTel wire rendering). */
+  traceId: string;
+  /** 16 hex characters, either case. */
+  spanId: string;
+  /**
+   * Wall-clock nanoseconds since the Unix epoch, as a DECIMAL STRING.
+   *
+   * Not a number: that count is ~1.8e18 today, well past
+   * `Number.MAX_SAFE_INTEGER` (9.0e15), so carrying it as a JSON number
+   * would silently corrupt the low digits of every timestamp on the way
+   * to the addon.
+   */
+  wallTimeUnixNs: string;
+  /** Monotonic-clock nanoseconds, as a decimal string (see above). */
+  monotonicTimeNs: string;
+}
+
+/** Either kind of entry carried by the `EVENT_MARKER` side channel. */
+export type MarkerEntry = CorrelationMarkerEntry | SpanCoverageMarkerEntry;
+
+/**
+ * A marker attachment as the caller supplies it — the same union with
+ * `eventIndex` removed from each member.
+ *
+ * Spelled member-by-member rather than as `Omit<MarkerEntry,
+ * "eventIndex">`: `Omit` over a union collapses it to the keys the
+ * members share, which would erase every field that distinguishes the
+ * two kinds.
+ */
+export type MarkerAttachment =
+  | Omit<CorrelationMarkerEntry, "eventIndex">
+  | Omit<SpanCoverageMarkerEntry, "eventIndex">;
+
 /** A flushed batch — a snapshot of the typed arrays at flush time. */
 export interface EventBatch {
   /** Event kind per slot (0=step, 1=enter, 2=ret, 3=write, 4=thread_start, 5=thread_switch, 6=thread_exit). */
@@ -131,7 +186,7 @@ export interface EventBatch {
   values: ValueEntry[];
   /** Captured writes for write events (console output). */
   writes: WriteEntry[];
-  /** Captured correlation markers for marker events. */
+  /** Captured correlation / span-coverage markers for marker events. */
   markers: MarkerEntry[];
 }
 
@@ -154,8 +209,8 @@ export interface EventAttachments {
   value?: Omit<ValueEntry, "eventIndex">;
   /** Console output for write events. */
   write?: Omit<WriteEntry, "eventIndex">;
-  /** Correlation payload for marker events. */
-  marker?: Omit<MarkerEntry, "eventIndex">;
+  /** Correlation / span-coverage payload for marker events. */
+  marker?: MarkerAttachment;
 }
 
 /**

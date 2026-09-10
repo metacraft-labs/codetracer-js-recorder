@@ -117,17 +117,55 @@ function record(options: RecordOptions = {}): Recording {
   const args = ["record", DEMO_APP, "-o", outDir];
   if (options.columnAware === false) args.push("--no-column-aware");
 
-  const stdout = execFileSync(process.execPath, [CLI_PATH, ...args], {
-    cwd: PROJECT_ROOT,
-    encoding: "utf-8",
-    env: {
-      ...process.env,
-      CT_EXPRESS_REQUESTS: JSON.stringify(
-        options.schedule ?? REQUIRED_SCHEDULE,
-      ),
-      CT_EXPRESS_CONCURRENT: options.concurrent ? "1" : "0",
-    },
-  });
+  // `timeout` + `killSignal` are what make a wedged recording a FAILURE
+  // instead of a hang. `execFileSync` blocks the event loop, so without a
+  // timeout vitest cannot interrupt it and its own per-test timeout never
+  // fires: the whole run wedges, and the only signal is the runner being
+  // killed from outside with rc 124 and nothing else. That is the exact shape
+  // `codetracer-specs/Testing/Verification-Harness-Traps.md` names — "a hang
+  // arm is one whose rc is 124 and nothing else" — and it made this repo's
+  // `just test` unable to complete at all, so no change to the recorder could
+  // be verified through it.
+  //
+  // Measured: the recorded express child sits in `epoll_wait` at 0% CPU
+  // indefinitely. 120 s is far above the ~10 s a healthy recording takes, so
+  // this cannot turn a slow machine into a red test; it only bounds the wedge.
+  // SIGKILL rather than SIGTERM because the child being waited on is a
+  // recorded process that may not be servicing signals.
+  let stdout: string;
+  try {
+    stdout = execFileSync(process.execPath, [CLI_PATH, ...args], {
+      cwd: PROJECT_ROOT,
+      encoding: "utf-8",
+      timeout: 120_000,
+      killSignal: "SIGKILL",
+      env: {
+        ...process.env,
+        CT_EXPRESS_REQUESTS: JSON.stringify(
+          options.schedule ?? REQUIRED_SCHEDULE,
+        ),
+        CT_EXPRESS_CONCURRENT: options.concurrent ? "1" : "0",
+      },
+    });
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException & {
+      signal?: string;
+      stdout?: string;
+      stderr?: string;
+    };
+    // Say which of the two it was. A timeout and a non-zero exit are different
+    // defects, and reporting both as "the recording failed" is what sends the
+    // next reader looking in the wrong place.
+    const cause =
+      err.signal === "SIGKILL" || err.code === "ETIMEDOUT"
+        ? "TIMED OUT after 120s (the recorded process wedged; it does not exit)"
+        : `exited non-zero (${err.code ?? "unknown"})`;
+    throw new Error(
+      `codetracer record ${args.join(" ")} ${cause}\n` +
+        `stdout:\n${err.stdout ?? "(none)"}\n` +
+        `stderr:\n${err.stderr ?? "(none)"}`,
+    );
+  }
 
   const traceDirs = fs
     .readdirSync(outDir)

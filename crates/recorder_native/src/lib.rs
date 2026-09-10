@@ -250,48 +250,87 @@ struct WriteEntryInput {
     content: String,
 }
 
-/// An M25 correlation-marker entry deserialized from the JS side.
+/// A marker-side-channel entry deserialized from the JS side.
 ///
-/// Mirrors `MarkerEntry` in `packages/runtime/src/buffer.ts`.
+/// Mirrors `MarkerEntry` in `packages/runtime/src/buffer.ts`, and is
+/// internally tagged by `kind` so the one side channel carries both
+/// marker kinds the correlation index knows about — see
+/// `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md` §10.2
+/// ("one namespace, two kinds"): a boundary crossing has a pairing
+/// domain and a direction, a span-coverage declaration has neither.
+///
+/// The tag is REQUIRED rather than defaulted. Both producers of this
+/// JSON (`packages/runtime/src/runtime.ts` and the runner
+/// `packages/cli/src/record-cmd.ts` emits) ship in the same package as
+/// this addon, so a missing tag can only mean a version skew — and a
+/// skew that silently decoded as "correlation" would write markers with
+/// an empty boundary, which is invisible rather than broken.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MarkerEntryInput {
-    event_index: usize,
-    direction: String,
-    boundary: String,
-    key: String,
-    #[serde(default)]
-    payload: Option<String>,
-    /// Name of the binding the value came from on this side of the
-    /// boundary. A cross-process origin chain resumes its walk on this
-    /// name in the sending recording.
-    #[serde(default)]
-    show_text: Option<String>,
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum MarkerEntryInput {
+    /// `Correlation-Markers.md` §2.4 — a value crossed a process boundary.
+    #[serde(rename_all = "camelCase")]
+    Correlation {
+        /// Index of the event in the batch this marker belongs to.
+        event_index: usize,
+        direction: String,
+        boundary: String,
+        key: String,
+        #[serde(default)]
+        payload: Option<String>,
+        /// Name of the binding the value came from on this side of the
+        /// boundary. A cross-process origin chain resumes its walk on this
+        /// name in the sending recording.
+        #[serde(default)]
+        show_text: Option<String>,
+    },
+    /// This recording covers a distributed-trace span.
+    #[serde(rename_all = "camelCase")]
+    SpanCoverage {
+        /// Index of the event in the batch this declaration belongs to.
+        event_index: usize,
+        /// 32 hex characters, either case (the OTel wire rendering).
+        trace_id: String,
+        /// 16 hex characters, either case.
+        span_id: String,
+        /// Decimal-string nanoseconds. NOT a JSON number: nanoseconds
+        /// since the Unix epoch are ~1.8e18, well past JavaScript's
+        /// `Number.MAX_SAFE_INTEGER` (9.0e15), so a numeric round-trip
+        /// would silently corrupt the low digits of every timestamp.
+        wall_time_unix_ns: String,
+        /// Decimal-string nanoseconds, as above.
+        monotonic_time_ns: String,
+    },
 }
 
-/// The `metadata` document a correlation marker rides in.
+impl MarkerEntryInput {
+    /// The batch-relative event index this entry attaches to.
+    fn event_index(&self) -> usize {
+        match self {
+            MarkerEntryInput::Correlation { event_index, .. } => *event_index,
+            MarkerEntryInput::SpanCoverage { event_index, .. } => *event_index,
+        }
+    }
+}
+
+/// Parse a decimal nanosecond timestamp handed over as a string.
 ///
-/// This is a **wire contract** with the db-backend: its
-/// `SessionHandler::pair_index` calls
-/// `MarkerPayload::decode(&event.metadata)` and silently skips any
-/// tracepoint firing that does not deserialize into the complete
-/// struct. A marker written with a partial or differently-named
-/// document is therefore not a degraded marker — it is an invisible
-/// one, and no cross-process origin chain can cross that boundary.
-///
-/// Field names and types must match `MarkerPayload` in
-/// `codetracer/src/db-backend/src/correlation_markers.rs`.
-#[derive(Debug, Clone, Serialize)]
-struct MarkerPayloadOut {
-    marker_id: usize,
-    boundary_id: String,
-    direction: String,
-    key_text: String,
-    key_value: String,
-    show_text: Option<String>,
-    show_value: Option<String>,
-    description: Option<String>,
-    format: Option<serde_json::Value>,
+/// Returns 0 (and warns) on anything unparseable rather than dropping the
+/// declaration: the `(trace_id, span_id)` pair is what the correlation
+/// index keys on, so a recording whose coverage entry is present with a
+/// zero timestamp is still findable, while a dropped entry is a recording
+/// that silently claims to cover nothing.
+fn parse_nanos(field: &str, raw: &str) -> u64 {
+    match raw.parse::<u64>() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!(
+                "[codetracer-js-recorder] span coverage: {field} is not a decimal \
+                 nanosecond count ({raw:?}); recording it as 0",
+            );
+            0
+        }
+    }
 }
 
 // ── TraceLowLevelEvent-compatible types (serialized to JSON) ─────────
@@ -348,6 +387,12 @@ impl TypeKind {
 /// Only the variants the JS recorder actually emits are listed.  Discriminants
 /// match the upstream `codetracer_trace_types::EventLogKind` so the JSON
 /// trace's numeric `kind` survives round-tripping through db-backend.
+///
+/// Correlation markers used to ride a third variant (`TraceLogEvent`) here,
+/// because this recorder built their `MarkerPayload` itself. They now go
+/// through the shared writer's `mark_correlation_by_id`, which owns both
+/// the payload and the event kind it rides — so program output is all that
+/// is left on this path.
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 enum EventLogKind {
@@ -355,14 +400,6 @@ enum EventLogKind {
     Write = 0,
     /// `WriteOther` — stderr-style program output (console.warn / console.error).
     WriteOther = 2,
-    /// `TraceLogEvent` — the tracepoint channel. Correlation markers
-    /// ride this kind; the db-backend recognises them by decoding a
-    /// `MarkerPayload` out of the event's metadata slot.
-    ///
-    /// The discriminant must match `EventLogKind::TraceLogEvent` in
-    /// `codetracer_trace_types` (and the `EVENT_KIND_TRACE_LOG_EVENT`
-    /// constant the browser recorder writes).
-    TraceLogEvent = 12,
 }
 
 impl Serialize for EventLogKind {
@@ -524,6 +561,55 @@ enum TraceEvent {
     ThreadStart(u64),
     ThreadSwitch(u64),
     ThreadExit(u64),
+    /// M25 correlation marker, buffered until replay.
+    ///
+    /// It is a first-class buffered event rather than a pre-rendered
+    /// `Event(RecordEvent)` because the payload is no longer this
+    /// recorder's to build: replay forwards the fields to the shared
+    /// writer's `mark_correlation_by_id`, which constructs the
+    /// `MarkerPayload` and indexes the marker into `corrmark.ns`.
+    CorrelationMarker(CorrelationMarkerRecord),
+    /// A declaration that this recording covers a distributed-trace span.
+    SpanCoverage(SpanCoverageRecord),
+}
+
+/// A boundary crossing, normalised and ready to hand to the shared writer.
+///
+/// Every field is already-stringified UTF-8: the shared library never
+/// calls back into the host to render a value, so the conversion has
+/// happened on the JS side, before any writer lock is taken.
+#[derive(Debug, Clone, Serialize)]
+struct CorrelationMarkerRecord {
+    /// The pairing domain both sides of the crossing name.
+    boundary: String,
+    /// Already normalised to `"send"` or `"recv"` (see `append_events`).
+    direction: String,
+    /// The correlation key; pairing is string equality on this.
+    key_value: String,
+    /// The shown value, or empty when the caller supplied none.
+    show_value: String,
+    /// The NAME the key was read under.
+    key_text: String,
+    /// The NAME the shown value's binding had on this side. Load-bearing:
+    /// a cross-process origin chain resumes its walk on this name in the
+    /// sending recording, so a marker that drops it is visible with its
+    /// history unreachable.
+    show_text: String,
+    /// Optional human-readable description of the hop; empty when absent.
+    description: String,
+}
+
+/// A span-coverage declaration, buffered until replay.
+///
+/// The ids stay in their hex rendering all the way to
+/// `mark_span_coverage_hex`: the hex→bytes conversion lives in the shared
+/// library so it has one implementation rather than one per recorder.
+#[derive(Debug, Clone, Serialize)]
+struct SpanCoverageRecord {
+    trace_id_hex: String,
+    span_id_hex: String,
+    wall_time_unix_ns: u64,
+    monotonic_time_ns: u64,
 }
 
 // Trace metadata previously serialised to `trace_metadata.json` is now
@@ -1211,16 +1297,30 @@ pub fn append_events(
         write_map.insert(entry.event_index, entry);
     }
 
-    // Parse markers JSON — an array of MarkerEntryInput objects
+    // Parse markers JSON — an array of MarkerEntryInput objects.
+    //
+    // Unlike the value / write side channels above this reports a parse
+    // failure instead of defaulting to an empty batch: a marker is a
+    // deliberate declaration by user code, and dropping the whole batch
+    // in silence is exactly the "invisible rather than broken" failure
+    // the shared marker API exists to prevent.
     let marker_entries: Vec<MarkerEntryInput> = match &markers_json {
-        Some(json) if !json.is_empty() && json != "[]" => {
-            serde_json::from_str(json).unwrap_or_default()
-        }
+        Some(json) if !json.is_empty() && json != "[]" => match serde_json::from_str(json) {
+            Ok(entries) => entries,
+            Err(err) => {
+                eprintln!(
+                    "[codetracer-js-recorder] could not decode the correlation-marker \
+                     side channel ({err}); {} bytes of markers were dropped from this batch",
+                    json.len(),
+                );
+                vec![]
+            }
+        },
         _ => vec![],
     };
     let mut marker_map: HashMap<usize, &MarkerEntryInput> = HashMap::new();
     for entry in &marker_entries {
-        marker_map.insert(entry.event_index, entry);
+        marker_map.insert(entry.event_index(), entry);
     }
 
     let kinds = event_kinds.as_ref();
@@ -1500,53 +1600,73 @@ pub fn append_events(
                     },
                 ));
             }
-            // M25 correlation marker -> tracepoint Event carrying a
-            // full MarkerPayload in its metadata slot.
+            // M25 marker slot — a correlation marker or a span-coverage
+            // declaration, buffered for the shared writer to lower at
+            // replay.  Nothing here constructs a payload: that moved into
+            // the CTFS writer library so the ~20 recorders cannot drift
+            // (contract §11a.1).
             8 => {
                 let Some(marker) = marker_map.get(&i) else {
                     continue;
                 };
-                // Normalise the direction to the two tokens the
-                // db-backend's `MarkerDirection` deserialises. Anything
-                // else would decode to `None` and silently vanish from
-                // the pair index, so we default to "send" rather than
-                // writing an unpairable marker.
-                let direction = match marker.direction.as_str() {
-                    "recv" | "receive" => "recv",
-                    _ => "send",
-                };
-                let payload = MarkerPayloadOut {
-                    marker_id: 0,
-                    boundary_id: marker.boundary.clone(),
-                    direction: direction.to_string(),
-                    key_text: "key".to_string(),
-                    key_value: marker.key.clone(),
-                    // `show_text` names the binding the walk continues
-                    // on after crossing this boundary; without it the
-                    // debugger has nothing to resume from and the chain
-                    // stops at the boundary.
-                    show_text: marker.show_text.clone(),
-                    show_value: marker.payload.clone(),
-                    description: None,
-                    format: None,
-                };
-                let Ok(metadata) = serde_json::to_string(&payload) else {
-                    continue;
-                };
-                let content = serde_json::json!({
-                    "key": marker.key,
-                    "payload": marker.payload,
-                })
-                .to_string();
-                state.events.push(TraceEvent::Event(RecordEvent {
-                    // Markers ride the tracepoint event channel; the
-                    // db-backend distinguishes them from ordinary
-                    // program output by the decodable metadata, not by
-                    // the kind.
-                    kind: EventLogKind::TraceLogEvent,
-                    metadata,
-                    content,
-                }));
+                match marker {
+                    MarkerEntryInput::Correlation {
+                        direction,
+                        boundary,
+                        key,
+                        payload,
+                        show_text,
+                        ..
+                    } => {
+                        // Normalise the direction to the two tokens the
+                        // db-backend's `MarkerDirection` deserialises.
+                        // Anything else would decode to `None` and silently
+                        // vanish from the pair index, so we default to
+                        // "send" rather than writing an unpairable marker.
+                        // The shared writer normalises identically, so this
+                        // is belt-and-braces rather than a second policy.
+                        let direction = match direction.as_str() {
+                            "recv" | "receive" => "recv",
+                            _ => "send",
+                        };
+                        state
+                            .events
+                            .push(TraceEvent::CorrelationMarker(CorrelationMarkerRecord {
+                                boundary: boundary.clone(),
+                                direction: direction.to_string(),
+                                key_value: key.clone(),
+                                show_value: payload.clone().unwrap_or_default(),
+                                key_text: "key".to_string(),
+                                // The name the shown value's binding had on
+                                // this side.  The shared writer would
+                                // substitute the literal "show" for an empty
+                                // string; passing the real binding name is
+                                // why `show_text` exists as a parameter at
+                                // all (contract §11a.2).
+                                show_text: show_text.clone().unwrap_or_default(),
+                                description: String::new(),
+                            }));
+                    }
+                    MarkerEntryInput::SpanCoverage {
+                        trace_id,
+                        span_id,
+                        wall_time_unix_ns,
+                        monotonic_time_ns,
+                        ..
+                    } => {
+                        state
+                            .events
+                            .push(TraceEvent::SpanCoverage(SpanCoverageRecord {
+                                trace_id_hex: trace_id.clone(),
+                                span_id_hex: span_id.clone(),
+                                wall_time_unix_ns: parse_nanos("wallTimeUnixNs", wall_time_unix_ns),
+                                monotonic_time_ns: parse_nanos(
+                                    "monotonicTimeNs",
+                                    monotonic_time_ns,
+                                ),
+                            }));
+                    }
+                }
             }
             _ => {
                 // Unknown event kind — skip
@@ -1735,6 +1855,14 @@ fn write_binary_trace(
     // semantics).
     let mut paths_with_line_lengths: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
+
+    // M25: interned correlation-boundary label ids, hoisted out of the
+    // replay loop.  `ensure_marker_id` is the primary operation of the
+    // shared marker API and is meant to be called once per boundary, not
+    // once per crossing (contract §11a.4) — a program that marks the same
+    // boundary in a loop therefore pays for one interning call, and the
+    // per-crossing call does no string lookup.
+    let mut marker_ids: HashMap<String, u64> = HashMap::new();
 
     // RS-M9: translate the span marks (positions in `state.events`) into real
     // step ids by sampling the writer's own exec-event counter as the replay
@@ -1979,14 +2107,93 @@ fn write_binary_trace(
                 let upstream_kind = match re.kind {
                     EventLogKind::Write => codetracer_trace_types::EventLogKind::Write,
                     EventLogKind::WriteOther => codetracer_trace_types::EventLogKind::WriteOther,
-                    // M25 correlation markers ride the tracepoint
-                    // channel; the db-backend recognises them by
-                    // decoding a `MarkerPayload` out of `metadata`.
-                    EventLogKind::TraceLogEvent => {
-                        codetracer_trace_types::EventLogKind::TraceLogEvent
-                    }
                 };
                 writer.register_special_event(upstream_kind, &re.metadata, &re.content);
+            }
+            // M25 correlation marker — forwarded to the shared CTFS
+            // writer, which owns the `MarkerPayload` document AND indexes
+            // the marker into `corrmark.ns`.  This recorder deliberately
+            // builds neither: a payload whose field names drift from
+            // `db-backend/src/correlation_markers.rs` produces markers
+            // that are invisible rather than broken, with no error
+            // anywhere, which is why the API lives in the writer library
+            // (contract §11a.1 / §11a.2).
+            //
+            // Step attribution is the shared writer's job and needs no
+            // argument from here: its C ABI derives the enclosing step
+            // itself (`enclosingStepId` in
+            // `codetracer_trace_writer_ffi.nim`) and feeds that one number
+            // to both the `MarkerPayload` event's `step_id` and the
+            // index entry's `geid`, so the two coordinates for a marker
+            // cannot disagree.
+            //
+            // Worth knowing WHY that is not simply `stepCount - 1`, since
+            // it is what this binding depends on: `register_step` only
+            // BUFFERS its step so that values registered afterwards still
+            // attach to it, so at the moment a marker is declared the step
+            // for the marker's own line has not been emitted yet.
+            // Subtracting one names the PREVIOUS step — issue #601, the
+            // flow view rendering output a source line too high. Pinned
+            // from this side by
+            // `tests/e2e/correlation-markers-recording.test.ts`.
+            TraceEvent::CorrelationMarker(cm) => {
+                // The numeric-id call is the primary one (§11a.4): the
+                // label is interned ONCE per distinct boundary and the
+                // per-crossing call then does no string lookup.  The cache
+                // is hoisted out of this loop for exactly that reason.
+                let marker_id = match marker_ids.get(&cm.boundary) {
+                    Some(id) => Some(*id),
+                    None => match writer.ensure_marker_id(&cm.boundary) {
+                        Ok(id) => {
+                            marker_ids.insert(cm.boundary.clone(), id);
+                            Some(id)
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[codetracer-js-recorder] ensure_marker_id failed for boundary {:?}: {} \
+                                 (this marker will be missing from the trace)",
+                                cm.boundary, err,
+                            );
+                            None
+                        }
+                    },
+                };
+                if let Some(marker_id) = marker_id {
+                    if let Err(err) = writer.mark_correlation_by_id(
+                        marker_id,
+                        &cm.boundary,
+                        &cm.direction,
+                        &cm.key_value,
+                        &cm.show_value,
+                        &cm.description,
+                        &cm.key_text,
+                        &cm.show_text,
+                    ) {
+                        eprintln!(
+                            "[codetracer-js-recorder] mark_correlation_by_id failed for boundary {:?}: {} \
+                             (this marker will be missing from the trace)",
+                            cm.boundary, err,
+                        );
+                    }
+                }
+            }
+            // A span-coverage declaration: this recording covers the named
+            // OTel span.  `corrmark.ns` kind 0 — no `MarkerPayload`, no
+            // direction and no pairing domain (contract §10.2).
+            TraceEvent::SpanCoverage(sc) => {
+                if let Err(err) = writer.mark_span_coverage_hex(
+                    &sc.trace_id_hex,
+                    &sc.span_id_hex,
+                    sc.wall_time_unix_ns,
+                    sc.monotonic_time_ns,
+                ) {
+                    eprintln!(
+                        "[codetracer-js-recorder] mark_span_coverage_hex failed for \
+                         trace {:?} span {:?}: {} (this recording will not advertise \
+                         that it covers the span)",
+                        sc.trace_id_hex, sc.span_id_hex, err,
+                    );
+                }
             }
             // Thread-lifecycle events route through the dedicated FFI entry
             // points added in handoff entry 1.30 (codetracer-trace-format-nim
