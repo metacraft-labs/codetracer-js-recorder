@@ -30,6 +30,8 @@ import * as os from "node:os";
 import { execFileSync } from "node:child_process";
 import {
   instrument,
+  mergeManifestSlices,
+  nextManifestIdBases,
   shouldInstrument,
   tryAutoformat,
 } from "@codetracer/instrumenter";
@@ -39,8 +41,6 @@ import {
 import { DEFAULT_STEP_LOCALS_MAX_SIZE } from "@codetracer/runtime";
 import type {
   ManifestSlice,
-  FunctionEntry,
-  SiteEntry,
   FilterOptions,
   AutoformatOutcome,
 } from "@codetracer/instrumenter";
@@ -125,99 +125,6 @@ export function linkNodeModules(tmpDir: string, baseDir: string): void {
       );
     }
   }
-}
-
-/**
- * Merge multiple manifest slices into a single manifest, re-indexing
- * paths, functions, and sites so IDs are globally unique.
- */
-function mergeManifestSlices(
-  slices: Array<{ slice: ManifestSlice; originalFile: string }>,
-): {
-  paths: string[];
-  functions: FunctionEntry[];
-  sites: SiteEntry[];
-  sourcesContent?: Record<string, string>;
-  lineLengths?: Record<string, number[]>;
-} {
-  const paths: string[] = [];
-  const functions: FunctionEntry[] = [];
-  const sites: SiteEntry[] = [];
-  const sourcesContent: Record<string, string> = {};
-  // P2.3: merged per-source line-length tables keyed by source path
-  // (mirror of instrument-cmd.ts).  The native addon ships these
-  // through `register_path_with_line_lengths` so the CTFS writer's
-  // `paths.dat` carries the Layout A line-length record.
-  const lineLengths: Record<string, number[]> = {};
-
-  const globalPathMap = new Map<string, number>();
-
-  for (const { slice } of slices) {
-    const localToGlobal: number[] = [];
-    for (const p of slice.paths) {
-      let globalIdx = globalPathMap.get(p);
-      if (globalIdx === undefined) {
-        globalIdx = paths.length;
-        paths.push(p);
-        globalPathMap.set(p, globalIdx);
-      }
-      localToGlobal.push(globalIdx);
-    }
-
-    const fnIdOffset = functions.length;
-    for (const fn of slice.functions) {
-      functions.push({
-        ...fn,
-        pathIndex: localToGlobal[fn.pathIndex],
-      });
-    }
-
-    for (const site of slice.sites) {
-      const reindexed: SiteEntry = {
-        ...site,
-        pathIndex: localToGlobal[site.pathIndex],
-      };
-      if (reindexed.fnId !== undefined) {
-        reindexed.fnId = reindexed.fnId + fnIdOffset;
-      }
-      sites.push(reindexed);
-    }
-
-    // Merge sourcesContent
-    if (slice.sourcesContent) {
-      for (const [key, value] of Object.entries(slice.sourcesContent)) {
-        sourcesContent[key] = value;
-      }
-    }
-
-    // P2.3: merge per-source line-length tables.  First slice wins on
-    // duplicate keys — re-instrumenting the same file always produces
-    // the same byte counts, so the choice is inert.
-    if (slice.lineLengths) {
-      for (const [key, value] of Object.entries(slice.lineLengths)) {
-        if (!(key in lineLengths)) {
-          lineLengths[key] = value.slice();
-        }
-      }
-    }
-  }
-
-  const result: {
-    paths: string[];
-    functions: FunctionEntry[];
-    sites: SiteEntry[];
-    sourcesContent?: Record<string, string>;
-    lineLengths?: Record<string, number[]>;
-  } = { paths, functions, sites };
-
-  if (Object.keys(sourcesContent).length > 0) {
-    result.sourcesContent = sourcesContent;
-  }
-  if (Object.keys(lineLengths).length > 0) {
-    result.lineLengths = lineLengths;
-  }
-
-  return result;
 }
 
 /**
@@ -949,7 +856,10 @@ export function recordCommand(args: string[]): void {
     // positions on the formatted view instead of the gibberish
     // single-line bundle.  See `packages/instrumenter/src/autoformat.ts`
     // for the heuristic + prettier wiring.
-    const slices: Array<{ slice: ManifestSlice; originalFile: string }> = [];
+    // Merge order IS instrumentation order: each file is instrumented
+    // with `nextManifestIdBases(slices)` so the ids baked into its
+    // `__ct.*` calls are already the merged manifest's ids.
+    const slices: ManifestSlice[] = [];
     // P6.2: per-file autoformat artefacts, keyed by the *virtual*
     // filename that the manifest will reference (`<file>.fmt.js`).
     // Each entry carries the formatted source + the V3 sourcemap
@@ -1044,6 +954,14 @@ export function recordCommand(args: string[]): void {
       try {
         const result = instrument(codeToInstrument, {
           filename: instrumentFilename,
+          // The site / function ids the instrumenter bakes into this
+          // file's `__ct.*` calls must be the ids of the MERGED
+          // manifest — a file numbered from zero and merged behind
+          // another one reports steps that resolve to the earlier
+          // file's lines.  Only a slice that is actually appended
+          // advances the bases, which is why this reads `slices`
+          // rather than a counter the failure path below could skew.
+          idBases: nextManifestIdBases(slices),
         });
 
         // Write instrumented code
@@ -1051,7 +969,7 @@ export function recordCommand(args: string[]): void {
         fs.mkdirSync(outFileDir, { recursive: true });
         fs.writeFileSync(outFilePath, result.code);
 
-        slices.push({ slice: result.manifestSlice, originalFile: file });
+        slices.push(result.manifestSlice);
       } catch (err) {
         console.error(`Warning: failed to instrument '${file}': ${err}`);
       }
@@ -1149,13 +1067,45 @@ export function recordCommand(args: string[]): void {
         },
       });
     } catch (err: unknown) {
-      // The child process may exit with a non-zero code but still produce a trace.
-      // We continue to check for the trace directory marker.
-      const exitErr = err as { status?: number };
-      if (exitErr.status !== undefined && exitErr.status !== 0) {
+      // The child may exit non-zero and still have produced a usable
+      // (if truncated) trace, so we keep going and finish writing it.
+      // But the recorder's OWN exit code must mirror the target's —
+      // `Recorder-CLI-Conventions.md` §6: "If the target exits with code
+      // 42, the recorder exits with code 42. This allows CI pipelines to
+      // detect target program failures."
+      //
+      // This used to only print a warning and still exit 0, which turned
+      // every caller's `status.success()` check into a silent self-pass:
+      // `codetracer/src/db-backend/tests/javascript_hcr_ctfs_integration.rs`
+      // reported success for two months against a program that died at
+      // its first `require`.
+      //
+      // `process.exitCode` rather than `process.exit()`: the `finally`
+      // block below still has to take down the `node_modules` symlink
+      // and the staging directory, and stdout still has to flush.
+      const exitErr = err as { status?: number | null; signal?: string | null };
+      if (typeof exitErr.status === "number" && exitErr.status !== 0) {
         console.error(
           `Warning: recorded program exited with code ${exitErr.status}`,
         );
+        process.exitCode = exitErr.status;
+      } else if (exitErr.signal) {
+        // Killed by a signal: there is no exit status to mirror, so use
+        // the shell's 128+N convention when the signal is one we know,
+        // and a plain failure otherwise.
+        console.error(
+          `Warning: recorded program was killed by signal ${exitErr.signal}`,
+        );
+        const signum = (os.constants.signals as Record<string, number>)[
+          exitErr.signal
+        ];
+        process.exitCode = signum === undefined ? 1 : 128 + signum;
+      } else {
+        // `execFileSync` threw without a status or a signal — the child
+        // could not be spawned at all (missing interpreter, bad cwd).
+        // That is a recorder failure, which the convention gives code 1.
+        console.error(`Error: failed to run the recorded program: ${err}`);
+        process.exitCode = 1;
       }
     }
 

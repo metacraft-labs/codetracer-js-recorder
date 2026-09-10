@@ -273,3 +273,66 @@ describe("test_env_disabled_skips_recording", () => {
     expect(exitCode).toBe(0);
   });
 });
+
+// =============================================
+// test_target_exit_code_is_propagated
+// =============================================
+/**
+ * `Recorder-CLI-Conventions.md` §6: "By default, the recorder's exit code
+ * should mirror the target program's exit code. If the target exits with
+ * code 42, the recorder exits with code 42. This allows CI pipelines to
+ * detect target program failures."
+ *
+ * This is a regression guard with a name attached. `record` used to catch
+ * the child's non-zero status, print `Warning: recorded program exited
+ * with code N`, and still exit 0 — which turned every caller's exit-status
+ * check into a silent self-pass. It is how
+ * `codetracer/src/db-backend/tests/javascript_hcr_ctfs_integration.rs`
+ * reported success for two months against a program that died at its first
+ * `require`. See
+ * `codetracer-specs/Testing/Silent-Self-Pass-Audit-2026-08-23.md`.
+ */
+describe("test_target_exit_code_is_propagated", () => {
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ct-exit-code-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("mirrors a non-zero exit code from the recorded program", () => {
+    const program = path.join(tmp, "fails.js");
+    fs.writeFileSync(
+      program,
+      'console.log("ran");\nprocess.exit(42);\n',
+      "utf-8",
+    );
+    const outDir = path.join(tmp, "traces");
+
+    const { stdout, stderr, exitCode } = runCLI(
+      ["record", program, "--out-dir", outDir],
+      { env: { CODETRACER_JS_RECORDER_DISABLED: undefined } },
+    );
+
+    expect(exitCode).toBe(42);
+    // The trace must still be written: a failing program's partial trace is
+    // usually the interesting one, so propagating the code must not abort
+    // the recording.
+    expect(`${stdout}${stderr}`).toContain("Trace written to:");
+  });
+
+  it("exits 0 when the recorded program succeeds", () => {
+    const program = path.join(tmp, "ok.js");
+    fs.writeFileSync(program, 'console.log("ran");\n', "utf-8");
+    const outDir = path.join(tmp, "traces-ok");
+
+    const { exitCode } = runCLI(["record", program, "--out-dir", outDir], {
+      env: { CODETRACER_JS_RECORDER_DISABLED: undefined },
+    });
+
+    expect(exitCode).toBe(0);
+  });
+});

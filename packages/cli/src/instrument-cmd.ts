@@ -11,13 +11,13 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { instrument, shouldInstrument } from "@codetracer/instrumenter";
-import type {
-  ManifestSlice,
-  FunctionEntry,
-  SiteEntry,
-  FilterOptions,
+import {
+  instrument,
+  mergeManifestSlices,
+  nextManifestIdBases,
+  shouldInstrument,
 } from "@codetracer/instrumenter";
+import type { ManifestSlice, FilterOptions } from "@codetracer/instrumenter";
 
 /**
  * Recursively collect all instrumentable files under a directory.
@@ -46,106 +46,6 @@ function collectFiles(dir: string, filterOpts?: FilterOptions): string[] {
 
   walk(dir);
   return results;
-}
-
-/**
- * Merge multiple manifest slices into a single manifest, re-indexing
- * paths, functions, and sites so IDs are globally unique.
- */
-function mergeManifestSlices(
-  slices: Array<{ slice: ManifestSlice; originalFile: string }>,
-): {
-  paths: string[];
-  functions: FunctionEntry[];
-  sites: SiteEntry[];
-  sourcesContent?: Record<string, string>;
-  lineLengths?: Record<string, number[]>;
-} {
-  const paths: string[] = [];
-  const functions: FunctionEntry[] = [];
-  const sites: SiteEntry[] = [];
-  const sourcesContent: Record<string, string> = {};
-  // P2.3: merged per-source line-length tables keyed by source path.
-  // The native addon forwards the merged table through
-  // `register_path_with_line_lengths` so the CTFS writer's `paths.dat`
-  // ships the Layout A line-length record needed for column-aware
-  // decoding.
-  const lineLengths: Record<string, number[]> = {};
-
-  const globalPathMap = new Map<string, number>();
-
-  for (const { slice } of slices) {
-    // Build a local-to-global path index map for this slice
-    const localToGlobal: number[] = [];
-    for (const p of slice.paths) {
-      let globalIdx = globalPathMap.get(p);
-      if (globalIdx === undefined) {
-        globalIdx = paths.length;
-        paths.push(p);
-        globalPathMap.set(p, globalIdx);
-      }
-      localToGlobal.push(globalIdx);
-    }
-
-    // Re-index functions
-    const fnIdOffset = functions.length;
-    for (const fn of slice.functions) {
-      functions.push({
-        ...fn,
-        pathIndex: localToGlobal[fn.pathIndex],
-      });
-    }
-
-    // Re-index sites
-    for (const site of slice.sites) {
-      const reindexed: SiteEntry = {
-        ...site,
-        pathIndex: localToGlobal[site.pathIndex],
-      };
-      if (reindexed.fnId !== undefined) {
-        reindexed.fnId = reindexed.fnId + fnIdOffset;
-      }
-      sites.push(reindexed);
-    }
-
-    // Merge sourcesContent
-    if (slice.sourcesContent) {
-      for (const [key, value] of Object.entries(slice.sourcesContent)) {
-        sourcesContent[key] = value;
-      }
-    }
-
-    // P2.3: merge line-length tables.  The first slice wins on
-    // collisions — re-instrumenting the same file in a different
-    // compilation run yields the same byte counts, so the choice
-    // doesn't matter in practice.  We slice() before storing to
-    // protect against the originating slice mutating the array
-    // afterward.
-    if (slice.lineLengths) {
-      for (const [key, value] of Object.entries(slice.lineLengths)) {
-        if (!(key in lineLengths)) {
-          lineLengths[key] = value.slice();
-        }
-      }
-    }
-  }
-
-  const result: {
-    paths: string[];
-    functions: FunctionEntry[];
-    sites: SiteEntry[];
-    sourcesContent?: Record<string, string>;
-    lineLengths?: Record<string, number[]>;
-  } = { paths, functions, sites };
-
-  if (Object.keys(sourcesContent).length > 0) {
-    result.sourcesContent = sourcesContent;
-  }
-  if (Object.keys(lineLengths).length > 0) {
-    result.lineLengths = lineLengths;
-  }
-
-  return result;
 }
 
 /**
@@ -398,8 +298,10 @@ export function instrumentCommand(args: string[]): void {
   const outPath = path.resolve(outDir);
   fs.mkdirSync(outPath, { recursive: true });
 
-  // Instrument each file
-  const slices: Array<{ slice: ManifestSlice; originalFile: string }> = [];
+  // Instrument each file.  Merge order IS instrumentation order: each
+  // file is instrumented with `nextManifestIdBases(slices)` so the ids
+  // baked into its `__ct.*` calls are already the merged manifest's ids.
+  const slices: ManifestSlice[] = [];
   let instrumentedCount = 0;
 
   for (const file of files) {
@@ -407,7 +309,12 @@ export function instrumentCommand(args: string[]): void {
     const code = fs.readFileSync(file, "utf-8");
 
     try {
-      const result = instrument(code, { filename: path.resolve(file) });
+      const result = instrument(code, {
+        filename: path.resolve(file),
+        // See the note on `slices` above: ids are baked into the emitted
+        // code, so they must be minted in the merged numbering.
+        idBases: nextManifestIdBases(slices),
+      });
 
       // Write instrumented code
       const outFilePath = path.join(outPath, relPath);
@@ -420,7 +327,7 @@ export function instrumentCommand(args: string[]): void {
         fs.writeFileSync(outFilePath + ".map", result.map);
       }
 
-      slices.push({ slice: result.manifestSlice, originalFile: file });
+      slices.push(result.manifestSlice);
       instrumentedCount++;
     } catch (err) {
       console.error(`Warning: failed to instrument '${file}': ${err}`);

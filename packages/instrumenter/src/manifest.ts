@@ -1,10 +1,41 @@
-import type { FunctionEntry, SiteEntry, ManifestSlice } from "./index.js";
+import type {
+  FunctionEntry,
+  SiteEntry,
+  ManifestSlice,
+  ManifestIdBases,
+} from "./index.js";
 
 /**
  * Builds a manifest slice for a single file being instrumented.
  * Tracks function entries and site entries, assigning sequential IDs.
+ *
+ * # Ids are minted in the FINAL (merged) numbering, not per file
+ *
+ * The instrumented source carries the ids as bare numeric literals —
+ * `__ct.step(20)`, `__ct.enter(2)` — and the recorder resolves them by
+ * indexing straight into the merged manifest's `sites` / `functions`
+ * arrays.  A slice that numbered its own ids from zero would therefore
+ * be readable only as long as it was the *first* slice merged: every
+ * later file's `__ct.step(k)` would land on some earlier file's site
+ * `k`, silently attributing its steps to another source file.
+ *
+ * So the caller that will do the merging tells each builder where its
+ * block starts — `functionIdBase` / `siteIdBase` — and the ids handed
+ * back (and baked into the emitted code) are already global.  The
+ * defaults of `0` are exactly right for the single-file case, where the
+ * slice is the whole manifest.
  */
 export class ManifestBuilder {
+  /**
+   * Index this slice's first function occupies in the merged
+   * `functions` array; every `addFunction` id is offset by it.
+   */
+  private readonly functionIdBase: number;
+  /**
+   * Index this slice's first site occupies in the merged `sites`
+   * array; every `add*Site` id is offset by it.
+   */
+  private readonly siteIdBase: number;
   private paths: string[] = [];
   private functions: FunctionEntry[] = [];
   private sites: SiteEntry[] = [];
@@ -21,6 +52,17 @@ export class ManifestBuilder {
    * per-line offset table — Layout A".
    */
   private _lineLengths = new Map<string, number[]>();
+
+  /**
+   * @param idBases Where this slice's id blocks start in the merged
+   *   manifest.  Omit (or pass zeros) when the slice is the entire
+   *   manifest; pass the running totals of the slices already merged
+   *   otherwise.  See {@link ManifestIdBases}.
+   */
+  constructor(idBases?: ManifestIdBases) {
+    this.functionIdBase = idBases?.functionIdBase ?? 0;
+    this.siteIdBase = idBases?.siteIdBase ?? 0;
+  }
 
   /**
    * Register a file path and return its index.
@@ -61,7 +103,7 @@ export class ManifestBuilder {
     col: number,
     params?: string[],
   ): number {
-    const fnId = this.functions.length;
+    const fnId = this.functionIdBase + this.functions.length;
     const entry: FunctionEntry = { name, pathIndex, line, col };
     if (params && params.length > 0) {
       entry.params = params;
@@ -87,7 +129,7 @@ export class ManifestBuilder {
     col: number,
     vars?: string[],
   ): number {
-    const siteId = this.sites.length;
+    const siteId = this.siteIdBase + this.sites.length;
     const entry: SiteEntry = { kind: "step", pathIndex, line, col };
     if (vars && vars.length > 0) {
       entry.vars = [...vars];
@@ -105,7 +147,7 @@ export class ManifestBuilder {
     line: number,
     col: number,
   ): number {
-    const siteId = this.sites.length;
+    const siteId = this.siteIdBase + this.sites.length;
     this.sites.push({ kind: "call", fnId, pathIndex, line, col });
     return siteId;
   }
@@ -119,7 +161,7 @@ export class ManifestBuilder {
     line: number,
     col: number,
   ): number {
-    const siteId = this.sites.length;
+    const siteId = this.siteIdBase + this.sites.length;
     this.sites.push({ kind: "return", fnId, pathIndex, line, col });
     return siteId;
   }
@@ -153,7 +195,7 @@ export class ManifestBuilder {
       index?: number;
     },
   ): number {
-    const siteId = this.sites.length;
+    const siteId = this.siteIdBase + this.sites.length;
     const entry: SiteEntry = {
       kind: "write",
       pathIndex,
@@ -185,6 +227,13 @@ export class ManifestBuilder {
       paths: [...this.paths],
       functions: [...this.functions],
       sites: [...this.sites],
+      // Echoed back so the merger can CHECK the placement it asked for
+      // rather than assume it: the ids are already baked into
+      // `InstrumentResult.code` and cannot be renumbered afterwards, so a
+      // slice landing anywhere other than its declared base has to fail
+      // loudly instead of producing a plausible-looking wrong manifest.
+      functionIdBase: this.functionIdBase,
+      siteIdBase: this.siteIdBase,
     };
 
     if (this._sourcesContent.size > 0) {
