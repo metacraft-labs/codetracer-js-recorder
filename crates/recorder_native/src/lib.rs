@@ -1451,10 +1451,19 @@ pub fn append_events(
                 //
                 // The trace-format `entryStep` convention (see
                 // `codetracer-trace-format-nim`, MultiStreamTraceWriter.registerCall)
-                // records a call entry at `stepCount - 1` — i.e. the step that was
-                // most recently flushed BEFORE the call.  ct-print then resolves
-                // that step index back to a source line to populate the call
-                // record's `entry_step`.
+                // is the NEXT-STEP semantic: `entryStep` is `w.stepCount` at the
+                // moment of `registerCall`, i.e. the index of the first step the
+                // writer emits AFTER the call opens.  `registerReturn` then
+                // applies a LEAF CLAMP: a callee that emitted no body step at all
+                // (`stepCount == entryStep`) has its `entryStep` clamped back to
+                // the step flushed just BEFORE the call, so the call entry still
+                // surfaces.  ct-print resolves whichever index results back to a
+                // source line to populate the call record's `entry_step`.
+                //
+                // (An earlier version of this comment said the convention "records
+                // a call entry at `stepCount - 1`".  That describes only the leaf
+                // clamp, and the mistake propagated into the db-backend's flow
+                // documentation before being corrected on 2026-09-11.)
                 //
                 // The SWC instrumenter emits `__ct.step(callSite)` at the *call
                 // site* and only emits the callee's first body step AFTER
