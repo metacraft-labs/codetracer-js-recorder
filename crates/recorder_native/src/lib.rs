@@ -2105,9 +2105,27 @@ fn write_binary_trace(
                 writer.register_variable_with_full_value(&var_name, v);
             }
             TraceEvent::Assignment(ar) => {
-                writer.add_event(codetracer_trace_types::TraceLowLevelEvent::Assignment(
-                    ar.clone(),
-                ));
+                // Resolve the TARGET's name exactly as the `Value` arm above
+                // does, and call `assign` directly rather than routing through
+                // `add_event`.
+                //
+                // `add_event`'s `Assignment` arm resolves the target through
+                // the upstream writer's own `variable_table`, which is only
+                // populated by `add_event(TraceLowLevelEvent::VariableName)`.
+                // This recorder registers names via `register_variable_name`
+                // instead (see the `TraceEvent::VariableName` arm), so that
+                // table is empty here and every assignment target came out as
+                // the placeholder `var_<id>` — invisible while assignments
+                // were being discarded outright, and wrong the moment they
+                // started reaching the trace.
+                let var_name = state
+                    .var_name_registry
+                    .map
+                    .iter()
+                    .find(|(_, &id)| id == ar.to.0)
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| format!("var_{}", ar.to.0));
+                writer.assign(&var_name, ar.from.clone(), ar.pass_by.clone());
             }
             TraceEvent::Event(re) => {
                 // Map local EventLogKind to upstream.  We produce Write
