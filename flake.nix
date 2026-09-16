@@ -16,7 +16,7 @@
     # can resolve those paths. When the addon has no trace-format path
     # deps (e.g. on older branches), the input is unused but harmless.
     codetracer-trace-format = {
-      url = "github:metacraft-labs/codetracer-trace-format/main";
+      url = "github:metacraft-labs/codetracer-trace-format/dev";
       flake = false;
     };
     # codetracer_trace_writer_nim's build.rs reads the FFI entry
@@ -24,7 +24,7 @@
     # at cargo build time.  Without the source the build aborts with
     # "Nim FFI entry point not found".
     codetracer-trace-format-nim = {
-      url = "github:metacraft-labs/codetracer-trace-format-nim/main";
+      url = "github:metacraft-labs/codetracer-trace-format-nim/dev";
       flake = false;
     };
     # Nim packages the Nim FFI library declares as ``requires`` in its
