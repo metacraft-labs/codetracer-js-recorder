@@ -146,11 +146,12 @@ describe("ct binary output", () => {
     expect(ctFiles.length).toBeGreaterThanOrEqual(1);
 
     // Read the first 12 bytes of the .ct file to check the header.
-    // CTFS header layout:
+    // CTFS v4 header layout (`ctfs-container.md`):
     //   bytes 0-4: magic (5 bytes)
     //   byte  5:   version (1 byte)
-    //   byte  6:   compression (1 byte)
-    //   byte  7:   encryption (1 byte)
+    //   byte  6:   encryption (1 byte)
+    //   byte  7:   max_shards (1 byte; 0 = not sharded, and 1 is not a
+    //              synonym for it)
     //   bytes 8-11: block_size (u32 LE)
     const header = Buffer.alloc(12);
     const fd = fs.openSync(ctFiles[0], "r");
