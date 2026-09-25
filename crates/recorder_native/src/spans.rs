@@ -392,21 +392,49 @@ mod tests {
     fn marks_resolve_to_the_writers_step_index() {
         let spans = vec![span(1, 2, Some(5))];
         let mut resolver = SpanResolver::new(&spans);
-        // Pretend the replay walked six events and the writer's counter ran
-        // ahead of the event index (column deltas, thread events, …).
-        let counters = [0u64, 3, 7, 9, 11, 14, 20];
-        for (idx, &counter) in counters.iter().enumerate() {
-            resolver.at_event_index(idx, counter);
-        }
+        // Real filesystem and canonical writer: thread lifecycle records
+        // advance coordinates without any register_step call. No writer mock.
+        use codetracer_trace_types::Line;
+        use codetracer_trace_writer_nim::{NimTraceWriter, TraceEventsFileFormat};
+        let directory = std::env::temp_dir().join(format!(
+            "ct-span-counter-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let mut writer = NimTraceWriter::new("span_counter", &[], TraceEventsFileFormat::Binary);
+        writer
+            .begin_writing_trace_events(&directory.join("trace.ct"))
+            .unwrap();
+        let source = directory.join("sample.js");
+        writer.start(&source, Line(1));
+        resolver.at_event_index(0, writer.next_step_index());
+        writer.register_thread_start(2);
+        resolver.at_event_index(1, writer.next_step_index());
+        writer.register_thread_switch(2);
+        let start = writer.next_step_index();
+        assert!(
+            start > 1,
+            "thread events must advance beyond the one source step"
+        );
+        resolver.at_event_index(2, start);
+        writer.register_step(&source, Line(2));
+        resolver.at_event_index(3, writer.next_step_index());
+        writer.register_thread_exit(2);
+        resolver.at_event_index(4, writer.next_step_index());
+        writer.register_thread_switch(1);
+        let end = writer.next_step_index() - 1;
+        resolver.at_event_index(5, end + 1);
         let resolved = resolver.finish();
-        assert_eq!(
-            resolved[0].start_step, 7,
-            "start = counter at the open mark"
-        );
-        assert_eq!(
-            resolved[0].end_step, 13,
-            "end = counter at the close mark - 1"
-        );
+        assert_eq!(resolved[0].start_step, start);
+        assert_eq!(resolved[0].end_step, end);
+        assert!(end > start, "the span must cover real writer events");
+        writer.finish_writing_trace_events().unwrap();
+        drop(writer);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// A span that recorded nothing — a request whose whole handling happened

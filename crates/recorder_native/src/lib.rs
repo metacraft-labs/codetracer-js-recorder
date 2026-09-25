@@ -767,6 +767,7 @@ mod assignment_rvalue_tests {
             rvalue_source: None,
             rvalue_field: None,
             rvalue_index: None,
+            vars: Vec::new(),
         }
     }
 

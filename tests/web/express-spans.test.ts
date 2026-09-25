@@ -22,14 +22,11 @@
  *
  * ## Why the two extra tests exist
  *
- * `express_span_step_ranges_track_the_writers_counter` is the control for the
- * failure mode every prior language milestone in this initiative hit: a
- * recorder that counts its own `register_step` calls instead of reading the
- * writer's exec-event counter. Such a recorder produces the SAME step ids
- * whether or not column-aware encoding is on, because `DeltaColumn` events are
- * not `register_step` calls. The real counter does not: it advances for every
- * exec-stream event. Recording one schedule both ways and requiring the ranges
- * to move is the only assertion here that can actually catch that bug.
+ * `express_span_ranges_survive_column_folding` records both column modes.
+ * The canonical writer folds column annotations into pending line steps, so
+ * the same request schedule must keep its step ranges in either mode. The
+ * native SpanResolver test separately exercises real writer thread events
+ * that advance coordinates beyond a count of register_step calls.
  *
  * `express_span_contiguity_reflects_the_event_loop` is the control for
  * `contiguous_on_one_thread`. Node multiplexes concurrent requests onto one
@@ -292,6 +289,12 @@ describe("express_requests_land_in_span_stream", () => {
       expect(Number(m[SPAN_META_KEYS.responseSize])).toBeGreaterThan(0);
       expect(span.start_wall_ns).toBeGreaterThan(0);
       expect(span.end_wall_ns).toBeGreaterThanOrEqual(span.start_wall_ns);
+      // Millisecond metadata must fit the same recorded wall interval.
+      // Allow the conformance suite's 2 ms rounding/clock-read tolerance.
+      const wallDurationMs = (span.end_wall_ns - span.start_wall_ns) / 1e6;
+      expect(Number(m[SPAN_META_KEYS.durationMs])).toBeLessThanOrEqual(
+        wallDurationMs + 2,
+      );
     });
 
     // The handler that threw says why.
@@ -324,11 +327,11 @@ describe("express_requests_land_in_span_stream", () => {
 });
 
 // ---------------------------------------------------------------------------
-// express_span_step_ranges_track_the_writers_counter
+// express_span_ranges_survive_column_folding
 // ---------------------------------------------------------------------------
 
-describe("express_span_step_ranges_track_the_writers_counter", () => {
-  it("moves every span's range when the writer emits extra exec events", () => {
+describe("express_span_ranges_survive_column_folding", () => {
+  it("preserves span ranges when columns fold into pending line steps", () => {
     const columnAware = webRequests(record({ columnAware: true }).settled);
     const lineOnly = webRequests(record({ columnAware: false }).settled);
 
@@ -339,18 +342,12 @@ describe("express_span_step_ranges_track_the_writers_counter", () => {
       lineOnly.map((s) => s.label),
     );
 
-    // Column-aware encoding adds `DeltaColumn` exec events, which occupy
-    // step ids but are NOT `register_step` calls.  A recorder counting its
-    // own step calls would therefore report IDENTICAL ranges in both
-    // recordings.  Requiring every range to widen is what makes
-    // "we read the writer's counter" a checkable claim rather than a
-    // comment.
+    // A column annotation refines the pending step; it no longer adds a
+    // second boundary. Keep both endpoints, not just the row count, stable.
     columnAware.forEach((span, i) => {
       const other = lineOnly[i];
-      expect(span.start_step).toBeGreaterThan(other.start_step);
-      expect(span.end_step - span.start_step).toBeGreaterThan(
-        other.end_step - other.start_step,
-      );
+      expect(span.start_step).toBe(other.start_step);
+      expect(span.end_step).toBe(other.end_step);
     });
   }, 180_000);
 });
@@ -452,4 +449,12 @@ describe("express_middleware_shares_the_recorder_span_contract", () => {
     expect(expressMiddleware.SPAN_STATUS_OK).toBe(SPAN_STATUS_OK);
     expect(expressMiddleware.SPAN_STATUS_ERROR).toBe(SPAN_STATUS_ERROR);
   });
+});
+
+// A malformed schedule fails after the real server has started listening.
+// Merely setting exitCode leaves that server alive and wedges the recorder.
+describe("express_failed_schedule_exits", () => {
+  it("exits non-zero instead of leaving the server alive", () => {
+    expect(() => record({ schedule: [] })).toThrow("exited non-zero");
+  }, 120_000);
 });

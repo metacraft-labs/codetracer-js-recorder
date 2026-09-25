@@ -98,8 +98,12 @@ echo "[verify] ok: the span test sits inside vitest's collection glob"
 
 require_in_file 'describe("express_requests_land_in_span_stream"' "${SPAN_TEST}" \
   "RS-M9 names this test explicitly"
-require_in_file 'describe("express_span_step_ranges_track_the_writers_counter"' \
-  "${SPAN_TEST}" "the step-index control must stay"
+require_in_file 'describe("express_span_ranges_survive_column_folding"' \
+  "${SPAN_TEST}" "the column-folding control must stay"
+require_in_file 'fn marks_resolve_to_the_writers_step_index()' \
+  "${NATIVE_SPANS}" "the real writer step-index control must stay"
+require_in_file 'cargo test --manifest-path crates/recorder_native/Cargo.toml' \
+  "${REPO_ROOT}/Justfile" "the native counter control must run in just test"
 require_in_file 'describe("express_span_contiguity_reflects_the_event_loop"' \
   "${SPAN_TEST}" "the contiguity/concurrency control must stay"
 
@@ -122,9 +126,14 @@ require_in_file 'expect(sequential.every((s) => !s.concurrent_with_siblings)).to
   "${SPAN_TEST}" "a sequential schedule must report no overlap"
 require_in_file 'expect(nested).toBe(true)' "${SPAN_TEST}" \
   "a concurrent schedule must produce a genuinely nested pair"
-require_in_file 'expect(span.start_step).toBeGreaterThan(other.start_step)' \
-  "${SPAN_TEST}" \
-  "span ranges must be shown to move when the writer emits extra exec events"
+require_in_file 'expect(span.start_step).toBe(other.start_step)' \
+  "${SPAN_TEST}" "folded columns must not add phantom span boundaries"
+require_in_file 'assert_eq!(resolved[0].start_step, start)' \
+  "${NATIVE_SPANS}" "span start must use the real writer coordinate"
+require_in_file 'assert_eq!(resolved[0].end_step, end)' \
+  "${NATIVE_SPANS}" "span end must use the real writer coordinate"
+require_in_file 'writer.register_thread_start(2)' \
+  "${NATIVE_SPANS}" "the control must emit a real non-source-step event"
 require_in_file 'expect(recording.all).toHaveLength(REQUIRED_SCHEDULE.length * 2)' \
   "${SPAN_TEST}" "every span must publish an open record and a settled record"
 

@@ -144,7 +144,9 @@ main().then(
   },
   (err) => {
     console.error(`demo driver failed: ${err && err.stack}`);
-    process.exitCode = 1;
+    // A failed schedule can leave the listening server alive. Exit after
+    // reporting the error; the recorder's synchronous exit hook still runs.
+    process.exit(1);
   },
 );
 

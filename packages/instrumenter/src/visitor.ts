@@ -26,6 +26,7 @@ import type {
 import { ManifestBuilder } from "./manifest.js";
 import type { SourceMapResolver } from "./sourcemap.js";
 import type { StepLocalsMap } from "./scopes.js";
+import { collectBindingNames } from "./scopes.js";
 
 // ---------- helpers for building AST nodes ----------
 
@@ -253,10 +254,10 @@ function mkModuleEnterCall(fnId: number): Statement {
  * when the arrow sits at module top level, where it throws
  * `ReferenceError: arguments is not defined`.
  *
- * Passing the declared parameter names explicitly is both safe and more
- * accurate: it captures exactly the values the arrow was called with,
- * without the surprise of silently reporting an *enclosing* function's
- * arguments when one happens to be in scope.
+ * Capture the real parameter bindings, including destructured leaves and
+ * rest arrays. Manifest display placeholders are not executable names.
+ * These are the bound values after defaults/destructuring, not an enclosing
+ * function's arguments or a reconstruction of the original argument objects.
  */
 function mkArrowEnterCall(fnId: number, paramNames: string[]): Statement {
   return mkExprStmt(
@@ -1780,7 +1781,7 @@ function transformArrowFunction(
   ctx: TransformContext,
 ): void {
   const resolved = resolveSpan(expr.span.start, ctx);
-  const params = extractParamNames(expr.params as unknown[]);
+  const params = expr.params.flatMap((param) => collectBindingNames(param));
   const fnId = ctx.manifest.addFunction(
     "<arrow>",
     resolved.pathIndex,

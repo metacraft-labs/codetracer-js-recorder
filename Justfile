@@ -16,6 +16,7 @@ install:
 
 # Run all tests (builds workspaces first so imports resolve)
 test: install
+    cargo test --manifest-path crates/recorder_native/Cargo.toml
     npm run build
     npm test
     just verify-cli-convention

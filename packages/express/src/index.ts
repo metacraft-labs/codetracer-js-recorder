@@ -199,7 +199,7 @@ export function codetracerExpress(
     // interleaving across an await each have their own `state`.
     const state: RequestSpan = {
       spanId: 0,
-      startedAt: Date.now(),
+      startedAt: 0,
       bytes: 0,
       errorMessage: "",
       settled: false,
@@ -214,6 +214,10 @@ export function codetracerExpress(
       ["http.url", url],
       ["framework", framework],
     ]);
+    // Opening flushes buffered recorder events before capturing the span's
+    // wall-clock start. Start the duration afterwards so that flush time is
+    // not reported as request time outside the recorded span.
+    state.startedAt = Date.now();
 
     const settle = (): void => {
       if (state.settled) return;
