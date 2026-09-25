@@ -97,6 +97,7 @@ interface RecordOptions {
   schedule?: ScheduledRequest[];
   concurrent?: boolean;
   columnAware?: boolean;
+  excludeDriver?: boolean;
 }
 
 interface Recording {
@@ -113,6 +114,7 @@ function record(options: RecordOptions = {}): Recording {
   const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "ct-express-spans-"));
   const args = ["record", DEMO_APP, "-o", outDir];
   if (options.columnAware === false) args.push("--no-column-aware");
+  if (options.excludeDriver) args.push("--exclude", "**/index.js");
 
   // `timeout` + `killSignal` are what make a wedged recording a FAILURE
   // instead of a hang. `execFileSync` blocks the event loop, so without a
@@ -192,6 +194,19 @@ function webRequests(spans: Span[]): Span[] {
 // ---------------------------------------------------------------------------
 
 describe("express_requests_land_in_span_stream", () => {
+  it("runs an excluded HTTP driver while recording the server application", () => {
+    const recording = record({ excludeDriver: true });
+    expect(recording.stdout).toContain("POST /api/users -> 201");
+    expect(recording.stdout).toContain("GET /api/boom -> 500");
+    const spans = webRequests(recording.settled);
+    expect(spans).toHaveLength(REQUIRED_SCHEDULE.length);
+    expect(recording.all).toHaveLength(REQUIRED_SCHEDULE.length * 2);
+    for (const span of spans) {
+      expect(span.start_step).toBeGreaterThan(0);
+      expect(span.end_step).toBeGreaterThanOrEqual(span.start_step);
+    }
+  });
+
   it("records five real requests as five spans with correct step ranges", () => {
     const recording = record();
 

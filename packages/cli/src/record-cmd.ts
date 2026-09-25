@@ -826,7 +826,9 @@ export function recordCommand(args: string[]): void {
 
   if (isDir) {
     baseDir = entryPath;
-    files = collectFiles(entryPath, filterOpts);
+    // Select the entry independently of instrumentation filters. Excluded
+    // source files must still exist when the instrumented app requires them.
+    files = collectFiles(entryPath);
     // Look for index.js or index.ts as entry point
     const indexFile = files.find(
       (f) => path.basename(f) === "index.js" || path.basename(f) === "index.ts",
@@ -879,6 +881,12 @@ export function recordCommand(args: string[]): void {
 
     for (const file of files) {
       const relPath = path.relative(baseDir, file);
+      if (isDir && !shouldInstrument(relPath, filterOpts)) {
+        const plainPath = path.join(tmpDir, relPath);
+        fs.mkdirSync(path.dirname(plainPath), { recursive: true });
+        fs.copyFileSync(file, plainPath);
+        continue;
+      }
       const originalCode = fs.readFileSync(file, "utf-8");
 
       // P6.2 — recorder-side autoformat hook.  We run *before* the

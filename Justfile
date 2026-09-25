@@ -230,9 +230,18 @@ record-request-panel-fixture OUT SCHEDULE="sequential": build
     set -euo pipefail
     work="$(mktemp -d)"
     trap 'rm -rf "$work"' EXIT
-    CODETRACER_DEMO_DIR="$work" CODETRACER_DEMO_RECORD_ONLY=1 \
-      just demo-request-panel-js {{SCHEDULE}}
-    trace_dir="$(cat "$work/.trace_dir")"
+    case "{{SCHEDULE}}" in
+      sequential) concurrent=0 ;;
+      concurrent) concurrent=1 ;;
+      *) echo "unknown schedule '{{SCHEDULE}}'" >&2; exit 1 ;;
+    esac
+    # Keep the real HTTP client runnable, but record only the server source.
+    # Otherwise body-parser awaits can put client steps at a request boundary.
+    CT_EXPRESS_CONCURRENT="$concurrent" \
+      node packages/cli/dist/index.js record test-programs/web/express \
+        --exclude '**/index.js' -o "$work"
+    trace_dir="$(find "$work" -maxdepth 1 -type d -name 'trace-*' | head -n1)"
+    test -n "$trace_dir"
     rm -rf "{{OUT}}"
     mkdir -p "{{OUT}}"
     # Only the container is checked in.  The recorder also drops a
