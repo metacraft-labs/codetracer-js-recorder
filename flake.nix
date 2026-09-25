@@ -42,34 +42,19 @@
     };
   };
 
-  outputs =
-    {
-      self,
-      nixpkgs,
-      fenix,
-      pre-commit-hooks,
-      codetracer-trace-format,
-      codetracer-trace-format-nim,
-      nim-stew,
-      nim-results,
-    }:
+  outputs = { self, nixpkgs, fenix, pre-commit-hooks, codetracer-trace-format
+    , codetracer-trace-format-nim, nim-stew, nim-results, }:
     let
-      systems = [
-        "x86_64-linux"
-        "aarch64-linux"
-        "x86_64-darwin"
-        "aarch64-darwin"
-      ];
+      systems =
+        [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forEachSystem = nixpkgs.lib.genAttrs systems;
 
-      rust-toolchain-for =
-        system:
+      rust-toolchain-for = system:
         fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
           sha256 = "sha256-Qxt8XAuaUR2OMdKbN4u8dBJOhSHxS+uS06Wl9+flVEk=";
         };
-    in
-    {
+    in {
       checks = forEachSystem (system: {
         pre-commit-check = pre-commit-hooks.lib.${system}.run {
           src = ./.;
@@ -85,18 +70,15 @@
         };
       });
 
-      devShells = forEachSystem (
-        system:
+      devShells = forEachSystem (system:
         let
           pkgs = import nixpkgs { inherit system; };
           preCommit = self.checks.${system}.pre-commit-check;
           isLinux = pkgs.stdenv.isLinux;
           isDarwin = pkgs.stdenv.isDarwin;
-        in
-        {
+        in {
           default = pkgs.mkShell {
-            packages =
-              with pkgs;
+            packages = with pkgs;
               [
                 # Node.js runtime and package manager
                 nodejs_22
@@ -124,10 +106,7 @@
                 just
                 git-lfs
                 prek
-              ]
-              ++ pkgs.lib.optionals isLinux [
-                glibc.dev
-              ]
+              ] ++ pkgs.lib.optionals isLinux [ glibc.dev ]
               ++ preCommit.enabledPackages;
 
             shellHook = preCommit.shellHook + ''
@@ -136,11 +115,9 @@
               export CODETRACER_NIM_LIB_DIR="''${CODETRACER_NIM_LIB_DIR:-../codetracer-trace-format-nim}"
             '';
           };
-        }
-      );
+        });
 
-      packages = forEachSystem (
-        system:
+      packages = forEachSystem (system:
         let
           pkgs = import nixpkgs { inherit system; };
           inherit (pkgs) lib stdenv;
@@ -150,9 +127,9 @@
           # Check if the native addon's Cargo.toml references codetracer-trace-format
           # path deps (present after the trace_writer integration commit).
           cargoToml = builtins.readFile ./crates/recorder_native/Cargo.toml;
-          hasTraceFormatDeps = builtins.match ".*codetracer_trace_types.*" cargoToml != null;
-        in
-        {
+          hasTraceFormatDeps =
+            builtins.match ".*codetracer_trace_types.*" cargoToml != null;
+        in {
           # The codetracer-js-recorder package:
           # - Builds the Rust N-API native addon (codetracer_js_recorder_native)
           # - Compiles all TypeScript workspace packages (instrumenter, runtime, cli)
@@ -193,12 +170,7 @@
               nimble
             ];
 
-            buildInputs = lib.optionals isDarwin (
-              with pkgs;
-              [
-                libiconv
-              ]
-            );
+            buildInputs = lib.optionals isDarwin (with pkgs; [ libiconv ]);
 
             # cargoSetupHook expects Cargo.lock at the source root
             postUnpack = ''
@@ -231,7 +203,8 @@
             # injected through ``CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS``.
             CODETRACER_TRACE_FORMAT_NIM_DIR = "${codetracer-trace-format-nim}";
             CODETRACER_TRACE_FORMAT_NIM_SKIP_NIMBLE_INSTALL = "1";
-            CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS = "${nim-stew}:${nim-results}";
+            CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS =
+              "${nim-stew}:${nim-results}";
 
             buildPhase = ''
               runHook preBuild
@@ -279,7 +252,6 @@
 
             doCheck = false;
           };
-        }
-      );
+        });
     };
 }

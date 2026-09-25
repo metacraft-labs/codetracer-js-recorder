@@ -13,6 +13,7 @@
 ## on Windows (or ``REPRO_TOOL_PROVISIONING=tarball`` anywhere).
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 
 package codetracer_js_recorder:
   uses:
@@ -35,6 +36,9 @@ package codetracer_js_recorder:
   library codetracerJsRecorder
 
   devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
     activity "default"
 
   build:
