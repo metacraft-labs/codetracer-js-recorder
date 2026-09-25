@@ -407,7 +407,7 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let mut writer = NimTraceWriter::new("span_counter", &[], TraceEventsFileFormat::Binary);
         writer
-            .begin_writing_trace_events(&directory.join("trace.ct"))
+            .begin_writing_trace_events(&directory.join("trace"))
             .unwrap();
         let source = directory.join("sample.js");
         writer.start(&source, Line(1));
@@ -432,8 +432,39 @@ mod tests {
         assert_eq!(resolved[0].start_step, start);
         assert_eq!(resolved[0].end_step, end);
         assert!(end > start, "the span must cover real writer events");
+        // Persist the production resolver's output and read it through the
+        // canonical reader. Comparing in-memory counters alone cannot prove
+        // that the coordinates address the serialized execution stream.
+        for record in build_span_records(&spans, &resolved) {
+            writer.register_span(&record).unwrap();
+        }
         writer.finish_writing_trace_events().unwrap();
         drop(writer);
+        use codetracer_trace_writer_nim::{read_span_stream_json, NimTraceReaderHandle};
+        let container = directory.join("span_counter.ct");
+        let decoded: serde_json::Value =
+            serde_json::from_str(&read_span_stream_json(&container, true).unwrap()).unwrap();
+        let records = decoded.as_array().expect("span reader returns records");
+        assert_eq!(records.len(), 1);
+        let actual_start = records[0]["start_step"].as_u64().unwrap();
+        let actual_end = records[0]["end_step"].as_u64().unwrap();
+        assert_eq!((actual_start, actual_end), (start, end));
+        let reader = NimTraceReaderHandle::open(container.to_str().unwrap()).unwrap();
+        assert_eq!(reader.step_location(actual_start).unwrap().1, 2);
+        // Negative control: resolve the SAME marks with a register_step-call
+        // count. Real lifecycle events remain in the container, so this wrong
+        // coordinate must point outside the handler's source line.
+        let mut wrong = SpanResolver::new(&spans);
+        wrong.at_event_index(2, 1);
+        wrong.at_event_index(5, 2);
+        let wrong = wrong.finish();
+        assert_ne!(reader.step_location(wrong[0].start_step).unwrap().1, 2);
+        assert_ne!(
+            (wrong[0].start_step, wrong[0].end_step),
+            (actual_start, actual_end),
+            "the counter mutation must be observable after decoding"
+        );
+        drop(reader);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

@@ -251,3 +251,15 @@ record-request-panel-fixture OUT SCHEDULE="sequential": build
     # developer's $HOME in codetracer's git history for no benefit.
     cp "$trace_dir"/*.ct "{{OUT}}/"
     echo "[fixture] wrote {{OUT}}"
+
+# Deterministic mixed client/server fixture; both sources remain instrumented.
+record-mixed-request-panel-fixture OUT:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work"' EXIT
+    node packages/cli/dist/index.js record test-programs/web/express-mixed -o "$work"
+    mapfile -t containers < <(find "$work" -name index.ct)
+    [[ ${#containers[@]} == 1 ]]
+    mkdir -p "$(dirname '{{OUT}}')"
+    cp "${containers[0]}" '{{OUT}}'

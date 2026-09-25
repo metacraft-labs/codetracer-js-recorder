@@ -94,6 +94,7 @@ const REQUIRED_SCHEDULE: ScheduledRequest[] = [
 ];
 
 interface RecordOptions {
+  mixed?: boolean;
   schedule?: ScheduledRequest[];
   concurrent?: boolean;
   columnAware?: boolean;
@@ -112,7 +113,14 @@ interface Recording {
 /** Record the demo app under the CLI and decode the spans it wrote. */
 function record(options: RecordOptions = {}): Recording {
   const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "ct-express-spans-"));
-  const args = ["record", DEMO_APP, "-o", outDir];
+  const args = [
+    "record",
+    options.mixed
+      ? path.join(PROJECT_ROOT, "test-programs/web/express-mixed")
+      : DEMO_APP,
+    "-o",
+    outDir,
+  ];
   if (options.columnAware === false) args.push("--no-column-aware");
   if (options.excludeDriver) args.push("--exclude", "**/index.js");
 
@@ -194,6 +202,24 @@ function webRequests(spans: Span[]): Span[] {
 // ---------------------------------------------------------------------------
 
 describe("express_requests_land_in_span_stream", () => {
+  it("records both deterministic mixed client/server requests", () => {
+    const recording = record({ mixed: true });
+    expect(recording.stdout).toContain("MIXED_CLIENT_TURNS=alpha,beta");
+    expect(recording.settled).toHaveLength(2);
+    expect(recording.settled.map((s) => s.label)).toEqual([
+      "GET /alpha",
+      "GET /beta",
+    ]);
+    for (const span of recording.settled) {
+      expect(span.end_step).toBeGreaterThan(span.start_step);
+      expect(span.contiguous_on_one_thread).toBe(false);
+      expect(span.concurrent_with_siblings).toBe(false);
+    }
+    expect(recording.settled[1].start_step).toBeGreaterThan(
+      recording.settled[0].end_step,
+    );
+  });
+
   it("runs an excluded HTTP driver while recording the server application", () => {
     const recording = record({ excludeDriver: true });
     expect(recording.stdout).toContain("POST /api/users -> 201");
