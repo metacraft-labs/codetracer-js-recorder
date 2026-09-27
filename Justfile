@@ -113,7 +113,7 @@ bump-version version:
         print(f"{f} -> {new}")
 
 # --- M13: Packaging UX Standardization ---
-# Implements Repo-Requirements.md §2.8 packaging UX for the JS
+# Implements Repo-Requirements.md §2.5 packaging UX for the JS
 # language-ecosystem recorder. Single channel: npm.
 
 # Build a release artifact for the given channel.

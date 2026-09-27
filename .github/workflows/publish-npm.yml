@@ -4,7 +4,7 @@ name: publish-npm
 # (the primary release path) and also accepts a manual
 # workflow_dispatch (the fallback for manually re-running a single
 # channel after a transient registry outage, per
-# Repo-Requirements.md §2.8.4).
+# Repo-Requirements.md §2.5.4).
 #
 # Required secrets:
 #   NPM_TOKEN          npm access token with publish permission on
