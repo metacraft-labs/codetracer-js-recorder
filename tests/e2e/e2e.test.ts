@@ -356,7 +356,11 @@ describe("e2e_record_simple_program", () => {
     //       step 6  line 5  (greet body: `var message = ...`)
     //       step 7  line 6  (greet body: `return message`)
     //       step 8  line 10 (`console.log(result)`)
-    //   - 2 call entries (synthetic <module> wrapper + greet)
+    //   - 3 call entries: the call tree's `<toplevel>` root, the
+    //     synthetic <module> wrapper, and greet.  The root is opened by
+    //     the trace writer's `start()` (trace-format-spec `trace-events.md`
+    //     §"Recorder Integration — Starting a Recording"); the recorder
+    //     must not open it a second time.
     //   - 1 io event (the console.log("Hello, World!") write to stdout)
     //
     // The two "definition-line anchor" steps (1 and 5) are emitted by the
@@ -370,15 +374,33 @@ describe("e2e_record_simple_program", () => {
     // current JS recorder — if they change, that's a real regression
     // to investigate, not a flake.
     expect(full.counts.steps).toBe(9);
-    expect(full.counts.calls).toBe(2);
+    expect(full.counts.calls).toBe(3);
     expect(full.counts.io_events).toBe(1);
 
-    // ----- entry_step points at the callee DEFINITION line ------------
-    // A call's recorded source line is the line of its `entry_step` step.
-    // `greet` is defined on line 4 and called on line 9; its call entry
-    // MUST anchor on line 4 (the definition), NOT line 9 (the call site).
-    // This is the core guarantee the function-level incremental-rebuild
-    // engine relies on, and the regression this fix repaired.
+    // ----- The call tree's root: <toplevel> ---------------------------
+    // trace-events.md §"`<toplevel>` is the call tree's root and its id is
+    // fixed": `<toplevel>` is the first function interned (function_id 0)
+    // and its call is the first call (call_key 0, depth 0).
+    expect(full.functions[0]).toBe("<toplevel>");
+    const rootEntry = full.events.find(
+      (e): e is Extract<CtFullEvent, { kind: "call_entry" }> =>
+        e.kind === "call_entry" && e.call_key === 0,
+    );
+    expect(rootEntry).toBeDefined();
+    expect(rootEntry!.function).toBe("<toplevel>");
+    expect(rootEntry!.function_id).toBe(0);
+    expect(rootEntry!.depth).toBe(0);
+
+    // ----- entry_step follows the trace-format convention -------------
+    // `entry_step` is the first step emitted after the call (the
+    // "next-step" convention of the writer's `registerCall`).  `greet`
+    // is defined on line 4, called on line 9, and its body starts on
+    // line 5: its entry step MUST be line 5, never the call site.
+    //
+    // The recorder emits a definition-line step (line 4) immediately
+    // before each call.  For a call with a body it is the step just
+    // before `entry_step`; for a body-less call it is what the writer's
+    // leaf clamp falls back to (covered by the leaf-call test below).
     const stepLineByIndex = new Map<number, number>();
     for (const e of full.events) {
       if (e.kind === "step") {
@@ -390,8 +412,8 @@ describe("e2e_record_simple_program", () => {
         e.kind === "call_entry" && e.function.endsWith("greet"),
     );
     expect(greetEntry).toBeDefined();
-    // greet is declared on line 4 of examples/hello.js.
-    expect(stepLineByIndex.get(greetEntry!.entry_step)).toBe(4);
+    expect(stepLineByIndex.get(greetEntry!.entry_step)).toBe(5);
+    expect(stepLineByIndex.get(greetEntry!.entry_step - 1)).toBe(4);
 
     // ----- Call sequence: <module> first, then greet ------------------
     const callSequence: string[] = full.events
@@ -400,11 +422,14 @@ describe("e2e_record_simple_program", () => {
           e.kind === "call_entry",
       )
       .map((e) => e.function);
-    expect(callSequence).toHaveLength(2);
-    // The synthetic <module> frame is always entered first (it wraps
-    // every JS program the recorder instruments).
-    expect(callSequence[0].endsWith("<module>")).toBe(true);
-    expect(callSequence[1].endsWith("greet")).toBe(true);
+    expect(callSequence).toHaveLength(3);
+    // Exactly one `<toplevel>` root, entered first.
+    expect(callSequence[0]).toBe("<toplevel>");
+    expect(callSequence.filter((f) => f === "<toplevel>")).toHaveLength(1);
+    // The synthetic <module> frame is the first frame under the root (it
+    // wraps every JS program the recorder instruments).
+    expect(callSequence[1].endsWith("<module>")).toBe(true);
+    expect(callSequence[2].endsWith("greet")).toBe(true);
 
     // ----- Strict ValueRecord variant invariant -----------------------
     // Every step var / call arg / return value that surfaces must carry
@@ -587,6 +612,40 @@ describe("e2e_record_simple_program", () => {
 
     // Steps must be present — the program executes multiple statements.
     expect(bundle.steps!.length).toBeGreaterThan(0);
+  });
+
+  it("a body-less call anchors on its definition line, not its call site", () => {
+    // A call with no body step has nothing after it to be its entry
+    // step; the writer's leaf clamp falls back to the step emitted just
+    // before the call, which the recorder makes the callee's definition
+    // line.  Without that step the call would anchor on the caller's
+    // call site.
+    const program = path.join(tmpDir, "leaf.js");
+    fs.writeFileSync(
+      program,
+      [
+        "function noop() {}", // line 1: definition, empty body
+        "",
+        "noop();", // line 3: call site
+        "",
+      ].join("\n"),
+    );
+    const outDir = path.join(tmpDir, "traces-leaf");
+    const { stdout } = runCLI(["record", program, "--out-dir", outDir]);
+    const traceDirMatch = stdout.match(/Trace written to:\s*(.+)/);
+    expect(traceDirMatch).not.toBeNull();
+    const full = ctPrintFull(findCtFile(traceDirMatch![1].trim()));
+
+    const stepLineByIndex = new Map<number, number>();
+    for (const e of full.events) {
+      if (e.kind === "step") stepLineByIndex.set(e.step_index, e.line);
+    }
+    const noopEntry = full.events.find(
+      (e): e is Extract<CtFullEvent, { kind: "call_entry" }> =>
+        e.kind === "call_entry" && e.function.endsWith("noop"),
+    );
+    expect(noopEntry).toBeDefined();
+    expect(stepLineByIndex.get(noopEntry!.entry_step)).toBe(1);
   });
 });
 
