@@ -25,6 +25,7 @@ import * as os from "node:os";
 import { execFileSync } from "node:child_process";
 import {
   ctPrintAvailable,
+  requireCtPrint,
   ctPrintFull,
   findCtFile,
   type CtFullBundle,
@@ -156,7 +157,7 @@ describe("test_step_locals_recorded_end_to_end", () => {
   });
 
   it("records the whole frame on a line that assigns nothing", () => {
-    if (!ctPrintAvailable()) return; // guarded by the test above
+    requireCtPrint();
     const bundle = recordAndDecode(tmpDir, "locals.js", FIXTURE);
 
     // Line 6 is `return scaled;`. This is the exact symptom of #602:
@@ -167,7 +168,7 @@ describe("test_step_locals_recorded_end_to_end", () => {
   });
 
   it("records the correct value for each local at each step", () => {
-    if (!ctPrintAvailable()) return; // guarded by the first test
+    requireCtPrint();
     const bundle = recordAndDecode(tmpDir, "locals.js", FIXTURE);
 
     // Names alone are not enough: a name-only assertion is what let the
@@ -188,7 +189,7 @@ describe("test_step_locals_recorded_end_to_end", () => {
   });
 
   it("captures loop binders and keeps them out of scope where they are not bound", () => {
-    if (!ctPrintAvailable()) return; // guarded by the first test
+    requireCtPrint();
     const bundle = recordAndDecode(
       tmpDir,
       "loops.js",
@@ -215,7 +216,7 @@ accumulate(4);
   });
 
   it("orders the pre-line snapshot before the post-line write on an assigning step", () => {
-    if (!ctPrintAvailable()) return; // guarded by the first test
+    requireCtPrint();
 
     // CROSS-REPO INVARIANT — this ordering is load-bearing for the
     // db-backend and is the reason a JS step agrees with a Ruby step.
@@ -244,7 +245,7 @@ accumulate(4);
   });
 
   it("drops block-scoped bindings once their block ends", () => {
-    if (!ctPrintAvailable()) return; // guarded by the first test
+    requireCtPrint();
 
     // The db-backend used to union every step in the frame for JS,
     // which hid a leaking in-scope set. That union is gone, so a
@@ -289,7 +290,7 @@ probe(true, 2);
   });
 
   it("reverts to the pre-M37 shape when capture is disabled", () => {
-    if (!ctPrintAvailable()) return; // guarded by the first test
+    requireCtPrint();
     const bundle = recordAndDecode(tmpDir, "locals.js", FIXTURE, {
       CODETRACER_JS_STEP_LOCALS: "0",
     });

@@ -124,6 +124,9 @@
                 just
                 git-lfs
                 prek
+                # `just lint-nix`, from the pinned nixpkgs, so the check
+                # neither depends on nor is skipped by the host's nixfmt.
+                nixfmt
               ]
               ++ pkgs.lib.optionals isLinux [ glibc.dev ]
               ++ preCommit.enabledPackages;

@@ -35,7 +35,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
 import {
-  ctPrintAvailable,
+  requireCtPrint,
   ctPrintJson,
   findCtFile,
   type CtPrintBundle,
@@ -79,10 +79,7 @@ describe("audit_ctfs_call_args", () => {
   });
 
   it("Call records include their declared argument names + values", () => {
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP audit_ctfs_call_args: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const programDir = path.join(tmpDir, "src");
     fs.mkdirSync(programDir, { recursive: true });
     fs.writeFileSync(
@@ -139,10 +136,7 @@ describe("audit_ctfs_stderr_kind", () => {
   });
 
   it("console.log / .warn / .error all reach the CTFS IO event stream", () => {
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP audit_ctfs_stderr_kind: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const programDir = path.join(tmpDir, "src");
     fs.mkdirSync(programDir, { recursive: true });
     fs.writeFileSync(
@@ -210,10 +204,7 @@ describe("audit_ctfs_thread_events", () => {
   });
 
   it("async program produces a non-empty .ct container with decodable IO", () => {
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP audit_ctfs_thread_events: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const programDir = path.join(tmpDir, "src");
     fs.mkdirSync(programDir, { recursive: true });
     fs.writeFileSync(
