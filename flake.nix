@@ -42,19 +42,34 @@
     };
   };
 
-  outputs = { self, nixpkgs, fenix, pre-commit-hooks, codetracer-trace-format
-    , codetracer-trace-format-nim, nim-stew, nim-results, }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      fenix,
+      pre-commit-hooks,
+      codetracer-trace-format,
+      codetracer-trace-format-nim,
+      nim-stew,
+      nim-results,
+    }:
     let
-      systems =
-        [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
       forEachSystem = nixpkgs.lib.genAttrs systems;
 
-      rust-toolchain-for = system:
+      rust-toolchain-for =
+        system:
         fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
           sha256 = "sha256-Qxt8XAuaUR2OMdKbN4u8dBJOhSHxS+uS06Wl9+flVEk=";
         };
-    in {
+    in
+    {
       checks = forEachSystem (system: {
         pre-commit-check = pre-commit-hooks.lib.${system}.run {
           src = ./.;
@@ -70,15 +85,18 @@
         };
       });
 
-      devShells = forEachSystem (system:
+      devShells = forEachSystem (
+        system:
         let
           pkgs = import nixpkgs { inherit system; };
           preCommit = self.checks.${system}.pre-commit-check;
           isLinux = pkgs.stdenv.isLinux;
           isDarwin = pkgs.stdenv.isDarwin;
-        in {
+        in
+        {
           default = pkgs.mkShell {
-            packages = with pkgs;
+            packages =
+              with pkgs;
               [
                 # Node.js runtime and package manager
                 nodejs_22
@@ -106,18 +124,54 @@
                 just
                 git-lfs
                 prek
-              ] ++ pkgs.lib.optionals isLinux [ glibc.dev ]
+              ]
+              ++ pkgs.lib.optionals isLinux [ glibc.dev ]
               ++ preCommit.enabledPackages;
 
+            # `cargo <subcommand>` looks for `cargo-<subcommand>` in
+            # `$CARGO_HOME/bin` BEFORE it searches PATH. On any machine with
+            # rustup -- including the self-hosted macOS runner -- that
+            # directory holds rustup's proxies, so `cargo fmt` and
+            # `cargo clippy` run rustup's `cargo-fmt` / `cargo-clippy` instead
+            # of this shell's toolchain, and fail with "'cargo-fmt' is not
+            # installed for the toolchain".
+            #
+            # The shell therefore gets its own CARGO_HOME with no `bin/`, so
+            # subcommand lookup falls through to PATH. `registry/` and `git/`
+            # are symlinks to the real CARGO_HOME, and so are its config and
+            # credentials when present: the download cache is shared, and only
+            # the proxy directory is left behind.
             shellHook = preCommit.shellHook + ''
+              _js_real_cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
+              _js_cargo_home="''${XDG_CACHE_HOME:-$HOME/.cache}/codetracer-js-recorder/cargo-home"
+              if [ "$_js_real_cargo_home" != "$_js_cargo_home" ]; then
+                mkdir -p "$_js_cargo_home" \
+                  "$_js_real_cargo_home/registry" "$_js_real_cargo_home/git"
+                # Re-pointed on every entry, so a changed CARGO_HOME is
+                # followed rather than left sharing the previous one's cache.
+                # Only a link is ever replaced; a real file placed here is
+                # left alone.
+                for _js_entry in registry git config.toml credentials.toml; do
+                  if [ -e "$_js_real_cargo_home/$_js_entry" ] &&
+                    { [ -L "$_js_cargo_home/$_js_entry" ] ||
+                      [ ! -e "$_js_cargo_home/$_js_entry" ]; }; then
+                    ln -sfn "$_js_real_cargo_home/$_js_entry" "$_js_cargo_home/$_js_entry"
+                  fi
+                done
+                export CARGO_HOME="$_js_cargo_home"
+              fi
+              unset _js_real_cargo_home _js_cargo_home _js_entry
+
               # Default CODETRACER_NIM_LIB_DIR to the sibling repo when not
               # already set (e.g. in CI where the env var is passed explicitly).
               export CODETRACER_NIM_LIB_DIR="''${CODETRACER_NIM_LIB_DIR:-../codetracer-trace-format-nim}"
             '';
           };
-        });
+        }
+      );
 
-      packages = forEachSystem (system:
+      packages = forEachSystem (
+        system:
         let
           pkgs = import nixpkgs { inherit system; };
           inherit (pkgs) lib stdenv;
@@ -127,9 +181,9 @@
           # Check if the native addon's Cargo.toml references codetracer-trace-format
           # path deps (present after the trace_writer integration commit).
           cargoToml = builtins.readFile ./crates/recorder_native/Cargo.toml;
-          hasTraceFormatDeps =
-            builtins.match ".*codetracer_trace_types.*" cargoToml != null;
-        in {
+          hasTraceFormatDeps = builtins.match ".*codetracer_trace_types.*" cargoToml != null;
+        in
+        {
           # The codetracer-js-recorder package:
           # - Builds the Rust N-API native addon (codetracer_js_recorder_native)
           # - Compiles all TypeScript workspace packages (instrumenter, runtime, cli)
@@ -143,7 +197,7 @@
             # npm dependencies (pre-fetched for offline install)
             npmDeps = pkgs.fetchNpmDeps {
               src = ./.;
-              hash = "sha256-O6nXlRwKOGCTtoHju8BaZH+4lJD0Wb/h7rSRVM6PSbw=";
+              hash = "sha256-R7cGTzWWD1lbUJzlIFGq2Hoav1eYEDoOJO39rj9WBps=";
             };
 
             # Rust dependencies for the native addon (vendored from Cargo.lock)
@@ -203,8 +257,7 @@
             # injected through ``CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS``.
             CODETRACER_TRACE_FORMAT_NIM_DIR = "${codetracer-trace-format-nim}";
             CODETRACER_TRACE_FORMAT_NIM_SKIP_NIMBLE_INSTALL = "1";
-            CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS =
-              "${nim-stew}:${nim-results}";
+            CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS = "${nim-stew}:${nim-results}";
 
             buildPhase = ''
               runHook preBuild
@@ -252,6 +305,7 @@
 
             doCheck = false;
           };
-        });
+        }
+      );
     };
 }
