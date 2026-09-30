@@ -1807,6 +1807,28 @@ fn local_value_to_upstream(
 /// fight over the same content.  Other `extra_files` entries (anything
 /// not part of the autoformat pair) remain caller-owned and still need
 /// to be written to `<trace>/files/`.
+/// The `(path, line)` of the recording's first step or call — the entry
+/// point handed to the writer's `start()`.  `None` when the recording holds
+/// neither.
+fn recording_entry_point(state: &RecorderState) -> Option<(PathBuf, i64)> {
+    let path_at = |index: usize| {
+        state
+            .manifest
+            .paths
+            .get(index)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("<unknown>"))
+    };
+    state.events.iter().find_map(|event| match event {
+        TraceEvent::Step(sr) => Some((path_at(sr.path_id), sr.line)),
+        TraceEvent::Call(cr) => Some(match state.manifest.functions.get(cr.function_id) {
+            Some(f) => (path_at(f.path_index), f.line as i64),
+            None => (PathBuf::from("<unknown>"), 0),
+        }),
+        _ => None,
+    })
+}
+
 fn write_binary_trace(
     state: &RecorderState,
     trace_dir: &Path,
@@ -1845,9 +1867,13 @@ fn write_binary_trace(
         writer.enable_column_motions_support();
     }
 
-    // We need to track whether we've called `start()` yet — the Nim writer
-    // requires a `start()` call before registering steps/calls.
+    // `start()` must precede every function registration, not only the
+    // first step or call: it interns `<toplevel>`, which must receive
+    // function_id 0 (trace-events.md §"`<toplevel>` is the call tree's
+    // root and its id is fixed").  The entry point it is given is the
+    // position of the recording's first step or call.
     let mut started = false;
+    let entry_point = recording_entry_point(state);
 
     // P2.2: column-aware step emission.  Every `TraceEvent::Step`
     // produces one `register_step(path, line)` call on the Nim writer,
@@ -1922,6 +1948,12 @@ fn write_binary_trace(
                 writer.register_variable_name(name);
             }
             TraceEvent::Function(fr) => {
+                if !started {
+                    if let Some((entry_path, entry_line)) = &entry_point {
+                        writer.start(entry_path, codetracer_trace_types::Line(*entry_line));
+                        started = true;
+                    }
+                }
                 // Look up the path from the manifest by path_id index.
                 let path = state
                     .manifest

@@ -1,0 +1,5 @@
+# Test fixtures are data, not source: their exact bytes are what the tests
+# assert on. `minified.js` must stay a single minified line, and its column
+# offsets are pinned by the sibling `minified.js.map`; reformatting it breaks
+# the fixture and the map at once.
+tests/fixtures/
