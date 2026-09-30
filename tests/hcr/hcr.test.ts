@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
 import {
-  ctPrintAvailable,
+  requireCtPrint,
   ctPrintJson,
   findCtFile,
   type CtPrintBundle,
@@ -235,13 +235,12 @@ describe("HCR trace content assertions", () => {
 
   /**
    * Helper: record the HCR program and return the ct-print bundle + trace
-   * dir.  Returns null when ct-print is unavailable so callers can skip
-   * cleanly without silently weakening assertions.
+   * dir.  Fails the test when ct-print is unavailable.
    */
   function recordAndDecode(): {
     bundle: CtPrintBundle;
     traceDir: string;
-  } | null {
+  } {
     const workdir = prepareWorkdir();
     const outDir = path.join(tmpDir, "traces");
 
@@ -251,10 +250,7 @@ describe("HCR trace content assertions", () => {
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP HCR content assertions: ct-print not found");
-      return null;
-    }
+    requireCtPrint();
 
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
@@ -263,7 +259,6 @@ describe("HCR trace content assertions", () => {
 
   it("trace file exists and contains events", () => {
     const result = recordAndDecode();
-    if (!result) return;
     const { bundle, traceDir } = result;
 
     // The CTFS .ct container must exist and decode to a non-empty bundle.
@@ -284,7 +279,6 @@ describe("HCR trace content assertions", () => {
 
   it("trace contains Step events from the HCR program", () => {
     const result = recordAndDecode();
-    if (!result) return;
     const { bundle } = result;
 
     // The program has 12 iterations with multiple statements each, plus
@@ -295,7 +289,6 @@ describe("HCR trace content assertions", () => {
 
   it("Function definitions include module entry and arrow functions", () => {
     const result = recordAndDecode();
-    if (!result) return;
     const { bundle } = result;
 
     const funcNames = bundle.functions ?? [];
@@ -313,7 +306,6 @@ describe("HCR trace content assertions", () => {
 
   it("recorded CTFS trace surfaces the index.js source path", () => {
     const result = recordAndDecode();
-    if (!result) return;
     const { bundle } = result;
 
     const paths = bundle.paths ?? [];
@@ -326,7 +318,6 @@ describe("HCR trace content assertions", () => {
 
   it("structural integrity: substantial step count for the HCR program", () => {
     const result = recordAndDecode();
-    if (!result) return;
     const { bundle } = result;
 
     // Module + at least one arrow function must surface.

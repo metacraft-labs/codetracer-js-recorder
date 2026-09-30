@@ -18,7 +18,7 @@ import {
 import type { TraceManifest } from "@codetracer/runtime";
 import { instrument } from "@codetracer/instrumenter";
 import {
-  ctPrintAvailable,
+  requireCtPrint,
   ctPrintJson,
   findCtFile,
   type CtPrintBundle,
@@ -241,10 +241,7 @@ var r5 = work(200);
       const traceDir = traceDirMatch![1].trim();
 
       // Measure the produced CTFS bundle.
-      if (!ctPrintAvailable()) {
-        console.warn("SKIP benchmark size analysis: ct-print not found");
-        return;
-      }
+      requireCtPrint();
       const ctFile = findCtFile(traceDir);
       const bundle = ctPrintJson(ctFile) as CtPrintBundle;
       const stepEvents = (bundle.steps ?? []).length;

@@ -19,7 +19,7 @@ import {
 import type { TraceManifest } from "@codetracer/runtime";
 import { instrument } from "@codetracer/instrumenter";
 import {
-  ctPrintAvailable,
+  requireCtPrint,
   ctPrintJson,
   findCtFile,
   type CtPrintBundle,
@@ -344,10 +344,7 @@ main();
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP content assertions: ct-print not found");
-      return;
-    }
+    requireCtPrint();
 
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
@@ -427,10 +424,7 @@ main();
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP content assertions: ct-print not found");
-      return;
-    }
+    requireCtPrint();
 
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;

@@ -25,7 +25,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
 import {
-  ctPrintAvailable,
+  requireCtPrint,
   ctPrintFull,
   findCtFile,
 } from "../helpers/ct-print.js";
@@ -76,7 +76,7 @@ describe("P2 column-aware step emission", () => {
   });
 
   it("default-on: trace carries column-aware flag + column field on steps", () => {
-    if (!ctPrintAvailable()) return;
+    requireCtPrint();
     const src = `const a = 1;\nconst b = 2;\nconst c = a + b;\nconsole.log(c);\n`;
     const traceDir = recordSource(src, tmpDir);
     const ctFile = findCtFile(traceDir);
@@ -98,7 +98,7 @@ describe("P2 column-aware step emission", () => {
   });
 
   it("--no-column-aware: legacy line-only trace, no column flag", () => {
-    if (!ctPrintAvailable()) return;
+    requireCtPrint();
     const src = `const a = 1;\nconst b = 2;\nconst c = a + b;\nconsole.log(c);\n`;
     const traceDir = recordSource(src, tmpDir, ["--no-column-aware"]);
     const ctFile = findCtFile(traceDir);
@@ -123,7 +123,7 @@ describe("P2 column-aware step emission", () => {
    * against column 1, not against the previous column.
    */
   it("multiple statements on one line each record distinct columns", () => {
-    if (!ctPrintAvailable()) return;
+    requireCtPrint();
     // Three `let` declarations separated by `;` on a single line.
     // SWC byte offsets within the line are 0, 12, 24 (0-based); the
     // recorder converts these to 1-based columns 1, 13, 25 on the wire.

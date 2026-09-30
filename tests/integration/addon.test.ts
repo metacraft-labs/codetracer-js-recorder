@@ -14,7 +14,7 @@ import {
 import type { TraceManifest } from "@codetracer/runtime";
 import { instrument } from "@codetracer/instrumenter";
 import {
-  ctPrintAvailable,
+  requireCtPrint,
   ctPrintJson,
   findCtFile,
   type CtPrintBundle,
@@ -194,10 +194,7 @@ describe("test_addon_append_events_batch", () => {
 
     const traceDir = session.stop();
 
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP content assertions: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
@@ -244,10 +241,7 @@ describe("test_addon_append_events_batch", () => {
 
     const traceDir = session.stop();
 
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP content assertions: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
@@ -418,10 +412,7 @@ greet("World");
     // Step 6: Verify the trace
     expect(fs.existsSync(traceDir)).toBe(true);
 
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP content assertions: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 

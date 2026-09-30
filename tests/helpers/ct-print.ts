@@ -63,6 +63,25 @@ export function ctPrintAvailable(): boolean {
 }
 
 /**
+ * Fail the calling test when `ct-print` is not reachable.
+ *
+ * Tests that decode a recording with `ct-print` must not return early
+ * without it: the test runner would report a pass for a test that asserted
+ * nothing. Build it in the sibling `codetracer-trace-format-nim` checkout
+ * (`nimble buildCtPrint`, as CI does) or point `CT_PRINT` at a binary.
+ */
+export function requireCtPrint(): string {
+  const p = ctPrintPath();
+  if (!ctPrintAvailable()) {
+    throw new Error(
+      `ct-print not found at ${p} -- build it in codetracer-trace-format-nim ` +
+        "(`nimble buildCtPrint`) or set CT_PRINT.",
+    );
+  }
+  return p;
+}
+
+/**
  * Locate the first `.ct` file in a recorded trace directory.
  *
  * The Nim writer names the container after the program (e.g. `hello.ct`
@@ -84,8 +103,8 @@ export function findCtFile(traceDir: string): string {
 
 /**
  * Convert a recorded `.ct` bundle to JSON via `ct-print --json` and
- * parse the result.  Throws if `ct-print` is unavailable so callers
- * must guard with `ctPrintAvailable()` and skip when appropriate.
+ * parse the result.  Throws if `ct-print` is unavailable; callers start
+ * with `requireCtPrint()`.
  */
 export function ctPrintJson(ctFile: string): unknown {
   const bin = ctPrintPath();
@@ -446,7 +465,7 @@ export interface CtFullBundle {
  * across machines and test runs.
  *
  * Throws if `ct-print` is unavailable so callers must guard with
- * `ctPrintAvailable()` and skip when appropriate.
+ * `requireCtPrint()` first.
  */
 export function ctPrintFull(ctFile: string): CtFullBundle {
   const bin = ctPrintPath();

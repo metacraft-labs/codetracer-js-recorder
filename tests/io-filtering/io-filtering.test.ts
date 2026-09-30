@@ -16,7 +16,7 @@ import {
 } from "@codetracer/runtime";
 import { shouldInstrument } from "@codetracer/instrumenter";
 import {
-  ctPrintAvailable,
+  requireCtPrint,
   ctPrintJson,
   findCtFile,
   type CtPrintBundle,
@@ -382,10 +382,7 @@ describe("e2e_console_capture", () => {
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
@@ -427,10 +424,7 @@ console.error("error message");
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
@@ -474,10 +468,7 @@ console.log("value is", 42);
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 

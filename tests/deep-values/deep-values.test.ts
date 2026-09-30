@@ -11,7 +11,7 @@ import {
 } from "@codetracer/runtime";
 import type { TraceManifest, EncodedValue } from "@codetracer/runtime";
 import {
-  ctPrintAvailable,
+  requireCtPrint,
   ctPrintJson,
   findCtFile,
   type CtPrintBundle,
@@ -652,10 +652,7 @@ describe("test_addon_deep_value_capture", () => {
 
     const traceDir = session!.stop();
 
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
@@ -732,10 +729,7 @@ console.log("counter:", c2);
     expect(traceDirMatch).not.toBeNull();
     const traceDir = traceDirMatch![1].trim();
 
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
