@@ -14,9 +14,14 @@ alias fmt := format
 install:
     npm install
 
-# Run all tests (builds workspaces first so imports resolve)
+# Run all tests. Builds the native addon and the workspaces first: the
+# recording tests load `crates/recorder_native/index.node`, which is not
+# committed, so on a clean tree (or after the trace-format siblings move)
+# they must not run against a missing or stale addon. Cargo makes the
+# addon build a no-op when nothing changed.
 test: install
     cargo test --manifest-path crates/recorder_native/Cargo.toml
+    just build-native
     npm run build
     npm test
     just verify-cli-convention
