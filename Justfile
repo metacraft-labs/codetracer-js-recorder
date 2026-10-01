@@ -53,7 +53,7 @@ format-js:
 
 # Format Nix files
 format-nix:
-    if command -v nixfmt >/dev/null; then find . -name '*.nix' -print0 | xargs -0 nixfmt; fi
+    find . -name '*.nix' -not -path './node_modules/*' -print0 | xargs -0 nixfmt
 
 # Format all code
 format:
@@ -72,7 +72,7 @@ lint-js:
 
 # Lint Nix files
 lint-nix:
-    if command -v nixfmt >/dev/null; then find . -name '*.nix' -print0 | xargs -0 nixfmt --check; fi
+    find . -name '*.nix' -not -path './node_modules/*' -print0 | xargs -0 nixfmt --check
 
 # Lint all code
 lint:

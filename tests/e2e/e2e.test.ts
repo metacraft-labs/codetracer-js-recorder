@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
 import {
-  ctPrintAvailable,
+  requireCtPrint,
   ctPrintFull,
   ctPrintJson,
   findCtFile,
@@ -261,15 +261,7 @@ describe("e2e_record_simple_program", () => {
     //          using the textual `Raw` form rather than the typed
     //          `String` variant — this is current recorder behaviour;
     //          if it changes, the strict invariant below fires).
-    if (!ctPrintAvailable()) {
-      // Skip when ct-print is not reachable (out-of-workspace CI run).
-      // The verify-cli-convention-no-silent-skip.sh guard ensures the
-      // CLI surface stays compliant even if this content test is skipped.
-      console.warn(
-        "SKIP test_recorded_trace_via_ct_print_json: ct-print not found",
-      );
-      return;
-    }
+    requireCtPrint();
 
     const outDir = path.join(tmpDir, "traces");
     const { stdout } = runCLI([
@@ -587,10 +579,7 @@ describe("e2e_record_simple_program", () => {
   });
 
   it("recorded CTFS trace contains Call frames for greet + module", () => {
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const outDir = path.join(tmpDir, "traces2");
     const { stdout } = runCLI([
       "record",
@@ -664,10 +653,7 @@ describe("e2e_record_multi_file", () => {
   });
 
   it("records functions.js and all function names appear in the trace", () => {
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const outDir = path.join(tmpDir, "traces");
     const { stdout } = runCLI([
       "record",
@@ -697,10 +683,7 @@ describe("e2e_record_multi_file", () => {
   });
 
   it("records loops.js and captures loop iterations as Step events", () => {
-    if (!ctPrintAvailable()) {
-      console.warn("SKIP: ct-print not found");
-      return;
-    }
+    requireCtPrint();
     const outDir = path.join(tmpDir, "traces2");
     const { stdout } = runCLI([
       "record",
