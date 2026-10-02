@@ -15,15 +15,13 @@
  * Playwright can launch, and the `session-manager` binary).
  *
  * Pass criteria (mirrors the milestone description):
- *   1. The `<program>.ct/trace.json` file exists and parses as a JSON
- *      array of externally-tagged `TraceLowLevelEvent`s.
- *   2. At least one `Step` record is present (proof that the SWC
- *      instrumenter's `__ct.step(siteId)` calls reached the daemon).
- *   3. At least one matched `VariableName` + `Value` pair is present
- *      (proof that the page-side `__ct.value(name, value)` path lowers
- *      cleanly into the on-disk vocabulary).
- *   4. No record is malformed: every entry is a single-key object whose
- *      key is one of the known externally-tagged variant names.
+ *   1. The daemon wrote a single-file CTFS `<program>.ct` — and nothing
+ *      else: no `trace.json`, `trace_metadata.json` or `trace_paths.json`
+ *      — and the canonical decoder (`ct-print --full`) reads it.
+ *   2. At least one step is present (proof that the SWC instrumenter's
+ *      `__ct.step(siteId)` calls reached the daemon).
+ *   3. The page-side `__ct.value("z", z)` value is recorded against its
+ *      name (proof that the value path lowers cleanly into the recording).
  *
  * Skip discipline (Recorder-CLI-Conventions §1 / §6): the test prints
  * `SKIP:` with the precise missing prerequisite so a CI runner that
@@ -39,6 +37,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as net from "node:net";
+import { ctPrintAvailable, ctPrintFull, ctPrintPath } from "../helpers/ct-print";
 
 const REPO_ROOT = path.resolve(__dirname, "../..");
 const CLI_PATH = path.join(REPO_ROOT, "packages/cli/dist/index.js");
@@ -285,24 +284,8 @@ function writeFixture(dir: string, daemonPort: number): void {
 
 // ── Trace assertions ────────────────────────────────────────────────────
 
-/**
- * Known externally-tagged variants of `TraceLowLevelEvent` per
- * `codetracer/src/backend-manager/src/browser_stream_host.rs`.  Each
- * top-level record must carry exactly one key drawn from this set.
- */
-const KNOWN_TRACE_VARIANTS = new Set([
-  "Path",
-  "Function",
-  "Step",
-  "Call",
-  "Return",
-  "Value",
-  "VariableName",
-  "Event",
-]);
-
-/** Find a `<program>.ct/trace.json` under `outDir`. */
-function findTraceJson(outDir: string): string | null {
+/** Find the `<program>.ct` recording under `outDir`. */
+function findRecording(outDir: string): string | null {
   let entries: string[];
   try {
     entries = fs.readdirSync(outDir);
@@ -310,8 +293,8 @@ function findTraceJson(outDir: string): string | null {
     return null;
   }
   for (const e of entries) {
-    const cand = path.join(outDir, e, "trace.json");
-    if (e.endsWith(".ct") && fs.existsSync(cand)) return cand;
+    const cand = path.join(outDir, e);
+    if (e.endsWith(".ct") && fs.statSync(cand).isFile()) return cand;
   }
   return null;
 }
@@ -402,6 +385,12 @@ describe("test_browser_recorder_full_stack", () => {
       !fs.existsSync(VITE_PLUGIN_DIST)
     ) {
       console.warn("SKIP: workspace dists missing — run `npm run build`.");
+      return;
+    }
+    if (!ctPrintAvailable()) {
+      console.warn(
+        `SKIP: ct-print not found at ${ctPrintPath()} — build it in codetracer-trace-format-nim or set CT_PRINT.`,
+      );
       return;
     }
 
@@ -510,49 +499,35 @@ describe("test_browser_recorder_full_stack", () => {
 
     // ── Stop the daemon (SIGINT triggers graceful flush) ───────────────
     await killChild(daemon.child);
-    // Give the writer a moment to flush trace.json before we read it.
+    // Give the writer a moment to finalise the recording before we read it.
     await new Promise((r) => setTimeout(r, 300));
 
-    // ── Locate + parse the trace ───────────────────────────────────────
-    const tracePath = findTraceJson(outDir);
+    // ── Locate + decode the recording ──────────────────────────────────
+    const recording = findRecording(outDir);
     expect(
-      tracePath,
-      `expected <program>.ct/trace.json under ${outDir}; daemon stderr:\n${daemon.stderr.join("")}`,
+      recording,
+      `expected a <program>.ct under ${outDir}; daemon stderr:\n${daemon.stderr.join("")}`,
     ).not.toBeNull();
-    const records = JSON.parse(fs.readFileSync(tracePath!, "utf-8")) as Array<
-      Record<string, unknown>
-    >;
-    expect(Array.isArray(records)).toBe(true);
-    expect(records.length).toBeGreaterThan(0);
+    const sidecars = fs
+      .readdirSync(outDir)
+      .filter((e) => /^trace(_metadata|_paths)?\.json$/.test(e));
+    expect(sidecars, "record-web must write no JSON sidecar").toEqual([]);
 
-    // ── Vocabulary well-formedness ─────────────────────────────────────
-    for (const rec of records) {
-      const keys = Object.keys(rec);
-      expect(keys.length, `bad record: ${JSON.stringify(rec)}`).toBe(1);
-      expect(
-        KNOWN_TRACE_VARIANTS.has(keys[0]),
-        `unknown variant '${keys[0]}'`,
-      ).toBe(true);
-    }
+    const bundle = ctPrintFull(recording!);
 
     // ── Content checks ─────────────────────────────────────────────────
-    expect(records.filter((r) => "Step" in r).length).toBeGreaterThan(0);
+    const steps = bundle.events.filter((e) => e.kind === "step");
+    expect(steps.length).toBeGreaterThan(0);
 
-    // VariableName + Value land as adjacent records (the writer pushes
-    // them as a pair) — at least one such pair must exist.
-    let foundPair = false;
-    let foundZ = false;
-    for (let i = 0; i < records.length - 1; i++) {
-      if ("VariableName" in records[i] && "Value" in records[i + 1]) {
-        foundPair = true;
-        if (records[i].VariableName === "z") foundZ = true;
-      }
+    const recordedNames = new Set<string>();
+    for (const e of bundle.events) {
+      if (e.kind !== "step") continue;
+      for (const v of e.vars ?? []) recordedNames.add(v.varname);
     }
     expect(
-      foundPair,
-      "expected at least one (VariableName, Value) adjacent pair",
+      recordedNames.has("z"),
+      `expected the page-side __ct.value('z', z) to be recorded; got ${[...recordedNames].join(", ")}`,
     ).toBe(true);
-    expect(foundZ, "expected the page-side __ct.value('z', z) pair").toBe(true);
 
     fs.rmSync(tmp, { recursive: true, force: true });
   }, 60_000);
