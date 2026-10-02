@@ -92,6 +92,23 @@
           preCommit = self.checks.${system}.pre-commit-check;
           isLinux = pkgs.stdenv.isLinux;
           isDarwin = pkgs.stdenv.isDarwin;
+          # git-hooks.nix installs `.pre-commit-config.yaml` and git hooks into
+          # `git rev-parse --show-toplevel` of the directory the shell is entered
+          # from, so `nix develop /path/to/this-repo` run inside another checkout
+          # would plant this repository's hooks there. `ownRepoOnly` runs a snippet
+          # only when that toplevel is this repository, recognised by a `flake.nix`
+          # identical to the one this shell was evaluated from; anything it cannot
+          # establish counts as another repository, so it fails safe.
+          # tests/test_dev_shell_writes_nothing_elsewhere.sh
+          ownRepoOnly = script: ''
+            _own_repo_root="$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || true)"
+            if [ -n "$_own_repo_root" ] && [ -f "$_own_repo_root/flake.nix" ] \
+              && [ "$(${pkgs.coreutils}/bin/sha256sum "$_own_repo_root/flake.nix" | ${pkgs.coreutils}/bin/cut -d' ' -f1)" \
+                = "${builtins.hashFile "sha256" ./flake.nix}" ]; then
+            ${script}
+            fi
+            unset _own_repo_root
+          '';
         in
         {
           default = pkgs.mkShell {
@@ -144,7 +161,7 @@
             # are symlinks to the real CARGO_HOME, and so are its config and
             # credentials when present: the download cache is shared, and only
             # the proxy directory is left behind.
-            shellHook = preCommit.shellHook + ''
+            shellHook = ownRepoOnly preCommit.shellHook + ''
               _js_real_cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
               _js_cargo_home="''${XDG_CACHE_HOME:-$HOME/.cache}/codetracer-js-recorder/cargo-home"
               if [ "$_js_real_cargo_home" != "$_js_cargo_home" ]; then

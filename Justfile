@@ -268,3 +268,8 @@ record-mixed-request-panel-fixture OUT:
     [[ ${#containers[@]} == 1 ]]
     mkdir -p "$(dirname '{{OUT}}')"
     cp "${containers[0]}" '{{OUT}}'
+
+# Entering the dev shell from another git repository must write nothing there.
+# Runs `nix develop`, so it is not part of the in-shell test recipes.
+test-dev-shell:
+    bash tests/test_dev_shell_writes_nothing_elsewhere.sh
