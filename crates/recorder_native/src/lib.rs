@@ -1020,6 +1020,67 @@ pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// The state a recording starts from: the manifest's paths, the
+/// pre-registered types and the manifest's functions, ahead of any event
+/// the program reports.
+fn new_recorder_state(
+    trace_dir: PathBuf,
+    manifest: Manifest,
+    program: String,
+    args: Vec<String>,
+    column_aware: bool,
+) -> RecorderState {
+    let mut type_registry = TypeRegistry::new();
+    let var_name_registry = VariableNameRegistry::new();
+
+    // Pre-register paths and functions as initial events
+    let mut events: Vec<TraceEvent> = Vec::new();
+
+    for p in &manifest.paths {
+        events.push(TraceEvent::Path(PathBuf::from(p)));
+    }
+
+    // Register types that functions may reference — emit Type events
+    // before Function events so the db-backend has them available.
+    // We pre-register a few common types.
+    for kind in [
+        TypeKind::None,
+        TypeKind::Int,
+        TypeKind::Float,
+        TypeKind::String,
+        TypeKind::Bool,
+        TypeKind::Raw,
+        TypeKind::Seq,
+        TypeKind::Struct,
+        TypeKind::FunctionKind,
+    ] {
+        let (_id, type_event) = type_registry.get_or_register(kind);
+        if let Some(te) = type_event {
+            events.push(te);
+        }
+    }
+
+    for f in &manifest.functions {
+        events.push(TraceEvent::Function(FunctionRecord {
+            path_id: f.path_index,
+            line: f.line as i64,
+            name: f.name.clone(),
+        }));
+    }
+
+    RecorderState {
+        trace_dir,
+        manifest,
+        events,
+        program,
+        args,
+        type_registry,
+        var_name_registry,
+        column_aware,
+        spans: Vec::new(),
+    }
+}
+
 #[napi]
 pub fn start_recording(opts: JsObject) -> Result<u32> {
     // Extract fields from the options object
@@ -1086,55 +1147,7 @@ pub fn start_recording(opts: JsObject) -> Result<u32> {
         )
     })?;
 
-    let mut type_registry = TypeRegistry::new();
-    let var_name_registry = VariableNameRegistry::new();
-
-    // Pre-register paths and functions as initial events
-    let mut events: Vec<TraceEvent> = Vec::new();
-
-    for p in &manifest.paths {
-        events.push(TraceEvent::Path(PathBuf::from(p)));
-    }
-
-    // Register types that functions may reference — emit Type events
-    // before Function events so the db-backend has them available.
-    // We pre-register a few common types.
-    for kind in [
-        TypeKind::None,
-        TypeKind::Int,
-        TypeKind::Float,
-        TypeKind::String,
-        TypeKind::Bool,
-        TypeKind::Raw,
-        TypeKind::Seq,
-        TypeKind::Struct,
-        TypeKind::FunctionKind,
-    ] {
-        let (_id, type_event) = type_registry.get_or_register(kind);
-        if let Some(te) = type_event {
-            events.push(te);
-        }
-    }
-
-    for f in &manifest.functions {
-        events.push(TraceEvent::Function(FunctionRecord {
-            path_id: f.path_index,
-            line: f.line as i64,
-            name: f.name.clone(),
-        }));
-    }
-
-    let state = RecorderState {
-        trace_dir,
-        manifest,
-        events,
-        program,
-        args,
-        type_registry,
-        var_name_registry,
-        column_aware,
-        spans: Vec::new(),
-    };
+    let state = new_recorder_state(trace_dir, manifest, program, args, column_aware);
 
     recorder_map()
         .lock()
@@ -2531,4 +2544,190 @@ fn relativise_for_files_dir(absolute: &str) -> &str {
                 .unwrap_or(s)
         })
         .unwrap_or(trimmed)
+}
+
+/// What a recording's `paths.dat` says about each file: in a column-aware
+/// trace a file's line table is fixed by its first mention, so every file
+/// whose table the recorder knows must arrive with it, ahead of any step,
+/// function or call that names the file.
+///
+/// No mocks: each test records through the real Nim-backed writer and reads
+/// the container back with `codetracer_trace_reader`.
+#[cfg(test)]
+mod path_table_tests {
+    use super::*;
+
+    fn manifest(json: &str) -> Manifest {
+        serde_json::from_str(json).expect("test manifest parses")
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ct-js-path-table-{name}-{}-{}",
+            std::process::id(),
+            wall_clock_ns()
+        ));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn step(path_id: usize, line: i64, column: i64) -> TraceEvent {
+        TraceEvent::Step(StepRecord {
+            path_id,
+            line,
+            column: Some(column),
+        })
+    }
+
+    fn state_for(dir: &Path, manifest: Manifest) -> RecorderState {
+        new_recorder_state(
+            dir.to_path_buf(),
+            manifest,
+            "prog.js".to_string(),
+            Vec::new(),
+            true,
+        )
+    }
+
+    /// Write `state` and return each `paths.dat` record of the container as
+    /// `(path, line table)`, in path-id order.
+    fn write_and_read_paths(dir: &Path, state: &RecorderState) -> Vec<(String, Vec<u32>)> {
+        write_binary_trace(state, dir).expect("the recording is written");
+        let container = fs::read_dir(dir)
+            .expect("the trace dir lists")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .find(|p| p.extension().is_some_and(|ext| ext == "ct"))
+            .expect("the recording wrote a .ct container");
+        let tables =
+            codetracer_trace_reader::interning_tables_reader::open_interning_tables(&container)
+                .expect("the container opens")
+                .expect("the container has interning tables");
+        assert!(tables.is_column_aware(), "the recording is column-aware");
+        let records = (0..tables.path_count() as u64)
+            .map(|id| {
+                (
+                    tables.path_str(id).expect("path record"),
+                    tables.path_line_lengths(id).expect("line table"),
+                )
+            })
+            .collect();
+        let _ = fs::remove_dir_all(dir);
+        records
+    }
+
+    /// Record `events` after the recording's preamble.
+    fn record(name: &str, manifest: Manifest, events: Vec<TraceEvent>) -> Vec<(String, Vec<u32>)> {
+        let dir = scratch_dir(name);
+        let mut state = state_for(&dir, manifest);
+        state.events.extend(events);
+        write_and_read_paths(&dir, &state)
+    }
+
+    const TWO_FILES: &str = r#"{
+        "formatVersion": 1,
+        "paths": ["/src/main.js", "/src/lib.js"],
+        "functions": [
+            {"name": "helper", "pathIndex": 1, "line": 2, "col": 0}
+        ],
+        "sites": [],
+        "lineLengths": {
+            "/src/main.js": [12, 30, 7, 19],
+            "/src/lib.js": [21, 15, 1]
+        }
+    }"#;
+
+    #[test]
+    fn each_file_carries_its_own_table_at_the_id_the_manifest_gives_it() {
+        let records = record(
+            "manifest-order",
+            manifest(TWO_FILES),
+            vec![
+                step(1, 2, 2),
+                step(0, 1, 0),
+                TraceEvent::Call(CallRecord {
+                    function_id: 0,
+                    args: Vec::new(),
+                }),
+                step(1, 3, 0),
+                step(0, 4, 5),
+            ],
+        );
+        assert_eq!(
+            records,
+            vec![
+                ("/src/main.js".to_string(), vec![12, 30, 7, 19]),
+                ("/src/lib.js".to_string(), vec![21, 15, 1]),
+            ],
+        );
+    }
+
+    /// A site or function whose path index the manifest does not hold is
+    /// recorded against `<unknown>`.  That file has no source, so it keeps
+    /// whatever table its registration gives it; what must not happen is
+    /// that it is named before the files the manifest lists, which would
+    /// move them off the ids the manifest gave them, or that naming it
+    /// disturbs their tables.
+    #[test]
+    fn a_path_the_manifest_lacks_is_registered_after_the_manifest_files_and_without_a_table() {
+        let json = r#"{
+            "formatVersion": 1,
+            "paths": ["/src/main.js", "/src/lib.js"],
+            "functions": [
+                {"name": "lost", "pathIndex": 9, "line": 1, "col": 0},
+                {"name": "helper", "pathIndex": 1, "line": 2, "col": 0}
+            ],
+            "sites": [],
+            "lineLengths": {
+                "/src/main.js": [12, 30, 7, 19],
+                "/src/lib.js": [21, 15, 1]
+            }
+        }"#;
+        let records = record(
+            "unknown-path",
+            manifest(json),
+            vec![
+                step(7, 1, 0),
+                step(0, 2, 3),
+                TraceEvent::Call(CallRecord {
+                    function_id: 1,
+                    args: Vec::new(),
+                }),
+                step(1, 1, 0),
+                TraceEvent::Call(CallRecord {
+                    function_id: 0,
+                    args: Vec::new(),
+                }),
+            ],
+        );
+        assert_eq!(
+            records,
+            vec![
+                ("/src/main.js".to_string(), vec![12, 30, 7, 19]),
+                ("/src/lib.js".to_string(), vec![21, 15, 1]),
+                ("<unknown>".to_string(), vec![]),
+            ],
+        );
+    }
+
+    /// The replay must not depend on the order the buffered events happen
+    /// to be in: a file's table is registered before the first event that
+    /// names it even when that event comes ahead of every other one.
+    #[test]
+    fn a_file_named_by_the_first_step_still_gets_its_table() {
+        let dir = scratch_dir("first-step");
+        let mut state = state_for(&dir, manifest(TWO_FILES));
+        // A step ahead of the recording's preamble: the first thing the
+        // replay sees names `/src/lib.js`.
+        state.events.insert(0, step(1, 3, 0));
+        state.events.push(step(0, 1, 0));
+        let mut by_path = write_and_read_paths(&dir, &state);
+        by_path.sort();
+        assert_eq!(
+            by_path,
+            vec![
+                ("/src/lib.js".to_string(), vec![21, 15, 1]),
+                ("/src/main.js".to_string(), vec![12, 30, 7, 19]),
+            ],
+        );
+    }
 }

@@ -66,6 +66,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
+name = "capnp"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fe67a3f89b693d2163cf3d94129125463ac5913e1c4322f2db905aa631d3c67"
+dependencies = [
+ "embedded-io",
+]
+
+[[package]]
+name = "capnpc"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "642d771bf5096ad1963fdbb9839f22e7bb1e308a2d1456fb1ad6cc99bb691115"
+dependencies = [
+ "capnp",
+]
+
+[[package]]
 name = "cbor4ii"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -148,6 +166,7 @@ name = "codetracer_js_recorder_native"
 version = "0.1.0"
 dependencies = [
  "codetracer_ctfs",
+ "codetracer_trace_reader",
  "codetracer_trace_types",
  "codetracer_trace_writer_nim",
  "napi",
@@ -155,6 +174,39 @@ dependencies = [
  "napi-derive",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "codetracer_trace_format_capnp"
+version = "0.19.0"
+dependencies = [
+ "capnp",
+ "capnpc",
+ "codetracer_trace_types",
+]
+
+[[package]]
+name = "codetracer_trace_format_cbor_zstd"
+version = "0.19.0"
+
+[[package]]
+name = "codetracer_trace_reader"
+version = "0.19.0"
+dependencies = [
+ "cbor4ii",
+ "codetracer_ctfs",
+ "codetracer_trace_format_capnp",
+ "codetracer_trace_format_cbor_zstd",
+ "codetracer_trace_types",
+ "codetracer_trace_writer",
+ "fscommon",
+ "num-traits",
+ "ruzstd",
+ "serde",
+ "serde_json",
+ "zeekstd",
+ "zstd",
+ "zstd-safe",
 ]
 
 [[package]]
@@ -170,6 +222,23 @@ dependencies = [
  "serde_repr",
  "serde_with",
  "uuid",
+]
+
+[[package]]
+name = "codetracer_trace_writer"
+version = "0.19.0"
+dependencies = [
+ "cbor4ii",
+ "codetracer_ctfs",
+ "codetracer_trace_format_capnp",
+ "codetracer_trace_format_cbor_zstd",
+ "codetracer_trace_types",
+ "num-traits",
+ "ruzstd",
+ "serde",
+ "serde_json",
+ "zeekstd",
+ "zstd",
 ]
 
 [[package]]
@@ -314,6 +383,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "embedded-io"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -348,6 +423,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fscommon"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "315ce685aca5ddcc5a3e7e436ef47d4a5d0064462849b6f0f628c28140103531"
+dependencies = [
+ "log",
 ]
 
 [[package]]
@@ -939,6 +1023,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
+name = "ruzstd"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "schemars"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1197,6 +1290,12 @@ dependencies = [
  "displaydoc",
  "zerovec",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
 
 [[package]]
 name = "typenum"
@@ -1662,6 +1761,15 @@ dependencies = [
  "quote",
  "syn",
  "synstructure",
+]
+
+[[package]]
+name = "zeekstd"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5f1379c45a7b52ed4aa3442da2cf5cc39abf1d8d178a5c02797be29c072ede2"
+dependencies = [
+ "zstd-safe",
 ]
 
 [[package]]
