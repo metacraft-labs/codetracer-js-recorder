@@ -18,9 +18,9 @@
  *      `ct print --json`'s `values` table.
  *
  *   2. `console.warn` / `console.error` writes are tagged
- *      `EventLogKind::WriteOther` — they should land in the `ioStderr`
- *      bucket of `ct print --json`'s `ioEvents` array, while
- *      `console.log` lands in `ioStdout`.
+ *      `EventLogKind::WriteOther` — `ct print --json` reports them as
+ *      `elkWriteOther` in its `ioEvents` array, while `console.log` is
+ *      an `elkWrite`.
  *
  *   3. Thread events emit through dedicated FFI entry points
  *      (`register_thread_start` etc.) instead of being silently dropped.
@@ -160,22 +160,13 @@ console.error("error-line");
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
     const ioEvents = bundle.ioEvents ?? [];
-    // Note: `ct print --json` currently collapses Write (stdout) and
-    // WriteOther (stderr) into the same `ioStdout` bucket via the
-    // multi-stream IO event collapse documented in the cairo audit
-    // (1.50, "Multi-stream IO event collapse" — `toIOEventKind` in
-    // `codetracer_trace_writer_ffi.nim` drops most `EventLogKind`
-    // variants into 4 buckets and `metadata` is dropped entirely).
-    // The recorder DOES correctly tag console.warn/.error as
-    // `WriteOther` at the writer level — that invariant is locked
-    // in by the addon-level test
-    // `tests/integration/addon.test.ts::test_addon_event_kinds`
-    // (when added) and by inspecting the raw `Event` records via the
-    // codetracer_trace_reader_nim crate (out of scope for this test).
-    //
-    // For this test we verify the structurally-stable invariants:
-    //   * All three IO entries reach the events stream.
-    //   * Each carries its content intact.
+    // `ct print --json` names each event by the recorder's exact
+    // EventLogKind, so stdout and stderr writes are told apart here.
+    const kindOf = (text: string) =>
+      ioEvents.find((e) => (e.data ?? "").includes(text))?.kind;
+    expect(kindOf("stdout-line")).toBe("elkWrite");
+    expect(kindOf("warn-line")).toBe("elkWriteOther");
+    expect(kindOf("error-line")).toBe("elkWriteOther");
     expect(ioEvents.length).toBeGreaterThanOrEqual(3);
     expect(ioEvents.some((e) => (e.data ?? "").includes("stdout-line"))).toBe(
       true,

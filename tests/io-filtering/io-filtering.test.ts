@@ -365,7 +365,7 @@ describe("e2e_console_capture", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("records a program that uses console.log and surfaces ioStdout in CTFS", () => {
+  it("records a program that uses console.log as a Write event in CTFS", () => {
     const outDir = path.join(tmpDir, "traces");
     const { stdout } = runCLI([
       "record",
@@ -386,9 +386,10 @@ describe("e2e_console_capture", () => {
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
-    // ct print --json collapses Write into ioStdout in the ioEvents stream.
+    // `ct print --json` names each event by the recorder's exact
+    // EventLogKind: console.log is a `Write`.
     const stdouts = (bundle.ioEvents ?? []).filter(
-      (e) => e.kind === "ioStdout",
+      (e) => e.kind === "elkWrite",
     );
     expect(stdouts.length).toBeGreaterThanOrEqual(1);
 
@@ -398,7 +399,7 @@ describe("e2e_console_capture", () => {
     expect(helloWrite).toBeDefined();
   });
 
-  it("records console.warn/error with ioStderr kind in CTFS", () => {
+  it("records console.warn/error as WriteOther events in CTFS", () => {
     // Create a test program that uses console.warn and console.error
     const programDir = path.join(tmpDir, "src");
     fs.mkdirSync(programDir, { recursive: true });
@@ -429,11 +430,14 @@ console.error("error message");
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
     const ioEvents = bundle.ioEvents ?? [];
-    // `ct print --json` collapses Write/WriteOther into a single
-    // `ioStdout` bucket (multi-stream IO event collapse — see the
-    // cairo audit's "Multi-stream IO event collapse" entry).  The
-    // stderr-routing invariant at the writer level is preserved but
-    // not visible here; we assert the structurally-stable invariants.
+    // `ct print --json` names each event by the recorder's exact
+    // EventLogKind: console.log is a `Write`, console.warn/.error a
+    // `WriteOther`.
+    const kindOf = (text: string) =>
+      ioEvents.find((e) => (e.data ?? "").includes(text))?.kind;
+    expect(kindOf("normal output")).toBe("elkWrite");
+    expect(kindOf("warning message")).toBe("elkWriteOther");
+    expect(kindOf("error message")).toBe("elkWriteOther");
     expect(ioEvents.length).toBeGreaterThanOrEqual(3);
     expect(ioEvents.some((e) => (e.data ?? "").includes("normal output"))).toBe(
       true,
@@ -472,10 +476,10 @@ console.log("value is", 42);
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintJson(ctFile) as CtPrintBundle;
 
-    // Should find the "value is 42" write in the IO stdout stream.
+    // Should find the "value is 42" write as a stdout `Write` event.
     const found = (bundle.ioEvents ?? []).find(
       (e) =>
-        e.kind === "ioStdout" &&
+        e.kind === "elkWrite" &&
         (e.data ?? "").includes("value is") &&
         (e.data ?? "").includes("42"),
     );

@@ -222,7 +222,11 @@ describe("P6.2 recorder-side autoformat", () => {
       const ctFile = findCtFile(traceDir);
       const bundle = ctPrintFull(ctFile);
 
-      expect(bundle.metadata.flags?.has_alternate_source_views).toBe(true);
+      // `srcviews.dat` is found by its presence; the header's
+      // alternate-source-views bit is not set.
+      expect(bundle.metadata.flags?.has_alternate_source_views ?? false).toBe(
+        false,
+      );
       expect(bundle.counts.source_views).toBeGreaterThanOrEqual(1);
 
       const view = bundle.source_views.find((sv) =>
@@ -297,7 +301,11 @@ describe("P6.2 recorder-side autoformat", () => {
     expect(ctPrintAvailable()).toBe(true);
     const ctFile = findCtFile(traceDir);
     const bundle = ctPrintFull(ctFile);
-    expect(bundle.metadata.flags?.has_alternate_source_views).toBe(true);
+    // `srcviews.dat` is found by its presence; the header's
+    // alternate-source-views bit is not set.
+    expect(bundle.metadata.flags?.has_alternate_source_views ?? false).toBe(
+      false,
+    );
     expect(bundle.counts.source_views).toBeGreaterThanOrEqual(1);
 
     const view = bundle.source_views.find((sv) =>

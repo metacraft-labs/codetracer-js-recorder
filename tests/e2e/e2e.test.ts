@@ -293,11 +293,11 @@ describe("e2e_record_simple_program", () => {
     expect(bundle.steps).toBeDefined();
     expect(bundle.steps!.length).toBeGreaterThan(0);
 
-    // The console.log("Hello, World!") call must surface as an ioStdout
+    // The console.log("Hello, World!") call must surface as a `Write`
     // event — this is the canonical anchor for the recorder's IO path.
     expect(bundle.ioEvents).toBeDefined();
     const helloEvent = bundle.ioEvents!.find(
-      (e) => e.kind === "ioStdout" && (e.data ?? "").includes("Hello, World!"),
+      (e) => e.kind === "elkWrite" && (e.data ?? "").includes("Hello, World!"),
     );
     expect(helloEvent).toBeDefined();
 
@@ -573,7 +573,7 @@ describe("e2e_record_simple_program", () => {
       (e): e is Extract<CtFullEvent, { kind: "io" }> => e.kind === "io",
     );
     expect(ioEvents).toHaveLength(1);
-    expect(ioEvents[0].io_kind).toBe("ioStdout");
+    expect(ioEvents[0].io_kind).toBe("Write");
     expect(ioEvents[0].text).toBe("Hello, World!");
     expect(ioEvents[0].bytes_len).toBe("Hello, World!".length);
   });

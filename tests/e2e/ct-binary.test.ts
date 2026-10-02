@@ -37,7 +37,7 @@ const CTFS_MAGIC = Buffer.from([0xc0, 0xde, 0x72, 0xac, 0xe2]);
  * remain readable across upstream bumps even before this constant is
  * updated.
  */
-const CTFS_VERSION = 4;
+const CTFS_VERSION = 5;
 
 /** Expected default block size (4096 as u32 LE). */
 const CTFS_BLOCK_SIZE = 4096;

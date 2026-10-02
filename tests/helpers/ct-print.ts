@@ -237,7 +237,7 @@ export type CtFullEvent =
     }
   | {
       kind: "io";
-      io_kind: string; // "ioStdout" / "ioStderr" / "ioFile" / "ioError"
+      io_kind: string; // the EventLogKind name: "Write", "WriteOther", "Error", ...
       io_index: number;
       step_id: number;
       text?: string;
