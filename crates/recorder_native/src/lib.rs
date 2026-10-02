@@ -543,7 +543,6 @@ enum ValueRecord {
 /// Uses serde's default externally-tagged enum representation, matching upstream.
 #[derive(Debug, Clone, Serialize)]
 enum TraceEvent {
-    Path(PathBuf),
     VariableName(String),
     Type(TypeRecord),
     Function(FunctionRecord),
@@ -1033,12 +1032,10 @@ fn new_recorder_state(
     let mut type_registry = TypeRegistry::new();
     let var_name_registry = VariableNameRegistry::new();
 
-    // Pre-register paths and functions as initial events
+    // Pre-register types and functions as initial events.  The manifest's
+    // paths are not events: `write_binary_trace` registers every one of
+    // them, with its line table, before it replays anything.
     let mut events: Vec<TraceEvent> = Vec::new();
-
-    for p in &manifest.paths {
-        events.push(TraceEvent::Path(PathBuf::from(p)));
-    }
 
     // Register types that functions may reference — emit Type events
     // before Function events so the db-backend has them available.
@@ -1824,22 +1821,89 @@ fn local_value_to_upstream(
 /// point handed to the writer's `start()`.  `None` when the recording holds
 /// neither.
 fn recording_entry_point(state: &RecorderState) -> Option<(PathBuf, i64)> {
-    let path_at = |index: usize| {
-        state
-            .manifest
-            .paths
-            .get(index)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("<unknown>"))
-    };
     state.events.iter().find_map(|event| match event {
-        TraceEvent::Step(sr) => Some((path_at(sr.path_id), sr.line)),
+        TraceEvent::Step(sr) => Some((manifest_path(state, sr.path_id), sr.line)),
         TraceEvent::Call(cr) => Some(match state.manifest.functions.get(cr.function_id) {
-            Some(f) => (path_at(f.path_index), f.line as i64),
-            None => (PathBuf::from("<unknown>"), 0),
+            Some(f) => (manifest_path(state, f.path_index), f.line as i64),
+            None => (PathBuf::from(UNKNOWN_PATH), 0),
         }),
         _ => None,
     })
+}
+
+/// The path recorded for a site, function or call whose path the manifest
+/// does not hold.
+const UNKNOWN_PATH: &str = "<unknown>";
+
+/// The path the manifest gives `index`, or [`UNKNOWN_PATH`].
+fn manifest_path(state: &RecorderState, index: usize) -> PathBuf {
+    state
+        .manifest
+        .paths
+        .get(index)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(UNKNOWN_PATH))
+}
+
+/// Whether the replay will name [`UNKNOWN_PATH`]: a function, step or call
+/// refers to a path index (or a function id) the manifest does not hold.
+fn recording_names_unknown_path(state: &RecorderState) -> bool {
+    let paths = state.manifest.paths.len();
+    let function_path_missing = |function_id: usize| match state.manifest.functions.get(function_id)
+    {
+        Some(f) => f.path_index >= paths,
+        None => true,
+    };
+    state
+        .manifest
+        .functions
+        .iter()
+        .any(|f| f.path_index >= paths)
+        || state.events.iter().any(|event| match event {
+            TraceEvent::Function(fr) => fr.path_id >= paths,
+            TraceEvent::Step(sr) => sr.path_id >= paths,
+            TraceEvent::Call(cr) => function_path_missing(cr.function_id),
+            _ => false,
+        })
+}
+
+/// Register every path the replay will name, before it names any.
+///
+/// In a column-aware trace a file's line table is fixed by the file's first
+/// mention -- a registration, or a step, function or call that names it --
+/// and a table offered after that is not the file's table.  So the
+/// manifest's paths are registered here, each with the table the manifest
+/// carries for it, ahead of `start()` and of every replayed event, and
+/// nothing later offers a table.  They are registered in manifest order, so
+/// a path's id is its manifest index (`register_source_view` relies on
+/// that).  [`UNKNOWN_PATH`], when some event needs it, comes after them; it
+/// has no source and so no table.
+fn register_recording_paths(state: &RecorderState, writer: &mut NimTraceWriter) {
+    let unknown = recording_names_unknown_path(state).then(|| UNKNOWN_PATH.to_string());
+    for path in state.manifest.paths.iter().chain(unknown.iter()) {
+        let p = Path::new(path);
+        if !state.column_aware {
+            writer.register_path(p);
+            continue;
+        }
+        let line_lengths: &[u32] = state
+            .manifest
+            .line_lengths
+            .get(path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if let Err(err) = writer.register_path_with_line_lengths(p, line_lengths) {
+            // Soft failure: the trace is still usable without per-line
+            // column counts (column resolution falls back to None at
+            // read time).
+            eprintln!(
+                "[codetracer-js-recorder] register_path_with_line_lengths failed for {}: {} \
+                 (column resolution will fall back to None for this file)",
+                p.display(),
+                err,
+            );
+        }
+    }
 }
 
 fn write_binary_trace(
@@ -1898,12 +1962,7 @@ fn write_binary_trace(
     // to track a previous-step cursor because the reset is
     // unconditional.
 
-    // P2.5: track paths we've registered with their line-length
-    // tables so we emit the `paths.dat` Layout A record exactly once
-    // per path (the first registration wins per the Nim writer's
-    // semantics).
-    let mut paths_with_line_lengths: std::collections::HashSet<PathBuf> =
-        std::collections::HashSet::new();
+    register_recording_paths(state, &mut writer);
 
     // M25: interned correlation-boundary label ids, hoisted out of the
     // replay loop.  `ensure_marker_id` is the primary operation of the
@@ -1925,34 +1984,6 @@ fn write_binary_trace(
             span_resolver.at_event_index(event_index, writer.next_step_index());
         }
         match event {
-            TraceEvent::Path(p) => {
-                // P2.5: when column-aware mode is on and the manifest
-                // ships a line-length table for this path, register
-                // it via the Layout A entry point.  Otherwise the
-                // legacy `register_path` call is preserved (the Nim
-                // writer takes the bare-path branch).
-                if state.column_aware {
-                    let path_str = p.to_string_lossy();
-                    let line_lengths_opt = state.manifest.line_lengths.get(path_str.as_ref());
-                    let line_lengths_slice: &[u32] =
-                        line_lengths_opt.map(Vec::as_slice).unwrap_or(&[]);
-                    if let Err(err) = writer.register_path_with_line_lengths(p, line_lengths_slice)
-                    {
-                        // Soft failure: the trace is still usable
-                        // without per-line column counts (column
-                        // resolution falls back to None at read time).
-                        eprintln!(
-                            "[codetracer-js-recorder] register_path_with_line_lengths failed for {}: {} \
-                             (column resolution will fall back to None for this file)",
-                            p.display(),
-                            err,
-                        );
-                    }
-                    paths_with_line_lengths.insert(p.clone());
-                } else {
-                    writer.register_path(p);
-                }
-            }
             TraceEvent::Type(tr) => {
                 let upstream_kind = local_type_kind_to_upstream(tr.kind);
                 writer.register_type(upstream_kind, &tr.lang_type);
@@ -1967,51 +1998,16 @@ fn write_binary_trace(
                         started = true;
                     }
                 }
-                // Look up the path from the manifest by path_id index.
-                let path = state
-                    .manifest
-                    .paths
-                    .get(fr.path_id)
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("<unknown>"));
+                let path = manifest_path(state, fr.path_id);
                 writer.register_function(&fr.name, &path, codetracer_trace_types::Line(fr.line));
             }
             TraceEvent::Step(sr) => {
-                let path = state
-                    .manifest
-                    .paths
-                    .get(sr.path_id)
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("<unknown>"));
+                let path = manifest_path(state, sr.path_id);
 
                 // The Nim writer requires a start() call before the first step.
                 if !started {
                     writer.start(&path, codetracer_trace_types::Line(sr.line));
                     started = true;
-                }
-
-                // P2.5: lazy register-with-line-lengths.  Path events
-                // for files reached only through the source-map
-                // resolver may not have a corresponding TraceEvent::Path
-                // entry up front; when we see the first step for a
-                // file we haven't registered yet, fall through to the
-                // Layout A entry point now (when column-aware).
-                if state.column_aware && !paths_with_line_lengths.contains(&path) {
-                    let path_str = path.to_string_lossy();
-                    let line_lengths_opt = state.manifest.line_lengths.get(path_str.as_ref());
-                    let line_lengths_slice: &[u32] =
-                        line_lengths_opt.map(Vec::as_slice).unwrap_or(&[]);
-                    if let Err(err) =
-                        writer.register_path_with_line_lengths(&path, line_lengths_slice)
-                    {
-                        eprintln!(
-                            "[codetracer-js-recorder] register_path_with_line_lengths failed for {}: {} \
-                             (column resolution will fall back to None for this file)",
-                            path.display(),
-                            err,
-                        );
-                    }
-                    paths_with_line_lengths.insert(path.clone());
                 }
 
                 // P2.2: column-aware step emission.  Mirrors the
@@ -2077,16 +2073,12 @@ fn write_binary_trace(
                 // is registered in the Nim writer.
                 let func = state.manifest.functions.get(cr.function_id);
                 let (func_path, func_line, func_name) = match func {
-                    Some(f) => {
-                        let p = state
-                            .manifest
-                            .paths
-                            .get(f.path_index)
-                            .map(PathBuf::from)
-                            .unwrap_or_else(|| PathBuf::from("<unknown>"));
-                        (p, f.line as i64, f.name.as_str())
-                    }
-                    None => (PathBuf::from("<unknown>"), 0, "<unknown>"),
+                    Some(f) => (
+                        manifest_path(state, f.path_index),
+                        f.line as i64,
+                        f.name.as_str(),
+                    ),
+                    None => (PathBuf::from(UNKNOWN_PATH), 0, "<unknown>"),
                 };
 
                 if !started {
