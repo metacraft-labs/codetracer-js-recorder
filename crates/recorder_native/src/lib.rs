@@ -2615,6 +2615,11 @@ mod path_table_tests {
         write_and_read_paths(&dir, &state)
     }
 
+    /// The table the writer records for a file first named without one.
+    fn conventional_table() -> Vec<u32> {
+        vec![1024; 100_000]
+    }
+
     const TWO_FILES: &str = r#"{
         "formatVersion": 1,
         "paths": ["/src/main.js", "/src/lib.js"],
@@ -2654,13 +2659,15 @@ mod path_table_tests {
     }
 
     /// A site or function whose path index the manifest does not hold is
-    /// recorded against `<unknown>`.  That file has no source, so it keeps
-    /// whatever table its registration gives it; what must not happen is
-    /// that it is named before the files the manifest lists, which would
-    /// move them off the ids the manifest gave them, or that naming it
-    /// disturbs their tables.
+    /// recorded against `<unknown>`.  That file has no source, so the
+    /// recorder offers no table for it and the writer records the
+    /// conventional one: 100000 lines of 1024 positions.  It must not be
+    /// named before the files the manifest lists, which would move them off
+    /// the ids the manifest gave them, and naming it must not disturb their
+    /// tables.
     #[test]
-    fn a_path_the_manifest_lacks_is_registered_after_the_manifest_files_and_without_a_table() {
+    fn a_path_the_manifest_lacks_is_registered_after_the_manifest_files_with_the_conventional_table(
+    ) {
         let json = r#"{
             "formatVersion": 1,
             "paths": ["/src/main.js", "/src/lib.js"],
@@ -2696,7 +2703,7 @@ mod path_table_tests {
             vec![
                 ("/src/main.js".to_string(), vec![12, 30, 7, 19]),
                 ("/src/lib.js".to_string(), vec![21, 15, 1]),
-                ("<unknown>".to_string(), vec![]),
+                ("<unknown>".to_string(), conventional_table()),
             ],
         );
     }
