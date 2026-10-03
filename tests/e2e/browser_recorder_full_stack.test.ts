@@ -37,7 +37,11 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as net from "node:net";
-import { ctPrintAvailable, ctPrintFull, ctPrintPath } from "../helpers/ct-print";
+import {
+  ctPrintAvailable,
+  ctPrintFull,
+  ctPrintPath,
+} from "../helpers/ct-print";
 
 const REPO_ROOT = path.resolve(__dirname, "../..");
 const CLI_PATH = path.join(REPO_ROOT, "packages/cli/dist/index.js");
