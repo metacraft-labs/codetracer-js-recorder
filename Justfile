@@ -52,9 +52,10 @@ build: install
 format-rust:
     cargo fmt --manifest-path crates/recorder_native/Cargo.toml
 
-# Format TypeScript/JavaScript code
+# Format TypeScript/JavaScript code with the lockfile's prettier (never npx;
+# see scripts/prettier.sh)
 format-js:
-    npx prettier --write "packages/**/*.{ts,js}" "tests/**/*.{ts,js}"
+    bash scripts/prettier.sh --write "packages/**/*.{ts,js}" "tests/**/*.{ts,js}"
 
 # Format Nix files
 format-nix:
@@ -71,9 +72,11 @@ lint-rust:
     cargo fmt --check --manifest-path crates/recorder_native/Cargo.toml
     cargo clippy --manifest-path crates/recorder_native/Cargo.toml
 
-# Lint TypeScript/JavaScript code
+# Lint TypeScript/JavaScript code with the lockfile's prettier (never npx;
+# see scripts/prettier.sh)
 lint-js:
-    npx prettier --check "packages/**/*.{ts,js}" "tests/**/*.{ts,js}"
+    bash scripts/prettier.sh --check "packages/**/*.{ts,js}" "tests/**/*.{ts,js}"
+    bash tests/prettier-resolution-test.sh
 
 # Lint Nix files
 lint-nix:
