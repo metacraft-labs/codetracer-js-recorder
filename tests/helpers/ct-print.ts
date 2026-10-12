@@ -198,9 +198,28 @@ export interface CtFullCallArg {
 
 /**
  * Tagged union of `events[]` entries in `ct-print --full` output.  The
- * `kind` discriminant routes between step / call_entry / call_exit / io.
+ * `kind` discriminant routes between step / call_entry / call_exit / io
+ * and the raise / catch / thread records.  Those records occupy an
+ * exec-record index (`step_index`) but are not steps: `counts.steps`
+ * does not include them.
  */
 export type CtFullEvent =
+  | {
+      kind: "raise";
+      step_index: number;
+      exception_type_id: number;
+      exception_message: string;
+    }
+  | {
+      kind: "catch";
+      step_index: number;
+      exception_type_id: number;
+    }
+  | {
+      kind: "thread_start" | "thread_exit" | "thread_switch";
+      step_index: number;
+      thread_id: number;
+    }
   | {
       kind: "step";
       step_index: number;

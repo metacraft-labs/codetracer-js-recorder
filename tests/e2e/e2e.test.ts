@@ -338,9 +338,12 @@ describe("e2e_record_simple_program", () => {
 
     // ----- Step / call counts -----------------------------------------
     // hello.js produces a stable number of recorder events:
-    //   - 9 step events:
-    //       step 0  line 1  (synthetic thread-start)
-    //       step 1  line 1  (<module> definition-line anchor — see below)
+    //   - 8 steps, interleaved with one thread-start record.  Thread,
+    //     raise and catch records occupy an exec-record index but are not
+    //     steps, so `counts.steps` leaves them out; `--full` lists them as
+    //     their own `thread_start` / `raise` / ... entries:
+    //       step 0  line 1  (<module> definition-line anchor — see below)
+    //       index 1         (thread_start — not a step)
     //       step 2  line 1  (module prologue)
     //       step 3  line 4  (`function greet` declaration hoist)
     //       step 4  line 9  (`var result = greet("World")` — the call site)
@@ -365,7 +368,8 @@ describe("e2e_record_simple_program", () => {
     // These are stable properties of the canonical fixture under the
     // current JS recorder — if they change, that's a real regression
     // to investigate, not a flake.
-    expect(full.counts.steps).toBe(9);
+    expect(full.counts.steps).toBe(8);
+    expect(full.events.filter((e) => e.kind === "thread_start").length).toBe(1);
     expect(full.counts.calls).toBe(3);
     expect(full.counts.io_events).toBe(1);
 
