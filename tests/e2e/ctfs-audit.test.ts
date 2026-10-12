@@ -18,8 +18,8 @@
  *      `ct print --json`'s `values` table.
  *
  *   2. `console.warn` / `console.error` writes are tagged
- *      `EventLogKind::WriteOther` — `ct print --json` reports them as
- *      `elkWriteOther` in its `ioEvents` array, while `console.log` is
+ *      `EventLogKind::WriteStderr` — `ct print --json` reports them as
+ *      `elkWriteStderr` in its `ioEvents` array, while `console.log` is
  *      an `elkWrite`.
  *
  *   3. Thread events emit through dedicated FFI entry points
@@ -122,7 +122,7 @@ console.log("result is", result);
 });
 
 // =============================================
-// Audit fix #2: stderr writes use WriteOther kind
+// Audit fix #2: stderr writes use the WriteStderr kind
 // =============================================
 describe("audit_ctfs_stderr_kind", () => {
   let tmpDir: string;
@@ -165,8 +165,8 @@ console.error("error-line");
     const kindOf = (text: string) =>
       ioEvents.find((e) => (e.data ?? "").includes(text))?.kind;
     expect(kindOf("stdout-line")).toBe("elkWrite");
-    expect(kindOf("warn-line")).toBe("elkWriteOther");
-    expect(kindOf("error-line")).toBe("elkWriteOther");
+    expect(kindOf("warn-line")).toBe("elkWriteStderr");
+    expect(kindOf("error-line")).toBe("elkWriteStderr");
     expect(ioEvents.length).toBeGreaterThanOrEqual(3);
     expect(ioEvents.some((e) => (e.data ?? "").includes("stdout-line"))).toBe(
       true,

@@ -398,8 +398,8 @@ impl TypeKind {
 enum EventLogKind {
     /// `Write` — stdout-style program output (console.log / console.info).
     Write = 0,
-    /// `WriteOther` — stderr-style program output (console.warn / console.error).
-    WriteOther = 2,
+    /// `WriteStderr` — stderr-style program output (console.warn / console.error).
+    WriteStderr = 14,
 }
 
 impl Serialize for EventLogKind {
@@ -1544,11 +1544,9 @@ pub fn append_events(
                     // sinks (`console.log`, `console.info` — tagged "stdout"
                     // by io-capture.ts) become `Write`; stderr-style sinks
                     // (`console.warn`, `console.error` — tagged "stderr")
-                    // become `WriteOther`.  This matches the canonical Python
-                    // / Ruby recorder mapping (see handoff entry 1.27 for the
-                    // Python `register_special_event` pattern).
+                    // become `WriteStderr`.
                     let kind = match write_entry.kind.as_str() {
-                        "stderr" | "warn" | "error" => EventLogKind::WriteOther,
+                        "stderr" | "warn" | "error" => EventLogKind::WriteStderr,
                         _ => EventLogKind::Write,
                     };
                     state.events.push(TraceEvent::Event(RecordEvent {
@@ -2167,11 +2165,11 @@ fn write_binary_trace(
             }
             TraceEvent::Event(re) => {
                 // Map local EventLogKind to upstream.  We produce Write
-                // (stdout) and WriteOther (stderr) — see append_events
+                // (stdout) and WriteStderr (stderr) — see append_events
                 // case 3 above for the JS console-method classification.
                 let upstream_kind = match re.kind {
                     EventLogKind::Write => codetracer_trace_types::EventLogKind::Write,
-                    EventLogKind::WriteOther => codetracer_trace_types::EventLogKind::WriteOther,
+                    EventLogKind::WriteStderr => codetracer_trace_types::EventLogKind::WriteStderr,
                 };
                 writer.register_special_event(upstream_kind, &re.metadata, &re.content);
             }

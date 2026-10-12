@@ -399,7 +399,7 @@ describe("e2e_console_capture", () => {
     expect(helloWrite).toBeDefined();
   });
 
-  it("records console.warn/error as WriteOther events in CTFS", () => {
+  it("records console.warn/error as WriteStderr events in CTFS", () => {
     // Create a test program that uses console.warn and console.error
     const programDir = path.join(tmpDir, "src");
     fs.mkdirSync(programDir, { recursive: true });
@@ -432,12 +432,12 @@ console.error("error message");
     const ioEvents = bundle.ioEvents ?? [];
     // `ct print --json` names each event by the recorder's exact
     // EventLogKind: console.log is a `Write`, console.warn/.error a
-    // `WriteOther`.
+    // `WriteStderr`.
     const kindOf = (text: string) =>
       ioEvents.find((e) => (e.data ?? "").includes(text))?.kind;
     expect(kindOf("normal output")).toBe("elkWrite");
-    expect(kindOf("warning message")).toBe("elkWriteOther");
-    expect(kindOf("error message")).toBe("elkWriteOther");
+    expect(kindOf("warning message")).toBe("elkWriteStderr");
+    expect(kindOf("error message")).toBe("elkWriteStderr");
     expect(ioEvents.length).toBeGreaterThanOrEqual(3);
     expect(ioEvents.some((e) => (e.data ?? "").includes("normal output"))).toBe(
       true,
