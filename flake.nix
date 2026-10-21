@@ -255,7 +255,7 @@
             # npm dependencies (pre-fetched for offline install)
             npmDeps = pkgs.fetchNpmDeps {
               src = ./.;
-              hash = "sha256-R7cGTzWWD1lbUJzlIFGq2Hoav1eYEDoOJO39rj9WBps=";
+              hash = "sha256-GckBE2l1g7pRZtlNENmkxpk2zyk3IqFDpUROnjOO5M0=";
             };
 
             # Rust dependencies for the native addon (vendored from Cargo.lock)
@@ -302,7 +302,10 @@
                   'path = "${codetracer-trace-format}/codetracer_trace_writer_nim"' \
                 --replace-fail \
                   'path = "../../../codetracer-trace-format/codetracer_ctfs"' \
-                  'path = "${codetracer-trace-format}/codetracer_ctfs"'
+                  'path = "${codetracer-trace-format}/codetracer_ctfs"' \
+                --replace-fail \
+                  'path = "../../../codetracer-trace-format/codetracer_trace_reader"' \
+                  'path = "${codetracer-trace-format}/codetracer_trace_reader"'
             '';
 
             # codetracer_trace_writer_nim/build.rs runs Nim against the
