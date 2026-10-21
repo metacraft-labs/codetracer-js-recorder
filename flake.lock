@@ -3,9 +3,11 @@
     "codetracer-trace-format": {
       "flake": false,
       "locked": {
+        "lastModified": 1792595081,
+        "narHash": "sha256-+lRx2pHlVynkv833Op00tqZHWk+yMCfyDPvv31E1J3w=",
         "owner": "metacraft-labs",
         "repo": "codetracer-trace-format",
-        "rev": "c8e57b1f21b1c4e82db5e14ab70fd16ecf217ce0",
+        "rev": "6c53d0af8908e6d3abe65fd1c7508893025e5571",
         "type": "github"
       },
       "original": {
