@@ -26,6 +26,15 @@ test: install
     npm test
     just verify-cli-convention
     just verify-request-spans
+    just verify-jsbound-vectors
+
+# Verify the vendored JS boundary log vectors (tests/boundary/vectors/)
+# against their SHA256SUMS and, when the codetracer sibling is checked out,
+# against the Rust side that writes them (libs/jsbound/vectors). Re-vendor
+# with `bash scripts/vendor-jsbound-vectors.sh`. Wired into `just lint` and
+# `just test`.
+verify-jsbound-vectors:
+    bash scripts/vendor-jsbound-vectors.sh --check
 
 # Verify the RS-M9 web-request span coverage is present and running.
 # This is a no-silent-skip shell guard — every assertion either passes
@@ -89,6 +98,7 @@ lint:
     just lint-nix
     just verify-cli-convention
     just verify-request-spans
+    just verify-jsbound-vectors
 
 # Bump version across all package.json files
 # (usage: just bump-version 0.2.0  or  just bump-version patch / minor / major)

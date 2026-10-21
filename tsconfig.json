@@ -12,6 +12,7 @@
     { "path": "packages/instrumenter-core" },
     { "path": "packages/runtime" },
     { "path": "packages/runtime-browser" },
+    { "path": "packages/boundary-format" },
     { "path": "packages/cli" },
     { "path": "packages/vite-plugin" },
     { "path": "packages/webpack-plugin" },

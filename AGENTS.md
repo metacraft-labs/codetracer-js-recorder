@@ -43,6 +43,12 @@ This is a monorepo managed with npm workspaces:
   instrumentation using SWC.
 * `packages/runtime` — Runtime library injected into instrumented programs
   to capture trace events.
+* `packages/boundary-format` — encoder and strict decoder of the browser
+  boundary log (`jsbound.log`). Held to the byte vectors the Rust
+  implementation in codetracer `libs/jsbound` writes; they are vendored in
+  `tests/boundary/vectors/` by `scripts/vendor-jsbound-vectors.sh` (re-run it
+  after the Rust side regenerates them; `just verify-jsbound-vectors` checks
+  the copy).
 * `crates/recorder_native` — Rust N-API addon (via napi-rs) for writing
   trace files in binary (CBOR+zstd) and JSON formats.
 * `tests/` — End-to-end integration tests.

@@ -9,6 +9,7 @@
     "packages/instrumenter-core",
     "packages/runtime",
     "packages/runtime-browser",
+    "packages/boundary-format",
     "packages/cli",
     "packages/express",
     "packages/vite-plugin",
@@ -18,10 +19,11 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces",
-    "test": "vitest run && npm run test:verify-cli-convention && npm run test:verify-request-spans",
+    "test": "vitest run && npm run test:verify-cli-convention && npm run test:verify-request-spans && npm run test:verify-jsbound-vectors",
     "test:watch": "vitest",
     "test:verify-cli-convention": "bash tests/verify-cli-convention-no-silent-skip.sh",
-    "test:verify-request-spans": "bash tests/verify-request-spans-no-silent-skip.sh"
+    "test:verify-request-spans": "bash tests/verify-request-spans-no-silent-skip.sh",
+    "test:verify-jsbound-vectors": "bash scripts/vendor-jsbound-vectors.sh --check"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.5.1",

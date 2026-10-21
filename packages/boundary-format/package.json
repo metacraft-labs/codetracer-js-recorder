@@ -1,0 +1,15 @@
+{
+  "name": "@codetracer/boundary-format",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "description": "Encoder and strict decoder of the CodeTracer JS boundary log (jsbound.log), held to the byte vectors the Rust implementation in codetracer libs/jsbound writes",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
