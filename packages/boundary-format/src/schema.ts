@@ -284,6 +284,37 @@ export const RECORD_SCHEMA = [
   fields: readonly (readonly [string, WireType])[];
 }[];
 
+/**
+ * The value set of every enumerated field (spec §5.2), as `[least,
+ * greatest]`: every `u8` field of {@link RECORD_SCHEMA} is one, and the
+ * strict decoder refuses a value outside its set as `UnknownEnumValue`
+ * (§5.3 rule 2). The Rust implementation carries the same table
+ * (`VALUE_SETS` in codetracer `libs/jsbound/src/record.rs`), and the
+ * shared refusal vectors step one past each end of every set.
+ */
+export const ENUM_VALUE_SETS: Readonly<
+  Record<string, Readonly<Record<string, readonly [number, number]>>>
+> = {
+  // §9.1 levels.
+  Header: { protocol_level: [0, 1] },
+  // §10.4: 0 no preference, 1 light, 2 dark; 1 when reduced motion.
+  Env: { color_scheme: [0, 2], reduced_motion: [0, 1] },
+  Task: { kind: [1, 12] },
+  TaskReg: { kind: [1, 12] },
+  Clock: { src: [1, 5] },
+  Random: { src: [1, 3] },
+  NetRequest: { api: [1, 5] },
+  NetResponse: { outcome: [1, 5] },
+  WsMessage: { dir: [1, 4] },
+  StorageRead: { area: [1, 3], present: [0, 2] },
+  DomEffect: { effect: [1, 6] },
+  Navigation: { kind: [1, 5] },
+  Error: { kind: [1, 2] },
+  Scrubbed: { class: [1, 4] },
+  Gap: { reason: [1, 3] },
+  End: { reason: [1, 4] },
+};
+
 type Schema = (typeof RECORD_SCHEMA)[number];
 
 /** The TypeScript type of a wire type's value. */

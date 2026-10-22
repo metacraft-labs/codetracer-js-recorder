@@ -21,6 +21,7 @@ import { describe, expect, it } from "vitest";
 import {
   BoundaryFormatError,
   DECODE_ERROR_CODES,
+  ENUM_VALUE_SETS,
   RECORD_SCHEMA,
   type BoundaryRecord,
   type Json,
@@ -137,6 +138,37 @@ describe("@codetracer/boundary-format", () => {
           .map((v) => v.want.termination),
       ),
     ).toEqual(new Set(["TruncatedUnterminated", "TruncatedMidRecord"]));
+  });
+
+  it("every u8 field has exactly one value set", () => {
+    // A field added to the schema without a value set, or a stale entry,
+    // fails here rather than in the decoder.
+    const u8Fields = RECORD_SCHEMA.flatMap((d) =>
+      d.fields
+        .filter(([, type]) => type === "u8")
+        .map(([name]) => `${d.name}.${name}`),
+    ).sort();
+    const sets = Object.entries(ENUM_VALUE_SETS)
+      .flatMap(([record, fields]) =>
+        Object.keys(fields).map((f) => `${record}.${f}`),
+      )
+      .sort();
+    expect(sets).toEqual(u8Fields);
+    expect(u8Fields).toHaveLength(18);
+    // The shared vectors step past both ends of every set: the refusal
+    // vectors name each field.
+    const refusals = loadVectors()
+      .filter((v) => v.want.error === "UnknownEnumValue")
+      .map((v) => v.name);
+    for (const [record, fields] of Object.entries(ENUM_VALUE_SETS)) {
+      const snake = record.replace(/(?<!^)([A-Z])/g, "_$1").toLowerCase();
+      for (const [field, [lo, hi]] of Object.entries(fields)) {
+        expect(refusals).toContain(`enum_${snake}_${field}_${hi + 1}`);
+        if (lo > 0) {
+          expect(refusals).toContain(`enum_${snake}_${field}_${lo - 1}`);
+        }
+      }
+    }
   });
 
   it("the vendored vectors match their SHA256SUMS", () => {

@@ -11,7 +11,8 @@
  * of {@link DECODE_ERROR_CODES}: a stream that is not CTBL version 1, an
  * unknown tag, a `vocab` other than 1, a frame of length 0 or over 64 MiB, a
  * frame shorter or longer than its fields, a string that is not UTF-8, an
- * unknown `blobref` kind, an inline body over 1024 bytes, a first frame that
+ * unknown `blobref` kind, an enumerated field outside its value set
+ * ({@link ENUM_VALUE_SETS}), an inline body over 1024 bytes, a first frame that
  * is not `Header` or a second that is not `Env`, a `seq` that does not follow
  * the previous one without a `Gap` covering the difference, a `Gap` that does
  * not, an `End` whose `last_seq` is not the last `seq`, and any byte after
@@ -33,6 +34,7 @@ import {
   type WireType,
   CTBL_MAGIC,
   CTBL_VERSION,
+  ENUM_VALUE_SETS,
   MAX_FRAME_LEN,
   MAX_INLINE_BLOB,
   VOCAB,
@@ -53,6 +55,7 @@ export const DECODE_ERROR_CODES = [
   "TrailingFieldBytes",
   "InvalidUtf8",
   "UnknownBlobKind",
+  "UnknownEnumValue",
   "InlineBlobTooLarge",
   "HeaderNotFirst",
   "EnvNotSecond",
@@ -405,6 +408,21 @@ export function decodeRecord(payload: Uint8Array, offset = 0): BoundaryRecord {
       offset,
       `the ${def.name} frame has ${r.length - r.position} byte(s) after its last field`,
     );
+  }
+  // Once the frame is whole: every enumerated field, in wire order.
+  for (const [name, type] of def.fields) {
+    if (type !== "u8") continue;
+    const set = ENUM_VALUE_SETS[def.name]?.[name];
+    const v = record[name] as number;
+    if (set === undefined || v < set[0] || v > set[1]) {
+      throw new BoundaryFormatError(
+        "UnknownEnumValue",
+        offset,
+        set === undefined
+          ? `${def.name}.${name} is a u8 field with no value set in this decoder`
+          : `${def.name}.${name} is ${v}; vocab ${VOCAB} defines ${set[0]} to ${set[1]}`,
+      );
+    }
   }
   return record as unknown as BoundaryRecord;
 }
