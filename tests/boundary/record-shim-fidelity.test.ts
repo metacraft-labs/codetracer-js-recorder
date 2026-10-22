@@ -520,23 +520,20 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
       //
       // Whether a progress event is still pending when the body ends (and so
       // comes at DONE) depends on when the last piece lands in the 50 ms
-      // window, so the page is loaded until it shows one, at most five times.
+      // window. The page makes it land there: the server holds the response
+      // open after its 40 pieces, and the listener that sees the last of
+      // them releases the rest synchronously (/api/release), so it arrives
+      // as soon as the listener returns (fixtures/streams.js "xhr-progress").
       type Seen = { type: string; state: number; len: number }[];
-      let p: Opened | undefined;
-      let seen: Seen = [];
-      for (let attempt = 0; attempt < 5; attempt++) {
-        p = await open(shimDir, "streams.html?case=xhr-progress");
-        expect(p.pageErrors).toEqual([]);
-        seen = (await slots(p.page))["r-seen"]
-          .slice("seen=".length)
-          .split("|")
-          .map((e) => {
-            const [type, state, len] = e.split(":");
-            return { type, state: Number(state), len: Number(len) };
-          });
-        if (seen.some((e) => e.type === "progress" && e.state === 4)) break;
-        await p.context.close();
-      }
+      const p = await open(shimDir, "streams.html?case=xhr-progress");
+      expect(p.pageErrors).toEqual([]);
+      const seen: Seen = (await slots(p.page))["r-seen"]
+        .slice("seen=".length)
+        .split("|")
+        .map((e) => {
+          const [type, state, len] = e.split(":");
+          return { type, state: Number(state), len: Number(len) };
+        });
       // Vacuity: progress events while loading and at DONE, the one at DONE
       // before DONE's readystatechange.
       expect(
@@ -544,10 +541,15 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
       ).toBeGreaterThan(0);
       expect(
         seen.filter((e) => e.state === 4).map((e) => e.type),
-        "a progress event at DONE in five loads",
+        "a progress event at DONE: if not, the released end of the held " +
+          "response did not reach the page within the 50 ms progress window " +
+          "(harness.ts RELEASE_SETTLE_MS, /api/release)",
       ).toEqual(["progress", "readystatechange"]);
-      const plog = await stopAndDecode(p!.page);
-      const req = request(plog, "/api/stream?n=40&interval=5");
+      const plog = await stopAndDecode(p.page);
+      const req = request(
+        plog,
+        "/api/stream?n=40&interval=5&hold=xhr-progress",
+      );
       const clocks = pageClocks(plog, req.at);
       expect(clocks).toHaveLength(seen.length);
       const firstDone = seen.findIndex((e) => e.state === 4);

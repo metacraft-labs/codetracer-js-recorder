@@ -110,6 +110,15 @@ const TYPES: Record<string, string> = {
 };
 
 /**
+ * How long `/api/release` waits, after the released response has been
+ * handed to the kernel, before it answers: time for the browser's network
+ * process to pass the released bytes and the response's end to the page's
+ * renderer, which queues them while the page is blocked in the synchronous
+ * request that asked for the release.
+ */
+const RELEASE_SETTLE_MS = 250;
+
+/**
  * Answer a streamed route: `/api/stream` writes `c0\n`, `c1\n`, … as
  * `text/plain`, `/api/sse` writes `data: e0\n\n`, … as `text/event-stream`.
  * The first chunk is written at once and each next one `interval` ms
@@ -117,39 +126,93 @@ const TYPES: Record<string, string> = {
  * with `n=forever`, the response never ends: only the client closing it
  * stops the writes. `nosniff` keeps Chromium from holding the first bytes
  * back to sniff a MIME type.
+ *
+ * `length=1` sends a `content-length` (a finite stream only), so the
+ * response's progress events are length-computable. `hold=<id>` keeps the
+ * response open after its `n` chunks until `/api/release?id=<id>` (see
+ * `releaseHeld`) writes `end\n` and ends it.
  */
 function serveStream(
   res: http.ServerResponse,
   url: URL,
   sse: boolean,
   streamEnds: StreamEnd[],
+  held: Map<string, http.ServerResponse>,
 ): void {
   const forever = url.searchParams.get("n") === "forever";
   const n = forever ? Infinity : Number(url.searchParams.get("n") ?? "3");
   const interval = Number(url.searchParams.get("interval") ?? "100");
-  res.writeHead(200, {
+  const hold = url.searchParams.get("hold");
+  const chunk = (i: number) => (sse ? `data: e${i}\n\n` : `c${i}\n`);
+  const headers: http.OutgoingHttpHeaders = {
     "content-type": sse ? "text/event-stream" : "text/plain; charset=utf-8",
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
-  });
+  };
+  if (url.searchParams.get("length") === "1" && !forever && hold === null) {
+    let length = 0;
+    for (let i = 0; i < n; i++) length += Buffer.byteLength(chunk(i));
+    headers["content-length"] = length;
+  }
+  res.writeHead(200, headers);
   let written = 0;
   let finished = false;
   let timer: NodeJS.Timeout | undefined;
   const write = () => {
-    res.write(sse ? `data: e${written}\n\n` : `c${written}\n`);
+    res.write(chunk(written));
     written++;
-    if (written >= n) {
+    if (written < n) {
+      timer = setTimeout(write, interval);
+    } else if (hold !== null) {
+      held.set(hold, res);
+    } else {
       finished = true;
       res.end();
-    } else {
-      timer = setTimeout(write, interval);
     }
   };
+  res.on("finish", () => {
+    finished = true;
+  });
   res.on("close", () => {
     clearTimeout(timer);
+    if (hold !== null) held.delete(hold);
     streamEnds.push({ url: url.pathname + url.search, written, finished });
   });
   write();
+}
+
+/**
+ * `/api/release?id=<id>`: end the held stream `<id>` with `end\n`, and
+ * answer `released` once that response has been handed to the kernel and
+ * `RELEASE_SETTLE_MS` more have passed (`404` if no stream is held by that
+ * id). A page that asks for it with a synchronous XMLHttpRequest from inside
+ * a `progress` listener of the held stream therefore returns from that
+ * listener with the rest of the body and its end already on their way to
+ * it: they reach the request within Chromium's 50 ms progress throttle
+ * window, which starts when the listener returns, so the platform's last
+ * `progress` event always comes at DONE (Chromium dispatches a deferred one
+ * before DONE's `readystatechange`).
+ */
+function releaseHeld(
+  res: http.ServerResponse,
+  url: URL,
+  held: Map<string, http.ServerResponse>,
+): void {
+  const id = url.searchParams.get("id") ?? "";
+  const target = held.get(id);
+  if (target === undefined) {
+    res.writeHead(404);
+    res.end();
+    return;
+  }
+  held.delete(id);
+  target.on("finish", () => {
+    setTimeout(() => {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("released");
+    }, RELEASE_SETTLE_MS);
+  });
+  target.end("end\n");
 }
 
 /**
@@ -158,8 +221,8 @@ function serveStream(
  * `{"value": 42}`, `POST /api/echo` answers its own body, `/api/redirect`
  * redirects to `/api/data?redirected=1`, `/api/slow?ms=`
  * answers `slow` after `ms` milliseconds, `/api/stall` neither reads the
- * request body nor answers, and `/api/stream` and `/api/sse` stream (see
- * `serveStream`).
+ * request body nor answers, `/api/stream` and `/api/sse` stream (see
+ * `serveStream`), and `/api/release` ends a held stream (see `releaseHeld`).
  */
 export async function startFixtureServer(
   root: string,
@@ -167,6 +230,7 @@ export async function startFixtureServer(
 ): Promise<FixtureServer> {
   const requests: ServedRequest[] = [];
   const streamEnds: StreamEnd[] = [];
+  const held = new Map<string, http.ServerResponse>();
   const server = http.createServer((req, res) => {
     if (req.url?.startsWith("/api/stall")) {
       // Never reads the request body and never answers: a large upload
@@ -198,7 +262,12 @@ export async function startFixtureServer(
           new URL(url, "http://x"),
           pathname === "/api/sse",
           streamEnds,
+          held,
         );
+        return;
+      }
+      if (pathname === "/api/release") {
+        releaseHeld(res, new URL(url, "http://x"), held);
         return;
       }
       if (pathname === "/api/redirect") {

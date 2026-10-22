@@ -378,7 +378,29 @@ describe("record-side generic boundary shim", () => {
         const server = await serve(root);
         const { page, pageErrors } = await newPage(["seeded-random.js"]);
         await page.clock.install({ time: PINNED });
+        // Playwright's clock pins performance.now() only if the page's
+        // first clock use comes within 100 ms of the document's start.
+        // Its injected clock starts a 100 ms real-time sync timer when it
+        // is injected, and replays `install` (which sets the wall time, not
+        // the ticks performance.now() returns) only at the first clock use;
+        // a sync that runs before that replay advances the ticks by the real
+        // time elapsed, and pauseAt keeps the offset (playwright-core 1.56.1,
+        // `ClockController._replayLogOnce` and `_updateRealTimeTimer`). The
+        // plain page makes no clock read until it is clicked, and the shim
+        // makes its first while installing, so on a loaded machine either
+        // arm could read `perf=5100` instead of `perf=5000`. An init script
+        // registered after the clock's (so evaluated after them, in the
+        // same step of document creation, where no timer can run) makes
+        // that first use at once, in both arms; it runs before the shim
+        // installs, so nothing is logged.
+        await page.addInitScript(() => {
+          performance.now();
+        });
         await page.goto(`${server.origin}/reads.html`);
+        // Past the 100 ms window on purpose, as a loaded machine is: without
+        // the init script above, performance.now() would no longer be
+        // pinned and the slots would differ on every run.
+        await sleep(150);
         await page.clock.pauseAt(PINNED + 5000);
         await page.click("#go");
         await waitForDone(page, () => page.clock.runFor(50));
@@ -443,6 +465,7 @@ describe("record-side generic boundary shim", () => {
         expect(a.requests).toContain('POST /api/echo "hello"');
       }
       expect(plain.slots["r-now"]).toBe(`now=${PINNED + 5000}`);
+      expect(plain.slots["r-perf"]).toBe("perf=5000");
       expect(plain.slots["r-xhrctor"]).toBe("xhrctor=sub,TypeError");
 
       expect(shimmed.slots).toEqual(plain.slots);

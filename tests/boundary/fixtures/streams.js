@@ -235,14 +235,32 @@
     // are deferred to a task of their own. Every readystatechange and
     // progress listener notes what the page could read (its responseText
     // length) and reads the clock.
+    //
+    // The server holds the response open after its 40 pieces. The progress
+    // listener that first sees the last of them asks for the rest with a
+    // synchronous request (/api/release), which returns once the rest and
+    // the response's end are on their way: they reach the request inside
+    // the 50 ms window that starts when this listener returns, so the
+    // platform's last progress event always comes at DONE.
     "xhr-progress": function () {
       var x = new XMLHttpRequest();
       var seen = [];
+      var released = false;
       function note(e) {
         seen.push(e.type + ":" + x.readyState + ":" + x.responseText.length);
         Date.now();
+        if (
+          !released &&
+          e.type === "progress" &&
+          x.responseText.endsWith("c39\n")
+        ) {
+          released = true;
+          var r = new XMLHttpRequest();
+          r.open("GET", "/api/release?id=xhr-progress", false);
+          r.send();
+        }
       }
-      x.open("GET", "/api/stream?n=40&interval=5");
+      x.open("GET", "/api/stream?n=40&interval=5&hold=xhr-progress");
       x.addEventListener("readystatechange", note);
       x.onprogress = note;
       x.onloadend = function () {
