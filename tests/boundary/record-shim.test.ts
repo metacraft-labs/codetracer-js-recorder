@@ -206,7 +206,8 @@ describe("record-side generic boundary shim", () => {
         build_hash: FIXTURE_BUILD_HASH,
       });
 
-      // Each of the ten kinds, as the page counted it and as the log has it.
+      // Each of the ten kinds (and the event clock), as the page counted it
+      // and as the log has it.
       // fetch and XHR are the network kind, counted per API.
       const table: [string, number, number][] = [
         [
@@ -258,6 +259,11 @@ describe("record-side generic boundary shim", () => {
           "localStorage.getItem (StorageRead area 1)",
           counts.localStorage,
           recordsOf(log, "StorageRead", (r) => r.area === 1).length,
+        ],
+        [
+          "event.timeStamp (Clock src 5)",
+          counts.timeStamp,
+          recordsOf(log, "Clock", (r) => r.src === 5).length,
         ],
         [
           "getBoundingClientRect (LayoutRead)",
@@ -723,10 +729,11 @@ describe("record-side generic boundary shim", () => {
           const v = new DataView(new ArrayBuffer(8));
           v.setBigUint64(0, r.bits, true);
           const value = v.getFloat64(0, true);
+          // §7.3: wall clock from src 1 and 3, monotonic from 2 and 4.
           if (r.src === 1 || r.src === 3) {
             wallNow = value;
             wallAt ??= value;
-          } else {
+          } else if (r.src === 2 || r.src === 4) {
             monoNow = value;
             monoAt ??= value;
           }

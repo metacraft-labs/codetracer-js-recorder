@@ -33,7 +33,12 @@
     if (pending === 0) document.body.setAttribute("data-done", "1");
   }
 
-  document.getElementById("go").addEventListener("click", function () {
+  document.getElementById("go").addEventListener("click", function (ev) {
+    // An event's timeStamp is a clock read (Clock src 5), of the browser's
+    // input event and of an event the page makes itself.
+    var stamps = [ev.timeStamp, new Event("made").timeStamp];
+    window.__stamps = stamps;
+    show("stamp", [typeof stamps[0], typeof stamps[1]].join(","));
     show("now", Date.now());
     show("perf", Math.round(performance.now()));
     show("rand", Math.random());

@@ -13,10 +13,17 @@ import {
   type SeamContext,
   asConstructor,
   copyBytes,
+  replaceAccessor,
   replaceValue,
   utf8Bytes,
 } from "./context.js";
 import { ClockSrc, TaskKind, numberToBits } from "./recorder.js";
+
+/**
+ * The `Refusal.feature` of a timer handler that is not a function
+ * (JS-Boundary-Recording.md §7.5).
+ */
+export const UNRECORDABLE_TIMER_HANDLER = "unrecordable-timer-handler";
 
 /** Patch every seam this module owns. */
 export function patchTimeSeams(ctx: SeamContext): void {
@@ -69,6 +76,24 @@ function patchClocks({ w, rec, orig }: SeamContext): void {
     logClock(ClockSrc.performanceNow, v);
     return v;
   });
+
+  // An event's timeStamp is a monotonic clock read the page makes, of an
+  // event the browser dispatched or of one the page constructed (§5.2
+  // `Clock` src 5). The shim itself never reads it.
+  const stamp = orig.eventTimeStamp;
+  if (stamp !== undefined) {
+    const get = stamp.descriptor.get!;
+    replaceAccessor(
+      stamp.owner,
+      "timeStamp",
+      function timeStamp(this: unknown) {
+        const v = get.call(this) as number;
+        logClock(ClockSrc.eventTimeStamp, v);
+        return v;
+      },
+      stamp.descriptor.set,
+    );
+  }
 }
 
 function patchRandom({ w, rec, orig }: SeamContext): void {
@@ -113,14 +138,6 @@ function patchRandom({ w, rec, orig }: SeamContext): void {
   }
 }
 
-/** A timer handler as the page passed it; a string is evaluated globally. */
-function callable(w: SeamContext["w"], handler: unknown): Function {
-  if (typeof handler === "function") return handler;
-  const code = String(handler);
-  // Indirect eval runs in the global scope, as a string timer handler does.
-  return () => (0, w.eval)(code);
-}
-
 function delayOf(timeout: unknown): number {
   const d = Number(timeout);
   return Number.isFinite(d) ? d : 0;
@@ -144,8 +161,28 @@ function patchTimers(ctx: SeamContext): void {
       if (!rec.recording) {
         return original.call(w, handler, timeout, ...args);
       }
+      if (typeof handler !== "function") {
+        // A string (or a value the platform converts to one, or a
+        // TrustedScript) is compiled by the platform as a classic script in
+        // the global scope when the timer fires, under the document's CSP
+        // (HTML §8.6 "timer initialization steps"). Only the platform does
+        // exactly that, so the handler goes to it unchanged; the shim then
+        // has no code of its own that runs first and cannot write the
+        // Task, so a timer that was scheduled makes the session
+        // non-replayable from here (§7.5). A handle of 0 is a timer the
+        // platform refused to create (Chromium, when the CSP forbids
+        // compiling strings): nothing will run.
+        const handle = original.call(w, handler, timeout, ...args);
+        if (handle !== 0) {
+          ctx.refuseOnce(
+            UNRECORDABLE_TIMER_HANDLER,
+            `${name} ${typeof handler}`,
+          );
+        }
+        return handle;
+      }
       const taskId = rec.nextTaskId();
-      const cb = callable(w, handler);
+      const cb = handler;
       const run = function (this: unknown, ...a: unknown[]): unknown {
         rec.guard(() => rec.task(taskId, kind));
         return cb.apply(this, a);

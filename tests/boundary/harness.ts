@@ -85,11 +85,22 @@ export interface ServedRequest {
   body: string;
 }
 
+/** How a streamed response (`/api/stream`, `/api/sse`) ended. */
+export interface StreamEnd {
+  url: string;
+  /** Chunks the server wrote before the response ended. */
+  written: number;
+  /** `true` when the server finished it, `false` when the client went away. */
+  finished: boolean;
+}
+
 export interface FixtureServer {
   /** `http://127.0.0.1:<port>`. */
   origin: string;
   /** Every request received, in arrival order. */
   requests: ServedRequest[];
+  /** Every streamed response that has ended, in the order they ended. */
+  streamEnds: StreamEnd[];
   close(): Promise<void>;
 }
 
@@ -99,16 +110,71 @@ const TYPES: Record<string, string> = {
 };
 
 /**
+ * Answer a streamed route: `/api/stream` writes `c0\n`, `c1\n`, … as
+ * `text/plain`, `/api/sse` writes `data: e0\n\n`, … as `text/event-stream`.
+ * The first chunk is written at once and each next one `interval` ms
+ * (default 100) later; `n` chunks are written and the response ended, or,
+ * with `n=forever`, the response never ends: only the client closing it
+ * stops the writes. `nosniff` keeps Chromium from holding the first bytes
+ * back to sniff a MIME type.
+ */
+function serveStream(
+  res: http.ServerResponse,
+  url: URL,
+  sse: boolean,
+  streamEnds: StreamEnd[],
+): void {
+  const forever = url.searchParams.get("n") === "forever";
+  const n = forever ? Infinity : Number(url.searchParams.get("n") ?? "3");
+  const interval = Number(url.searchParams.get("interval") ?? "100");
+  res.writeHead(200, {
+    "content-type": sse ? "text/event-stream" : "text/plain; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+  });
+  let written = 0;
+  let finished = false;
+  let timer: NodeJS.Timeout | undefined;
+  const write = () => {
+    res.write(sse ? `data: e${written}\n\n` : `c${written}\n`);
+    written++;
+    if (written >= n) {
+      finished = true;
+      res.end();
+    } else {
+      timer = setTimeout(write, interval);
+    }
+  };
+  res.on("close", () => {
+    clearTimeout(timer);
+    streamEnds.push({ url: url.pathname + url.search, written, finished });
+  });
+  write();
+}
+
+/**
  * Serve `root` (and `generated`, under `/__generated/`) on a free loopback
- * port. Two API routes stand in for a site's backend: `GET /api/data`
- * answers `{"value": 42}` and `POST /api/echo` answers its own body.
+ * port. API routes stand in for a site's backend: `GET /api/data` answers
+ * `{"value": 42}`, `POST /api/echo` answers its own body, `/api/redirect`
+ * redirects to `/api/data?redirected=1`, `/api/slow?ms=`
+ * answers `slow` after `ms` milliseconds, `/api/stall` neither reads the
+ * request body nor answers, and `/api/stream` and `/api/sse` stream (see
+ * `serveStream`).
  */
 export async function startFixtureServer(
   root: string,
   generated?: string,
 ): Promise<FixtureServer> {
   const requests: ServedRequest[] = [];
+  const streamEnds: StreamEnd[] = [];
   const server = http.createServer((req, res) => {
+    if (req.url?.startsWith("/api/stall")) {
+      // Never reads the request body and never answers: a large upload
+      // stalls on TCP backpressure until the client gives up.
+      requests.push({ method: req.method ?? "", url: req.url, body: "" });
+      req.pause();
+      return;
+    }
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
@@ -124,6 +190,29 @@ export async function startFixtureServer(
       if (pathname === "/api/echo") {
         res.writeHead(200, { "content-type": "text/plain" });
         res.end(body);
+        return;
+      }
+      if (pathname === "/api/stream" || pathname === "/api/sse") {
+        serveStream(
+          res,
+          new URL(url, "http://x"),
+          pathname === "/api/sse",
+          streamEnds,
+        );
+        return;
+      }
+      if (pathname === "/api/redirect") {
+        res.writeHead(302, { location: "/api/data?redirected=1" });
+        res.end();
+        return;
+      }
+      if (pathname === "/api/slow") {
+        const ms = Number(new URL(url, "http://x").searchParams.get("ms"));
+        const t = setTimeout(() => {
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.end("slow");
+        }, ms);
+        res.on("close", () => clearTimeout(t));
         return;
       }
       let dir = root;
@@ -150,6 +239,7 @@ export async function startFixtureServer(
   return {
     origin: `http://127.0.0.1:${port}`,
     requests,
+    streamEnds,
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections();

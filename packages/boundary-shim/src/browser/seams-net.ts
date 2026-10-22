@@ -5,10 +5,14 @@
  *
  * A request writes `NetRequest` and a `TaskReg{kind: network completion}`
  * (or `WebSocket` / `message` for the streaming APIs) when the page makes
- * it; its completion writes the `Task` and then `NetResponse` before any of
- * the page's code that consumes it runs. Bodies are inlined whatever their
- * size, as an uploaded batch carries them (§5.2); the assembler moves those
- * over 1024 bytes into `jsbound.blb`.
+ * it. What comes back is recorded as the page can observe it, each part
+ * before any of the page's code that consumes it runs: a `fetch` or XHR
+ * response's head (`NetResponse{outcome 5}`) when it arrives, then its body
+ * piece by piece as it reaches the page (`WsMessage{dir 1}`, ended by
+ * `WsMessage{dir 4}`; stream-body.ts for `fetch`), and a socket's or event
+ * stream's messages one by one. Bodies are inlined whatever their size, as
+ * an uploaded batch carries them (§5.2); the assembler moves those over 1024
+ * bytes into `jsbound.blb`.
  *
  * What cannot be captured synchronously and exactly (a `Blob` or stream
  * request body, a `blob`/`document` XHR response, a binary WebSocket
@@ -22,18 +26,22 @@ import {
   asConstructor,
   copyBytes,
   inline,
+  replaceAccessor,
   replaceValue,
   utf8Bytes,
 } from "./context.js";
 import { TaskKind } from "./recorder.js";
 import { sha256Hex } from "./sha256.js";
+import {
+  Dir,
+  Outcome,
+  emitBodyEnd,
+  failureOutcome,
+  patchResponses,
+} from "./stream-body.js";
 
 /** `NetRequest.api` (§5.2). */
 const Api = { fetch: 1, xhr: 2, beacon: 3, webSocket: 4, eventSource: 5 };
-/** `NetResponse.outcome` (§5.2). */
-const Outcome = { response: 1, networkError: 2, abort: 3, timeout: 4 };
-/** `WsMessage.dir` (§5.2). */
-const Dir = { in: 1, out: 2, close: 3 };
 
 /** Refusal feature names of this module (§7.5, §10.1). */
 export const UNRECORDABLE_REQUEST_BODY = "unrecordable-request-body";
@@ -96,6 +104,7 @@ function patchFetch(ctx: SeamContext): void {
   const { w, rec, orig } = ctx;
   const origFetch = orig.fetch;
   if (origFetch === undefined) return;
+  const responses = patchResponses(ctx);
 
   replaceValue(
     w,
@@ -143,61 +152,54 @@ function patchFetch(ctx: SeamContext): void {
       });
       const p = origFetch.call(w, input, init);
       if (ids === undefined) return p;
-      const complete = (
-        outcome: number,
-        status: number,
-        headers: string,
-        body: Uint8Array,
-      ) =>
-        rec.guard(() => {
-          rec.task(ids.taskId, TaskKind.networkCompletion);
-          rec.emit("NetResponse", {
-            req_id: ids.reqId,
-            outcome,
-            status,
-            headers,
-            body: inline(body),
-          });
-        });
       return p.then(
         (resp: Response) => {
-          // The page's promise settles only once the body is logged, so the
-          // NetResponse precedes every read the page makes of the response.
-          let headers = "[]";
-          let copy: Response | undefined;
+          // The head has arrived: the network task that resolves the
+          // platform's promise. The page gets its response now; its body is
+          // recorded piece by piece as the page reads it (stream-body.ts).
+          let page = resp;
           rec.guard(() => {
-            headers = headersJson(Array.from(resp.headers));
-            copy = resp.clone();
+            const headers = headersJson(Array.from(resp.headers));
+            rec.task(ids.taskId, TaskKind.networkCompletion);
+            let outcome = Outcome.response;
+            if (resp.body !== null) {
+              const rebuilt = responses?.rebuild(resp, ids.reqId, ids.taskId);
+              if (rebuilt === undefined) {
+                // The page reads the platform's body directly, unseen.
+                ctx.refuseOnce(
+                  UNRECORDABLE_RESPONSE_BODY,
+                  `fetch response ${resp.type} ${resp.status}`,
+                );
+              } else {
+                page = rebuilt;
+                outcome = Outcome.head;
+              }
+            }
+            rec.emit("NetResponse", {
+              req_id: ids.reqId,
+              outcome,
+              status: resp.status,
+              headers,
+              body: inline(EMPTY),
+            });
           });
-          if (copy === undefined) return resp;
-          return copy.arrayBuffer().then(
-            (buf) => {
-              complete(
-                Outcome.response,
-                resp.status,
-                headers,
-                new Uint8Array(buf),
-              );
-              return resp;
-            },
-            (err: unknown) => {
-              complete(
-                isAbort(err) ? Outcome.abort : Outcome.networkError,
-                resp.status,
-                headers,
-                EMPTY,
-              );
-              return resp;
-            },
-          );
+          return page;
         },
         (err: unknown) => {
-          complete(
-            isAbort(err) ? Outcome.abort : Outcome.networkError,
-            0,
-            "[]",
-            EMPTY,
-          );
+          rec.guard(() => {
+            const outcome = failureOutcome(err);
+            // An abort is the page's own call, made inside one of its tasks.
+            if (outcome !== Outcome.abort) {
+              rec.task(ids.taskId, TaskKind.networkCompletion);
+            }
+            rec.emit("NetResponse", {
+              req_id: ids.reqId,
+              outcome,
+              status: 0,
+              headers: "[]",
+              body: inline(EMPTY),
+            });
+          });
           throw err;
         },
       );
@@ -205,19 +207,54 @@ function patchFetch(ctx: SeamContext): void {
   );
 }
 
-function isAbort(err: unknown): boolean {
-  return (err as { name?: unknown })?.name === "AbortError";
-}
+/** `XMLHttpRequest.readyState` values (XHR standard). */
+const ReadyState = { opened: 1, headersReceived: 2, loading: 3, done: 4 };
 
 interface XhrState {
   method: string;
   url: string;
+  /** `open(…, async = false)`: the platform runs it inside `send()`. */
+  sync: boolean;
   reqId?: bigint;
   taskId?: bigint;
+  /** The platform's send() flag, as far as the shim can tell. */
+  sent: boolean;
+  /** `abort()` was called: the events it fires run inside that call. */
   aborted: boolean;
+  /** Inside the page's `send()` call (upload `loadstart` runs there). */
+  sending: boolean;
+  /** The head (`NetResponse{outcome 5}`) has been written. */
+  head: boolean;
+  /** UTF-16 length of the `responseText` already recorded. */
+  seen: number;
   done: boolean;
+  /**
+   * DONE came with a status of 0 and no abort: the request failed, and the
+   * event that follows (`error` or `timeout`) says how.
+   */
+  failing: boolean;
 }
 
+/**
+ * XMLHttpRequest (§5.2, §10.1, §10.4). A request is logged when `send()`
+ * will really send it. Its response is recorded as the page can observe it:
+ * at HEADERS_RECEIVED the head (`NetResponse{outcome 5}`), at each LOADING
+ * the bytes `responseText` grew by (`WsMessage{dir 1}`; empty for a
+ * non-text `responseType`, whose body the page cannot see before DONE), at
+ * DONE what is left and the end (`WsMessage{dir 4}`). A request that
+ * completes without a head (a synchronous request, a failure before the
+ * headers) is one `NetResponse` with its whole body, as before.
+ *
+ * How a request failed (outcome 2, network error, or 4, timeout) is not
+ * observable at DONE, where the page sees only a status of 0; the platform
+ * tells it by the event it fires next in the same task, `error` or
+ * `timeout` (XHR standard, "request error steps"). The shim's listener for
+ * those runs before the page's, so the failure is written there, before the
+ * page can tell which it was; the `Task` is written at DONE.
+ *
+ * Each of these is a network task with a `Task`, except what the platform
+ * dispatches inside a page call: a synchronous `send()`, and `abort()`.
+ */
 function patchXhr(ctx: SeamContext): void {
   const { w, rec, orig } = ctx;
   const OrigXhr = orig.XMLHttpRequest;
@@ -227,54 +264,202 @@ function patchXhr(ctx: SeamContext): void {
   const origSend = proto.send;
   const origAbort = proto.abort;
   const states = new WeakMap<XMLHttpRequest, XhrState>();
+  // Each request's upload object -> the request.
+  const uploads = new WeakMap<XMLHttpRequestUpload, XMLHttpRequest>();
 
-  const onReadyStateChange = function (this: XMLHttpRequest): void {
-    const s = states.get(this);
-    if (s === undefined || s.reqId === undefined || s.done) return;
-    if (this.readyState !== 4) return;
-    s.done = true;
-    rec.guard(() => {
-      const headers: [string, string][] = [];
-      for (const line of this.getAllResponseHeaders().split("\r\n")) {
-        const at = line.indexOf(": ");
-        if (at > 0) headers.push([line.slice(0, at), line.slice(at + 2)]);
-      }
-      const outcome = s.aborted
-        ? Outcome.abort
-        : this.status === 0
-          ? Outcome.networkError
-          : Outcome.response;
-      let body: Uint8Array = EMPTY;
-      const type = this.responseType;
-      if (outcome === Outcome.response) {
-        if (type === "" || type === "text") {
-          body = utf8Bytes(this.responseText);
-        } else if (type === "arraybuffer") {
-          body = this.response === null ? EMPTY : copyBytes(this.response);
-        } else if (type === "json") {
-          // The raw text is not exposed for a JSON response; its
-          // re-serialisation parses back to the same value on replay.
-          body = utf8Bytes(JSON.stringify(this.response));
-        } else {
-          ctx.refuseOnce(
-            UNRECORDABLE_RESPONSE_BODY,
-            `XHR responseType ${type}`,
-          );
-        }
-      }
-      rec.task(s.taskId!, TaskKind.networkCompletion);
+  const responseHeaders = (x: XMLHttpRequest): string => {
+    const headers: [string, string][] = [];
+    for (const line of x.getAllResponseHeaders().split("\r\n")) {
+      const at = line.indexOf(": ");
+      if (at > 0) headers.push([line.slice(0, at), line.slice(at + 2)]);
+    }
+    return headersJson(headers);
+  };
+  const isText = (x: XMLHttpRequest) =>
+    x.responseType === "" || x.responseType === "text";
+  /** What `responseText` grew by since it was last recorded. */
+  const textDelta = (x: XMLHttpRequest, s: XhrState): Uint8Array => {
+    const t = x.responseText;
+    const d = t.slice(s.seen);
+    s.seen = t.length;
+    return utf8Bytes(d);
+  };
+  /** The whole body of a non-text response at DONE, or `null` (refused). */
+  const wholeBody = (x: XMLHttpRequest): Uint8Array | null => {
+    const type = x.responseType;
+    if (type === "arraybuffer") {
+      return x.response === null ? EMPTY : copyBytes(x.response);
+    }
+    if (type === "json") {
+      // The raw text is not exposed for a JSON response; its
+      // re-serialisation parses back to the same value on replay.
+      return utf8Bytes(JSON.stringify(x.response));
+    }
+    ctx.refuseOnce(UNRECORDABLE_RESPONSE_BODY, `XHR responseType ${type}`);
+    return null;
+  };
+  /** Write how request `s` failed: its whole response, or its body's end. */
+  const failure = (s: XhrState, outcome: number) => {
+    s.failing = false;
+    if (s.head) {
+      emitBodyEnd(rec, s.reqId!, outcome);
+    } else {
       rec.emit("NetResponse", {
         req_id: s.reqId!,
         outcome,
-        status: this.status,
-        headers: headersJson(headers),
+        status: 0,
+        headers: "[]",
+        body: inline(EMPTY),
+      });
+    }
+  };
+  const head = (x: XMLHttpRequest, s: XhrState) => {
+    s.head = true;
+    rec.emit("NetResponse", {
+      req_id: s.reqId!,
+      outcome: Outcome.head,
+      status: x.status,
+      headers: responseHeaders(x),
+      body: inline(EMPTY),
+    });
+  };
+  const piece = (s: XhrState, bytes: Uint8Array) =>
+    rec.emit("WsMessage", {
+      req_id: s.reqId!,
+      dir: Dir.in,
+      data: inline(bytes),
+    });
+
+  /** The `Task` of a network task of request `s`; none in a page call. */
+  const task = (s: XhrState) => {
+    if (!s.sync && !s.aborted) {
+      rec.task(s.taskId!, TaskKind.networkCompletion);
+    }
+  };
+
+  /** Request `s` reached DONE: its `Task`, and how it completed. */
+  const finish = (x: XMLHttpRequest, s: XhrState) => {
+    s.done = true;
+    task(s);
+    if (s.aborted) {
+      failure(s, Outcome.abort);
+      return;
+    }
+    if (x.status === 0) {
+      s.failing = true; // written by onFailureEvent or onUploadEvent
+      return;
+    }
+    const outcome = Outcome.response;
+    if (!s.head) {
+      const body = isText(x)
+        ? utf8Bytes(x.responseText)
+        : (wholeBody(x) ?? EMPTY);
+      rec.emit("NetResponse", {
+        req_id: s.reqId!,
+        outcome,
+        status: x.status,
+        headers: responseHeaders(x),
         body: inline(body),
       });
+      return;
+    }
+    const rest = isText(x) ? textDelta(x, s) : wholeBody(x);
+    if (rest !== null && rest.length > 0) piece(s, rest);
+    emitBodyEnd(rec, s.reqId!, outcome);
+  };
+
+  /** The state of request `x` while it is sent and not yet DONE. */
+  const inFlight = (x: XMLHttpRequest): XhrState | undefined => {
+    const s = states.get(x);
+    return s === undefined || s.reqId === undefined || s.done ? undefined : s;
+  };
+
+  const onReadyStateChange = function (this: XMLHttpRequest): void {
+    const s = inFlight(this);
+    if (s === undefined) return;
+    const state = this.readyState;
+    if (state < ReadyState.headersReceived) return;
+    rec.guard(() => {
+      if (state === ReadyState.headersReceived) {
+        task(s);
+        head(this, s);
+        return;
+      }
+      if (state === ReadyState.loading) {
+        task(s);
+        if (!s.head) head(this, s);
+        piece(s, isText(this) ? textDelta(this, s) : EMPTY);
+        return;
+      }
+      finish(this, s);
     });
   };
 
-  // The constructor registers the shim's listener first, so its Task and
-  // NetResponse precede every listener the page adds, whenever it adds it.
+  /**
+   * A `progress` event at the request. The platform rate-limits these to
+   * one per 50 ms and dispatches a deferred one from a timer task of its
+   * own, and Chromium dispatches the last one at DONE before DONE's
+   * `readystatechange`, when the page can already read the whole body. So
+   * each is a `Task` of its own, with what `responseText` grew by since it
+   * was last recorded, and the one at DONE is where the request completes.
+   */
+  const onProgress = function (this: XMLHttpRequest): void {
+    const s = inFlight(this);
+    if (s === undefined || s.sync || s.aborted) return;
+    rec.guard(() => {
+      if (this.readyState === ReadyState.done) {
+        finish(this, s);
+        return;
+      }
+      task(s);
+      if (!s.head) head(this, s);
+      if (isText(this)) {
+        const grown = textDelta(this, s);
+        if (grown.length > 0) piece(s, grown);
+      }
+    });
+  };
+
+  /**
+   * An event at a request's upload object. Those the platform dispatches
+   * while it sends the body (`progress`, `load`, `loadend`) run in network
+   * tasks of their own, a `Task` each; `loadstart` runs inside `send()` and
+   * an abort's events inside `abort()`, page calls. A failure's `error` or
+   * `timeout` reaches the upload object before the request (XHR standard,
+   * "request error steps"), so the failure is written at the first of them.
+   */
+  const onUploadEvent = function (this: XMLHttpRequestUpload, ev: Event): void {
+    const x = uploads.get(this);
+    const s = x === undefined ? undefined : states.get(x);
+    if (s === undefined || s.reqId === undefined || s.sync) return;
+    rec.guard(() => {
+      if (s.failing) {
+        if (ev.type === "error" || ev.type === "timeout") {
+          failure(
+            s,
+            ev.type === "timeout" ? Outcome.timeout : Outcome.networkError,
+          );
+        }
+        return;
+      }
+      if (s.done || s.aborted || s.sending) return;
+      task(s);
+    });
+  };
+
+  const onFailureEvent = function (this: XMLHttpRequest, ev: Event): void {
+    const s = states.get(this);
+    if (s === undefined || !s.failing) return;
+    rec.guard(() =>
+      failure(
+        s,
+        ev.type === "timeout" ? Outcome.timeout : Outcome.networkError,
+      ),
+    );
+  };
+
+  // The constructor registers the shim's listeners first, so its records
+  // precede every listener the page adds, whenever it adds it.
   const PatchedXhr = function XMLHttpRequest(this: unknown): XMLHttpRequest {
     if (new.target === undefined) {
       // Calling the constructor without `new` throws; keep that.
@@ -283,8 +468,13 @@ function patchXhr(ctx: SeamContext): void {
     // Constructed for `new.target`, so a page subclass keeps its prototype.
     const x = Reflect.construct(OrigXhr, [], new.target) as XMLHttpRequest;
     rec.guard(() => {
-      states.set(x, { method: "GET", url: "", aborted: false, done: false });
+      states.set(x, newState("GET", "", false));
       orig.addEventListener.call(x, "readystatechange", onReadyStateChange);
+      orig.addEventListener.call(x, "progress", onProgress);
+      uploads.set(x.upload, x);
+      for (const t of ["error", "timeout"]) {
+        orig.addEventListener.call(x, t, onFailureEvent as EventListener);
+      }
     });
     return x;
   };
@@ -301,62 +491,186 @@ function patchXhr(ctx: SeamContext): void {
       ...rest: unknown[]
     ): void {
       (origOpen as (...a: unknown[]) => void).call(this, method, url, ...rest);
-      const s = states.get(this);
-      if (s !== undefined) {
+      const prev = states.get(this);
+      if (prev !== undefined) {
         rec.guard(() => {
-          s.method = normaliseMethod(method);
-          s.url = absoluteUrl(w, url instanceof URL ? url.href : url);
-          s.reqId = undefined;
-          s.aborted = false;
-          s.done = false;
+          // Reopened from its own DONE handler, before the failure's event:
+          // the platform may not fire it now, and the log must still close
+          // the request. A network error is what the page could tell.
+          if (prev.failing) failure(prev, Outcome.networkError);
+          // `open(method, url, async)`: an explicit falsy `async` (even
+          // `undefined`) makes the request synchronous.
+          states.set(
+            this,
+            newState(
+              normaliseMethod(method),
+              absoluteUrl(w, url instanceof URL ? url.href : url),
+              rest.length > 0 && !rest[0],
+            ),
+          );
         });
       }
     },
   );
 
-  replaceValue(
-    proto,
-    "send",
-    function send(
-      this: XMLHttpRequest,
-      body?: Document | XMLHttpRequestBodyInit | null,
-    ): void {
-      const s = states.get(this);
-      if (s !== undefined && rec.recording) {
-        rec.guard(() => {
-          let digest = bodyDigest(body);
-          if (digest === null) {
-            ctx.refuseOnce(
-              UNRECORDABLE_REQUEST_BODY,
-              `XHR body ${typeName(body)}`,
-            );
-            digest = "";
-          }
-          s.reqId = rec.nextReqId();
-          s.taskId = rec.nextTaskId();
-          rec.emit("NetRequest", {
-            req_id: s.reqId,
-            api: Api.xhr,
-            method: s.method,
-            url: s.url,
-            body_digest: digest,
-          });
-          rec.emit("TaskReg", {
-            task_id: s.taskId,
-            kind: TaskKind.networkCompletion,
-            delay_ms: 0,
-          });
+  replaceValue(proto, "send", function send(this: XMLHttpRequest): void {
+    const s = states.get(this);
+    // The platform refuses send() unless the request is OPENED and not
+    // already sent, and throws before sending anything (XHR standard,
+    // send() steps 1 and 2): such a call is not a request.
+    if (
+      s !== undefined &&
+      rec.recording &&
+      !s.sent &&
+      this.readyState === ReadyState.opened
+    ) {
+      const body = arguments[0] as unknown;
+      rec.guard(() => {
+        // For GET and HEAD the platform ignores the body (step 3).
+        let digest =
+          s.method === "GET" || s.method === "HEAD" ? "" : bodyDigest(body);
+        if (digest === null) {
+          ctx.refuseOnce(
+            UNRECORDABLE_REQUEST_BODY,
+            `XHR body ${typeName(body)}`,
+          );
+          digest = "";
+        }
+        s.sent = true;
+        s.reqId = rec.nextReqId();
+        s.taskId = rec.nextTaskId();
+        rec.emit("NetRequest", {
+          req_id: s.reqId,
+          api: Api.xhr,
+          method: s.method,
+          url: s.url,
+          body_digest: digest,
         });
+        rec.emit("TaskReg", {
+          task_id: s.taskId,
+          kind: TaskKind.networkCompletion,
+          delay_ms: 0,
+        });
+      });
+    }
+    if (s !== undefined) s.sending = true;
+    try {
+      return (origSend as (...a: unknown[]) => void).apply(
+        this,
+        Array.from(arguments),
+      );
+    } catch (e) {
+      // A synchronous request that fails throws from send() and fires no
+      // event at all (XHR standard, "request error steps" step 4).
+      if (s !== undefined && s.sync && s.reqId !== undefined && !s.done) {
+        s.done = true;
+        rec.guard(() => failure(s, failureOutcome(e)));
       }
-      return origSend.call(this, body);
-    },
-  );
+      throw e;
+    } finally {
+      if (s !== undefined) s.sending = false;
+    }
+  });
 
   replaceValue(proto, "abort", function abort(this: XMLHttpRequest): void {
     const s = states.get(this);
     if (s !== undefined) s.aborted = true;
     return origAbort.call(this);
   });
+
+  patchUploadListeners(ctx, uploads, onUploadEvent);
+}
+
+/** Every event the platform fires at an XHR's upload object. */
+const UPLOAD_EVENTS = [
+  "loadstart",
+  "progress",
+  "abort",
+  "error",
+  "load",
+  "timeout",
+  "loadend",
+];
+
+/**
+ * Listen at an XHR's upload object, first, once the page does.
+ *
+ * Not before: a listener on the upload object is what makes the platform
+ * fire upload events at all, and it forces a CORS preflight for a
+ * cross-origin request (XHR standard, `send()`, "upload listener flag";
+ * https://xhr.spec.whatwg.org/#the-send()-method). So the shim adds its
+ * listener only when the page adds one, just before the page's, through
+ * `addEventListener` or an `on<event>` handler of the upload object, and
+ * the request goes out exactly as it would without the shim. (A page that
+ * adds an upload listener and removes it again before `send()` would now
+ * have the flag set; the shim does not undo its own listener.)
+ */
+function patchUploadListeners(
+  ctx: SeamContext,
+  uploads: WeakMap<XMLHttpRequestUpload, XMLHttpRequest>,
+  onUploadEvent: (this: XMLHttpRequestUpload, ev: Event) => void,
+): void {
+  const { w, rec, orig } = ctx;
+  const Upload = w.XMLHttpRequestUpload;
+  const Target = w.XMLHttpRequestEventTarget;
+  if (Upload === undefined || Target === undefined) return;
+  const watched = new WeakSet<XMLHttpRequestUpload>();
+  const watch = (target: unknown, listener: unknown) => {
+    if (listener === null || listener === undefined) return;
+    const u = target as XMLHttpRequestUpload;
+    if (watched.has(u) || !uploads.has(u)) return;
+    rec.guard(() => {
+      watched.add(u);
+      for (const t of UPLOAD_EVENTS) {
+        orig.addEventListener.call(u, t, onUploadEvent as EventListener);
+      }
+    });
+  };
+
+  const origAdd = orig.addEventListener;
+  replaceValue(
+    Upload.prototype,
+    "addEventListener",
+    function addEventListener(
+      this: XMLHttpRequestUpload,
+      type: string,
+      listener: unknown,
+      ...rest: unknown[]
+    ): void {
+      watch(this, listener);
+      return (origAdd as (...a: unknown[]) => void).call(
+        this,
+        type,
+        listener,
+        ...rest,
+      );
+    },
+  );
+  for (const t of UPLOAD_EVENTS) {
+    const name = `on${t}`;
+    const d = Object.getOwnPropertyDescriptor(Target.prototype, name);
+    if (d?.get === undefined || d.set === undefined) continue;
+    const set = d.set;
+    replaceAccessor(Target.prototype, name, d.get, function (v: unknown) {
+      watch(this, v);
+      set.call(this, v);
+    });
+  }
+}
+
+function newState(method: string, url: string, sync: boolean): XhrState {
+  return {
+    method,
+    url,
+    sync,
+    sent: false,
+    aborted: false,
+    sending: false,
+    head: false,
+    seen: 0,
+    done: false,
+    failing: false,
+  };
 }
 
 function patchBeacon(ctx: SeamContext): void {

@@ -32,6 +32,8 @@ export {
   UNRECORDABLE_RESPONSE_BODY,
 } from "./browser/seams-net.js";
 export { RECORDER_FAULT } from "./browser/recorder.js";
+export { UNRECORDABLE_TIMER_HANDLER } from "./browser/seams-time.js";
+export { SHAPE_READ } from "./browser/seams-storage.js";
 
 /**
  * The path of the browser bundle, `dist/boundary-shim.iife.js`. Resolved from

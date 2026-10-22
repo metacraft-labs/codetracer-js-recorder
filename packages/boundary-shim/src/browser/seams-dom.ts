@@ -1,11 +1,12 @@
 /**
  * Storage, layout, navigation and input seams (JS-Boundary-Recording.md
  * §5.2 `StorageRead`, `LayoutRead`, `Navigation`, `Input`, `DomEffect`;
- * §10.1, §10.2).
+ * §10.1, §10.2). Storage is in seams-storage.ts.
  */
 
 import { type SeamContext, replaceAccessor, replaceValue } from "./context.js";
 import { TaskKind } from "./recorder.js";
+import { patchStorage } from "./seams-storage.js";
 import { targetOf } from "./targets.js";
 
 /** Patch every seam this module owns. */
@@ -13,65 +14,6 @@ export function patchDomSeams(ctx: SeamContext): void {
   patchStorage(ctx);
   patchLayout(ctx);
   patchHistory(ctx);
-}
-
-function patchStorage({ w, rec, orig }: SeamContext): void {
-  // The storage objects, fetched once: which one a getItem call is on is
-  // the record's `area`.
-  let local: Storage | undefined;
-  let session: Storage | undefined;
-  try {
-    local = w.localStorage;
-  } catch {
-    // Storage denied to this document: getItem cannot be called on it.
-  }
-  try {
-    session = w.sessionStorage;
-  } catch {
-    // As above.
-  }
-  const origGet = orig.storageGetItem;
-  replaceValue(
-    w.Storage.prototype,
-    "getItem",
-    function getItem(this: Storage, key: string): string | null {
-      const v = origGet.call(this, key);
-      const area = this === local ? 1 : this === session ? 2 : 0;
-      if (area !== 0) {
-        rec.guard(() =>
-          rec.emit("StorageRead", {
-            area,
-            key: String(key),
-            present: v === null ? 0 : 1,
-            value: v ?? "",
-          }),
-        );
-      }
-      return v;
-    },
-  );
-
-  const cookie = orig.cookie;
-  if (cookie !== undefined) {
-    const get = cookie.descriptor.get!;
-    const set = cookie.descriptor.set;
-    replaceAccessor(
-      cookie.owner,
-      "cookie",
-      function (this: unknown) {
-        const v = get.call(this) as string;
-        rec.guard(() =>
-          rec.emit("StorageRead", { area: 3, key: "", present: 1, value: v }),
-        );
-        return v;
-      },
-      set === undefined
-        ? undefined
-        : function (this: unknown, v: unknown) {
-            set.call(this, v);
-          },
-    );
-  }
 }
 
 function patchLayout({ w, rec, orig }: SeamContext): void {

@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <!-- No 'unsafe-eval': the platform refuses to compile a string timer
+         handler. 'unsafe-inline' admits the recorder's inline bootstrap. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="script-src 'self' 'unsafe-inline'"
+    />
+    <title>string timer handlers under CSP</title>
+  </head>
+  <body>
+    <ul id="out"></ul>
+    <script src="timers.js"></script>
+  </body>
+</html>

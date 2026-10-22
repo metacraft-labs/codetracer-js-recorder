@@ -23,6 +23,7 @@
     localStorage: 0,
     getBoundingClientRect: 0,
     webSocket: 0,
+    timeStamp: 0,
   };
   Object.defineProperty(window, "__pageCounts", { value: counts });
 
@@ -42,10 +43,23 @@
   wrap(window, "setTimeout", "setTimeout");
   wrap(window, "setInterval", "setInterval");
   wrap(window, "requestAnimationFrame", "requestAnimationFrame");
+  // The storage object as the platform made it: the shim hands the page a
+  // proxy of it, and unwraps the proxy before calling getItem.
+  var local = window.localStorage;
   wrap(Storage.prototype, "getItem", "localStorage", function (self) {
-    return self === window.localStorage;
+    return self === local;
   });
   wrap(Element.prototype, "getBoundingClientRect", "getBoundingClientRect");
+
+  var stamp = Object.getOwnPropertyDescriptor(Event.prototype, "timeStamp");
+  Object.defineProperty(Event.prototype, "timeStamp", {
+    get: function () {
+      if (counts.enabled) counts.timeStamp++;
+      return stamp.get.call(this);
+    },
+    enumerable: stamp.enumerable,
+    configurable: true,
+  });
 
   var OriginalWebSocket = window.WebSocket;
   var CountingWebSocket = function (url, protocols) {
