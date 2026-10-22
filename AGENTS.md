@@ -33,7 +33,19 @@ npm run bench
 This is a monorepo managed with npm workspaces:
 
 * `packages/cli` — CLI entry point (`codetracer-js-recorder` binary).
-  Provides `instrument`, `record` and `read-spans` subcommands.
+  Provides `instrument`, `record`, `read-spans`, `boundary-shim` and
+  `bundle-manifest` subcommands. `instrument` is deterministic: files are
+  instrumented in sorted order (`sortedFilesUnder` in
+  `packages/instrumenter/src/files.ts`, never the filesystem's order), every
+  output declares the recorder version (`packages/instrumenter/src/version.ts`),
+  and `--relative-paths` makes the output independent of where the bundle sits
+  (the post-bundle replay build). `bundle-manifest` writes `ct-bundle.json` and
+  prints the build hash (`packages/boundary-shim/src/bundle-manifest.ts`).
+  Pinned by `tests/integration/deterministic-instrumentation.test.ts`.
+* `packages/{esbuild,rollup,webpack,vite}-plugin` — bundler plugins. Each numbers
+  every module in the merged manifest (`ManifestAccumulator`, see below) and
+  emits `codetracer.manifest.json` and a source map; the real bundlers (root
+  devDependencies) run them in `tests/integration/bundler-plugins.test.ts`.
 * `packages/express` — Express middleware emitting one web-request span per
   request into the recorded `.ct` container (RS-M9); see
   `docs/web-request-spans.md`.
@@ -97,7 +109,7 @@ So a caller that instruments several files must ask
 `nextManifestIdBases(slicesSoFar)` **before** each `instrument()` call and pass
 it as `idBases`, then merge in the same order with `mergeManifestSlices`. That
 merge is the single implementation (`packages/instrumenter/src/merge.ts`), used
-by `record`, `instrument` and the vite plugin's `ManifestAccumulator`; it places
+by `record`, `instrument` and every bundler plugin's `ManifestAccumulator`; it places
 each slice at its declared base and throws `ManifestIdBaseMismatchError` rather
 than mis-attributing.
 
