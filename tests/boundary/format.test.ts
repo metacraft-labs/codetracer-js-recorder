@@ -154,7 +154,7 @@ describe("@codetracer/boundary-format", () => {
       )
       .sort();
     expect(sets).toEqual(u8Fields);
-    expect(u8Fields).toHaveLength(18);
+    expect(u8Fields).toHaveLength(21);
     // The shared vectors step past both ends of every set: the refusal
     // vectors name each field.
     const refusals = loadVectors()

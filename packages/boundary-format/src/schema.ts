@@ -271,6 +271,19 @@ export const RECORD_SCHEMA = [
     ],
   },
   {
+    tag: 0x56,
+    name: "XhrEvent",
+    fields: [
+      ["seq", "u64"],
+      ["req_id", "u64"],
+      ["target", "u8"],
+      ["event", "u8"],
+      ["loaded", "u64"],
+      ["total", "u64"],
+      ["length_computable", "u8"],
+    ],
+  },
+  {
     tag: 0x5f,
     name: "End",
     fields: [
@@ -313,7 +326,27 @@ export const ENUM_VALUE_SETS: Readonly<
   Scrubbed: { class: [1, 4] },
   Gap: { reason: [1, 3] },
   End: { reason: [1, 4] },
+  // 1 the request, 2 its upload object; the seven `ProgressEvent` types an
+  // XMLHttpRequest dispatches (XHR_EVENT); a boolean.
+  XhrEvent: { target: [1, 2], event: [1, 7], length_computable: [0, 1] },
 };
+
+/**
+ * `XhrEvent.target` and `XhrEvent.event` values (spec §5.2): where an
+ * XMLHttpRequest `ProgressEvent` was dispatched, and its type.
+ */
+export const XHR_EVENT = {
+  target: { request: 1, upload: 2 },
+  event: {
+    loadstart: 1,
+    progress: 2,
+    abort: 3,
+    error: 4,
+    load: 5,
+    timeout: 6,
+    loadend: 7,
+  },
+} as const;
 
 type Schema = (typeof RECORD_SCHEMA)[number];
 
