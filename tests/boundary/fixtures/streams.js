@@ -270,6 +270,97 @@
       x.send();
     },
 
+    // Three XMLHttpRequests, one after the other, with a listener for every
+    // ProgressEvent type at the request and at its upload object: a body
+    // of unknown length (chunked), one with a content-length, and a 2 MiB
+    // upload. Each listener notes the event as the page saw it and reads
+    // the clock.
+    "xhr-progress-values": function () {
+      var types = [
+        "loadstart",
+        "progress",
+        "abort",
+        "error",
+        "load",
+        "timeout",
+        "loadend",
+      ];
+      var seen = {};
+      var requests = [
+        ["down", "GET", "/api/stream?n=40&interval=5", null],
+        ["sized", "GET", "/api/stream?n=40&interval=5&length=1", null],
+        ["up", "POST", "/api/data", "u".repeat(2 * 1024 * 1024)],
+      ];
+      function next(k) {
+        if (k === requests.length) {
+          for (var name in seen) slot(name, seen[name].join("|"));
+          done();
+          return;
+        }
+        var spec = requests[k];
+        var log = (seen[spec[0]] = []);
+        var x = new XMLHttpRequest();
+        function listen(target, where) {
+          types.forEach(function (t) {
+            target.addEventListener(t, function (e) {
+              log.push(
+                [where, e.type, e.loaded, e.total, e.lengthComputable].join(
+                  ":",
+                ),
+              );
+              Date.now();
+              if (where === "req" && e.type === "loadend") next(k + 1);
+            });
+          });
+        }
+        listen(x, "req");
+        listen(x.upload, "up");
+        x.open(spec[1], spec[2]);
+        x.send(spec[3]);
+      }
+      next(0);
+    },
+
+    // Events the page itself dispatches at an XMLHttpRequest: right after
+    // send(), a progress at the request and at its upload object, a load and
+    // an error; and a readystatechange from inside the platform's
+    // HEADERS_RECEIVED one. Every listener, of the platform's events and of
+    // the page's alike, reads the clock.
+    "xhr-synthetic": function () {
+      var x = new XMLHttpRequest();
+      function made(type) {
+        return new ProgressEvent(type, {
+          loaded: 99,
+          total: 99,
+          lengthComputable: true,
+        });
+      }
+      x.open("POST", "/api/echo");
+      x.addEventListener("progress", function () {
+        Date.now();
+      });
+      x.addEventListener("readystatechange", function (e) {
+        Date.now();
+        if (e.isTrusted && x.readyState === 2) {
+          x.dispatchEvent(new Event("readystatechange"));
+        }
+      });
+      x.upload.addEventListener("progress", function () {
+        Date.now();
+      });
+      x.onloadend = function () {
+        slot("status", x.status);
+        done();
+      };
+      x.send("u".repeat(512));
+      // A progress at the request and at its upload object, whose listeners
+      // read the clock, and a load and an error, which have none.
+      x.dispatchEvent(made("progress"));
+      x.upload.dispatchEvent(made("progress"));
+      x.dispatchEvent(made("load"));
+      x.dispatchEvent(made("error"));
+    },
+
     // An upload with listeners at the upload object, one added with
     // addEventListener and the rest as handlers. Each listener reads the
     // clock.

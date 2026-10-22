@@ -647,6 +647,213 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
   );
 
   it(
+    "jsbound_shim_logs_xhr_progress_event_values",
+    async () => {
+      // A ProgressEvent's loaded, total and lengthComputable depend on how
+      // the network delivered the bytes, and a page that shows progress
+      // reads them (§5.2 XhrEvent, §10.1). The page notes every one it
+      // observes at three requests (a chunked download, a download with a
+      // content-length, a 2 MiB upload), with a listener for each type at
+      // the request and at its upload object, as
+      // `<target>:<type>:<loaded>:<total>:<lengthComputable>`, and reads
+      // the clock in each listener.
+      const o = await open(shimDir, "streams.html?case=xhr-progress-values");
+      expect(o.pageErrors).toEqual([]);
+      const s = await slots(o.page);
+      const log = await stopAndDecode(o.page);
+      expect(log.termination).toBe("Complete");
+      expect(recordsOf(log, "Refusal")).toEqual([]);
+
+      const TARGETS = ["", "req", "up"];
+      const TYPES = [
+        "",
+        "loadstart",
+        "progress",
+        "abort",
+        "error",
+        "load",
+        "timeout",
+        "loadend",
+      ];
+      const shown = (r: Extract<BoundaryRecord, { record: "XhrEvent" }>) =>
+        [
+          TARGETS[r.target],
+          TYPES[r.event],
+          r.loaded,
+          r.total,
+          r.length_computable === 1,
+        ].join(":");
+      const cases: [string, string][] = [
+        ["down", "/api/stream?n=40&interval=5"],
+        ["sized", "/api/stream?n=40&interval=5&length=1"],
+        ["up", "/api/data"],
+      ];
+      let observedCount = 0;
+      for (const [name, suffix] of cases) {
+        const observed = s[`r-${name}`].slice(`${name}=`.length).split("|");
+        observedCount += observed.length;
+        const { reqId, taskId } = request(log, suffix);
+        const events = recordsOf(log, "XhrEvent", (r) => r.req_id === reqId);
+        // Every observed event, with the values the page read, in the
+        // order it observed them, and nothing it did not.
+        expect(events.map(shown), name).toEqual(observed);
+
+        // Vacuity: each request went through its whole life.
+        const types = observed.map((e) => e.split(":").slice(0, 2).join(":"));
+        for (const t of ["req:loadstart", "req:progress", "req:load"]) {
+          expect(types, `${name} observed ${t}`).toContain(t);
+        }
+        expect(types[types.length - 1]).toBe("req:loadend");
+
+        // A progress event, and an upload event the platform dispatches
+        // while it sends the body, is a network task: its XhrEvent closes
+        // a Task of the request, after only the parts of the response that
+        // task brought (§6). `loadstart` runs inside send().
+        events.forEach((e, k) => {
+          const at = log.records.indexOf(e);
+          // The XhrEvent is the last record before the page's listener,
+          // whose first boundary read is the clock: replay dispatches the
+          // event with everything before it applied.
+          expect(
+            log.records[at + 1],
+            `${name}: the listener's clock read right after ${shown(e)} #${k}`,
+          ).toMatchObject({ record: "Clock", src: 1 });
+          let j = at - 1;
+          for (; j >= 0; j--) {
+            const r = log.records[j];
+            const part =
+              (r.record === "NetResponse" || r.record === "WsMessage") &&
+              r.req_id === reqId;
+            if (!part) break;
+          }
+          const opener = log.records[j];
+          const task = opener.record === "Task" && opener.task_id === taskId;
+          const type = TYPES[e.event];
+          if (type === "progress" || (e.target === 2 && type !== "loadstart")) {
+            expect(task, `${name}: a Task before ${shown(e)} #${k}`).toBe(true);
+          }
+          if (type === "loadstart") {
+            expect(task, `${name}: loadstart runs inside send()`).toBe(false);
+          }
+        });
+      }
+
+      // The values are the network's: a chunked body is not
+      // length-computable, a content-length makes it so (40 pieces, 150
+      // bytes), and the upload reports its 2 MiB.
+      const values = (name: string) =>
+        s[`r-${name}`]
+          .slice(`${name}=`.length)
+          .split("|")
+          .map((e) => e.split(":"));
+      expect(
+        values("down").filter(([, t]) => t === "progress"),
+      ).not.toContainEqual(expect.arrayContaining(["true"]));
+      expect(values("down")).toContainEqual([
+        "req",
+        "load",
+        "150",
+        "0",
+        "false",
+      ]);
+      expect(values("sized")).toContainEqual([
+        "req",
+        "load",
+        "150",
+        "150",
+        "true",
+      ]);
+      expect(values("up")).toContainEqual([
+        "up",
+        "load",
+        String(2 * 1024 * 1024),
+        String(2 * 1024 * 1024),
+        "true",
+      ]);
+      expect(
+        values("up").filter(([w, t]) => w === "up" && t === "progress").length,
+      ).toBeGreaterThan(0);
+
+      // Each XhrEvent is written before the listener that reads it runs:
+      // from the first request on, the events and the listeners' clock
+      // reads alternate, event first.
+      const first = request(log, cases[0][1]).at;
+      expect(
+        log.records
+          .slice(first)
+          .filter(
+            (r) =>
+              r.record === "XhrEvent" || (r.record === "Clock" && r.src === 1),
+          )
+          .map((r) => r.record),
+      ).toEqual(
+        Array.from({ length: observedCount }, () => [
+          "XhrEvent",
+          "Clock",
+        ]).flat(),
+      );
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "jsbound_shim_ignores_events_the_page_dispatches_at_an_xhr",
+    async () => {
+      // An event the page dispatches at an XMLHttpRequest is its own code,
+      // which runs again on replay; only the platform's events are recorded
+      // (§10.1). The page dispatches a progress event at the request and at
+      // its upload object inside the task that sends it, and a
+      // readystatechange inside the platform's HEADERS_RECEIVED one; every
+      // listener reads the clock.
+      const o = await open(shimDir, "streams.html?case=xhr-synthetic");
+      expect(o.pageErrors).toEqual([]);
+      expect((await slots(o.page))["r-status"]).toBe("status=200");
+      const log = await stopAndDecode(o.page);
+      expect(log.termination).toBe("Complete");
+      const { reqId, taskId, at } = request(log, "/api/echo");
+
+      // None of the page's events is an XhrEvent.
+      const events = recordsOf(log, "XhrEvent", (r) => r.req_id === reqId);
+      expect(events.length, "the platform's events").toBeGreaterThan(0);
+      expect(events.filter((e) => e.loaded === BigInt(99))).toEqual([]);
+
+      // The task that sent the request, up to the next Task: the platform's
+      // loadstart events inside send(), then the listeners of the page's two
+      // progress events, and nothing else.
+      const nextTask = log.records.findIndex(
+        (r, i) => i > at && r.record === "Task",
+      );
+      expect(nextTask).toBeGreaterThan(at);
+      expect(
+        log.records
+          .slice(at + 2, nextTask)
+          .map((r) =>
+            r.record === "XhrEvent"
+              ? `XhrEvent:${r.target}:${r.event}`
+              : r.record,
+          ),
+      ).toEqual(["XhrEvent:1:1", "XhrEvent:2:1", "Clock", "Clock"]);
+
+      // HEADERS_RECEIVED is one Task and one head, followed by its listener's
+      // clock read and that of the page's readystatechange inside it.
+      const heads = indicesOf(
+        log,
+        (r) =>
+          r.record === "NetResponse" && r.req_id === reqId && r.outcome === 5,
+      );
+      expect(heads).toHaveLength(1);
+      expect(log.records[heads[0] - 1]).toMatchObject({
+        record: "Task",
+        task_id: taskId,
+      });
+      expect(
+        log.records.slice(heads[0] + 1, heads[0] + 3).map((r) => r.record),
+      ).toEqual(["Clock", "Clock"]);
+    },
+    TIMEOUT,
+  );
+
+  it(
     "jsbound_shim_records_an_xhr_timeout_as_outcome_4",
     async () => {
       const o = await open(shimDir, "streams.html?case=xhr-failures");

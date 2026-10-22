@@ -30,6 +30,8 @@ import {
   replaceValue,
   utf8Bytes,
 } from "./context.js";
+import { XHR_EVENT } from "@codetracer/boundary-format";
+
 import { TaskKind } from "./recorder.js";
 import { sha256Hex } from "./sha256.js";
 import {
@@ -210,6 +212,15 @@ function patchFetch(ctx: SeamContext): void {
 /** `XMLHttpRequest.readyState` values (XHR standard). */
 const ReadyState = { opened: 1, headersReceived: 2, loading: 3, done: 4 };
 
+/**
+ * The `XhrEvent.event` of each `ProgressEvent` type an XMLHttpRequest and
+ * its upload object dispatch (§5.2; XHR standard, "Events summary",
+ * https://xhr.spec.whatwg.org/#events), by type name.
+ */
+const XHR_EVENT_TYPES: Readonly<Record<string, number>> = XHR_EVENT.event;
+/** The `ProgressEvent` types the shim listens for at the request itself. */
+const REQUEST_EVENTS = ["loadstart", "abort", "load", "loadend"];
+
 interface XhrState {
   method: string;
   url: string;
@@ -254,6 +265,17 @@ interface XhrState {
  *
  * Each of these is a network task with a `Task`, except what the platform
  * dispatches inside a page call: a synchronous `send()`, and `abort()`.
+ *
+ * Every `ProgressEvent` the platform dispatches at the request, or at its
+ * upload object once the shim listens there, is an `XhrEvent`: which
+ * object, which type, and the `loaded`, `total` and `lengthComputable` the
+ * page's listeners read, which depend on how the network delivered the
+ * bytes. It is the last record the shim writes for the event, after those
+ * that bring the response up to what the listeners can read, so replay
+ * dispatches it with that state. A `Task` of the request followed by no
+ * `XhrEvent` before the next `Task` is a `readystatechange`. Only trusted
+ * events are recorded: one the page dispatches itself happens again on
+ * replay.
  */
 function patchXhr(ctx: SeamContext): void {
   const { w, rec, orig } = ctx;
@@ -330,6 +352,27 @@ function patchXhr(ctx: SeamContext): void {
       data: inline(bytes),
     });
 
+  /**
+   * The `XhrEvent` of `ProgressEvent` `ev`, dispatched at request `s`
+   * (`target` 1) or its upload object (2), with the values its listeners
+   * read. A trusted `ProgressEvent`'s `loaded` and `total` are non-negative
+   * integers (XHR standard, "fire a progress event"); anything else throws
+   * here and is a recorder fault, never a wrong value.
+   */
+  const xhrEvent = (s: XhrState, ev: Event, target: number) => {
+    const event = XHR_EVENT_TYPES[ev.type];
+    if (event === undefined) return;
+    const p = ev as ProgressEvent;
+    rec.emit("XhrEvent", {
+      req_id: s.reqId!,
+      target,
+      event,
+      loaded: BigInt(p.loaded),
+      total: BigInt(p.total),
+      length_computable: p.lengthComputable ? 1 : 0,
+    });
+  };
+
   /** The `Task` of a network task of request `s`; none in a page call. */
   const task = (s: XhrState) => {
     if (!s.sync && !s.aborted) {
@@ -374,7 +417,8 @@ function patchXhr(ctx: SeamContext): void {
     return s === undefined || s.reqId === undefined || s.done ? undefined : s;
   };
 
-  const onReadyStateChange = function (this: XMLHttpRequest): void {
+  const onReadyStateChange = function (this: XMLHttpRequest, ev: Event): void {
+    if (!ev.isTrusted) return;
     const s = inFlight(this);
     if (s === undefined) return;
     const state = this.readyState;
@@ -402,21 +446,24 @@ function patchXhr(ctx: SeamContext): void {
    * `readystatechange`, when the page can already read the whole body. So
    * each is a `Task` of its own, with what `responseText` grew by since it
    * was last recorded, and the one at DONE is where the request completes.
+   * Its `XhrEvent` follows.
    */
-  const onProgress = function (this: XMLHttpRequest): void {
+  const onProgress = function (this: XMLHttpRequest, ev: Event): void {
+    if (!ev.isTrusted) return;
     const s = inFlight(this);
     if (s === undefined || s.sync || s.aborted) return;
     rec.guard(() => {
       if (this.readyState === ReadyState.done) {
         finish(this, s);
-        return;
+      } else {
+        task(s);
+        if (!s.head) head(this, s);
+        if (isText(this)) {
+          const grown = textDelta(this, s);
+          if (grown.length > 0) piece(s, grown);
+        }
       }
-      task(s);
-      if (!s.head) head(this, s);
-      if (isText(this)) {
-        const grown = textDelta(this, s);
-        if (grown.length > 0) piece(s, grown);
-      }
+      xhrEvent(s, ev, XHR_EVENT.target.request);
     });
   };
 
@@ -427,8 +474,10 @@ function patchXhr(ctx: SeamContext): void {
    * an abort's events inside `abort()`, page calls. A failure's `error` or
    * `timeout` reaches the upload object before the request (XHR standard,
    * "request error steps"), so the failure is written at the first of them.
+   * Each one's `XhrEvent` follows.
    */
   const onUploadEvent = function (this: XMLHttpRequestUpload, ev: Event): void {
+    if (!ev.isTrusted) return;
     const x = uploads.get(this);
     const s = x === undefined ? undefined : states.get(x);
     if (s === undefined || s.reqId === undefined || s.sync) return;
@@ -440,26 +489,50 @@ function patchXhr(ctx: SeamContext): void {
             ev.type === "timeout" ? Outcome.timeout : Outcome.networkError,
           );
         }
-        return;
+      } else if (!s.done && !s.aborted && !s.sending) {
+        task(s);
       }
-      if (s.done || s.aborted || s.sending) return;
-      task(s);
+      xhrEvent(s, ev, XHR_EVENT.target.upload);
     });
   };
 
+  /**
+   * `error` or `timeout` at the request: how a request whose DONE showed
+   * status 0 failed, unless its upload object already said so; then the
+   * event's `XhrEvent`.
+   */
   const onFailureEvent = function (this: XMLHttpRequest, ev: Event): void {
+    if (!ev.isTrusted) return;
     const s = states.get(this);
-    if (s === undefined || !s.failing) return;
-    rec.guard(() =>
-      failure(
-        s,
-        ev.type === "timeout" ? Outcome.timeout : Outcome.networkError,
-      ),
-    );
+    if (s === undefined || s.reqId === undefined) return;
+    rec.guard(() => {
+      if (s.failing) {
+        failure(
+          s,
+          ev.type === "timeout" ? Outcome.timeout : Outcome.networkError,
+        );
+      }
+      xhrEvent(s, ev, XHR_EVENT.target.request);
+    });
+  };
+
+  /**
+   * `loadstart`, `abort`, `load` and `loadend` at the request: no part of
+   * the response comes with them (`loadstart` runs inside `send()`; the
+   * rest in DONE's task, or inside `abort()` or a synchronous `send()`),
+   * only their `XhrEvent`.
+   */
+  const onRequestEvent = function (this: XMLHttpRequest, ev: Event): void {
+    if (!ev.isTrusted) return;
+    const s = states.get(this);
+    if (s === undefined || s.reqId === undefined) return;
+    rec.guard(() => xhrEvent(s, ev, XHR_EVENT.target.request));
   };
 
   // The constructor registers the shim's listeners first, so its records
-  // precede every listener the page adds, whenever it adds it.
+  // precede every listener the page adds, whenever it adds it. Listening at
+  // the request itself changes nothing the platform does (unlike the upload
+  // object, below).
   const PatchedXhr = function XMLHttpRequest(this: unknown): XMLHttpRequest {
     if (new.target === undefined) {
       // Calling the constructor without `new` throws; keep that.
@@ -469,11 +542,18 @@ function patchXhr(ctx: SeamContext): void {
     const x = Reflect.construct(OrigXhr, [], new.target) as XMLHttpRequest;
     rec.guard(() => {
       states.set(x, newState("GET", "", false));
-      orig.addEventListener.call(x, "readystatechange", onReadyStateChange);
-      orig.addEventListener.call(x, "progress", onProgress);
+      orig.addEventListener.call(
+        x,
+        "readystatechange",
+        onReadyStateChange as EventListener,
+      );
+      orig.addEventListener.call(x, "progress", onProgress as EventListener);
       uploads.set(x.upload, x);
       for (const t of ["error", "timeout"]) {
         orig.addEventListener.call(x, t, onFailureEvent as EventListener);
+      }
+      for (const t of REQUEST_EVENTS) {
+        orig.addEventListener.call(x, t, onRequestEvent as EventListener);
       }
     });
     return x;
