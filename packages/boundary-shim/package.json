@@ -10,7 +10,8 @@
     "build": "tsc && node scripts/bundle.mjs"
   },
   "dependencies": {
-    "@codetracer/boundary-format": "*"
+    "@codetracer/boundary-format": "*",
+    "@codetracer/instrumenter": "*"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

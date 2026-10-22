@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { instrument } from "@codetracer/instrumenter";
+import {
+  instrument,
+  recorderVersionDeclaration,
+} from "@codetracer/instrumenter";
 import type { ManifestSlice } from "@codetracer/instrumenter";
 
 /**
@@ -147,9 +150,11 @@ console.log(x);
     // scope there and referencing it throws on the very first
     // instrumented line.
     expect(code).toContain("__ct.enter(0, [])");
-    // Module-level ret at the end
+    // Module-level ret at the end of the code, followed only by the
+    // recorder-version declaration every instrumented file ends with.
     const lines = code.trim().split("\n");
-    const lastLine = lines[lines.length - 1].trim();
+    expect(lines[lines.length - 1]).toBe(recorderVersionDeclaration());
+    const lastLine = lines[lines.length - 2].trim();
     expect(lastLine).toMatch(/__ct\.ret\(0\)/);
   });
 });

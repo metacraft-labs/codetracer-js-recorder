@@ -14,6 +14,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { sortedFilesUnder } from "@codetracer/instrumenter";
+
+import { BOOTSTRAP_ELEMENT_SOURCE } from "./bundle-manifest.js";
+
 import {
   BOOTSTRAP_MARKER,
   CONFIG_GLOBAL,
@@ -80,7 +84,7 @@ export function bootstrapScript(
   return `<script ${BOOTSTRAP_MARKER}>${body}</script>`;
 }
 
-const EXISTING = new RegExp(`<script ${BOOTSTRAP_MARKER}>[\\s\\S]*?</script>`);
+const EXISTING = new RegExp(BOOTSTRAP_ELEMENT_SOURCE);
 
 /**
  * Insert the bootstrap as the first element of `<head>` (creating no
@@ -117,16 +121,9 @@ export function injectBoundaryShim(
 export function htmlFilesUnder(root: string): string[] {
   const stat = fs.statSync(root);
   if (!stat.isDirectory()) return [root];
-  const out: string[] = [];
-  const walk = (dir: string) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(p);
-      else if (entry.isFile() && /\.html?$/i.test(entry.name)) out.push(p);
-    }
-  };
-  walk(root);
-  return out.sort();
+  return sortedFilesUnder(root, (rel) => /\.html?$/i.test(rel)).map((rel) =>
+    path.join(root, rel),
+  );
 }
 
 /** Inject the bootstrap into each file, in place. Returns the files changed. */
@@ -147,3 +144,22 @@ export function injectBoundaryShimIntoFiles(
   }
   return changed;
 }
+
+export {
+  BUNDLE_MANIFEST_FILE,
+  BUNDLE_MANIFEST_VERSION,
+  BUNDLE_EXTENSIONS,
+  isBundleAsset,
+  stripBoundaryShim,
+  hashedBytes,
+  canonicalJson,
+  canonicalBundleManifestBytes,
+  buildHashOf,
+  buildBundleManifest,
+  writeBundleManifest,
+} from "./bundle-manifest.js";
+export type {
+  BundleManifest,
+  BundleManifestEntry,
+  BuiltBundleManifest,
+} from "./bundle-manifest.js";

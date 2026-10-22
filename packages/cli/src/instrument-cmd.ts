@@ -2,50 +2,56 @@
  * CLI `instrument` command implementation.
  *
  * Usage: codetracer-js-recorder instrument <src> --out <dir> [--source-maps]
+ *          [--relative-paths]
  *
  * Walks the source directory (or instruments a single file), instruments
  * all .js/.ts/.jsx/.tsx files (excluding node_modules), writes instrumented
  * output to the specified directory preserving directory structure, and
  * writes a merged codetracer.manifest.json.
+ *
+ * The output is deterministic: files are
+ * instrumented in the order of their sorted relative paths, so the id
+ * blocks baked into the code do not depend on the order the filesystem
+ * lists them in, and every file and the manifest declare the recorder
+ * version. With --relative-paths the manifest and the source maps name
+ * files by their path relative to <src>, so the same bundle instrumented
+ * in two places, or on two machines, is byte-identical; that is how the
+ * post-bundle replay build is made. An --out directory that already holds
+ * an instrumented build of another recorder version is refused rather than
+ * reused.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  checkInstrumentedBuild,
   instrument,
+  manifestDocument,
+  manifestFileContents,
   mergeManifestSlices,
+  MANIFEST_FILE_NAME,
   nextManifestIdBases,
+  RECORDER_VERSION,
+  recorderVersionDeclaration,
   shouldInstrument,
+  sortedFilesUnder,
 } from "@codetracer/instrumenter";
 import type { ManifestSlice, FilterOptions } from "@codetracer/instrumenter";
 
 /**
- * Recursively collect all instrumentable files under a directory.
+ * Collect all instrumentable files under a directory, as paths relative
+ * to it, sorted (`sortedFilesUnder`): the order files are instrumented
+ * in decides the id blocks baked into their code, so it must not be the
+ * order the filesystem happens to list them in.
  *
  * Uses glob-based include/exclude filtering via picomatch.
  * By default, includes all JS/TS files and excludes node_modules.
  */
-function collectFiles(dir: string, filterOpts?: FilterOptions): string[] {
-  const results: string[] = [];
-
-  function walk(current: string): void {
-    const entries = fs.readdirSync(current, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        walk(fullPath);
-      } else if (entry.isFile()) {
-        // Use relative path for glob matching
-        const relPath = path.relative(dir, fullPath);
-        if (shouldInstrument(relPath, filterOpts)) {
-          results.push(fullPath);
-        }
-      }
-    }
-  }
-
-  walk(dir);
-  return results;
+export function collectFiles(
+  dir: string,
+  filterOpts?: FilterOptions,
+): string[] {
+  return sortedFilesUnder(dir, (rel) => shouldInstrument(rel, filterOpts));
 }
 
 /**
@@ -55,6 +61,8 @@ function parseArgs(args: string[]): {
   src: string;
   outDir: string;
   sourceMaps: boolean;
+  /** Record paths relative to <src> instead of absolute (see the header). */
+  relativePaths: boolean;
   include: string[];
   exclude: string[];
   /**
@@ -71,6 +79,7 @@ function parseArgs(args: string[]): {
   let src: string | undefined;
   let outDir: string | undefined;
   let sourceMaps = false;
+  let relativePaths = false;
   let browser = false;
   let endpoint: string | undefined;
   const include: string[] = [];
@@ -82,6 +91,8 @@ function parseArgs(args: string[]): {
       outDir = args[++i];
     } else if (arg === "--source-maps") {
       sourceMaps = true;
+    } else if (arg === "--relative-paths") {
+      relativePaths = true;
     } else if (arg === "--include" && i + 1 < args.length) {
       include.push(args[++i]);
     } else if (arg === "--exclude" && i + 1 < args.length) {
@@ -92,7 +103,7 @@ function parseArgs(args: string[]): {
       endpoint = args[++i];
     } else if (arg === "--help" || arg === "-h") {
       console.log(
-        `Usage: codetracer-js-recorder instrument <src> --out <dir> [--source-maps] [--include <glob>] [--exclude <glob>] [--browser [--endpoint <url>]]`,
+        `Usage: codetracer-js-recorder instrument <src> --out <dir> [--source-maps] [--relative-paths] [--include <glob>] [--exclude <glob>] [--browser [--endpoint <url>]]`,
       );
       process.exit(0);
     } else if (!src && !arg.startsWith("-")) {
@@ -113,6 +124,7 @@ function parseArgs(args: string[]): {
     src: src!,
     outDir: outDir!,
     sourceMaps,
+    relativePaths,
     include,
     exclude,
     browser,
@@ -145,6 +157,7 @@ function buildBrowserRuntimeStub(endpoint: string, manifest: unknown): string {
   // queue-and-flush semantics.  We keep it ES5 / no-modules so it loads
   // from a plain `<script>` tag without `type="module"`.
   return `// CodeTracer browser runtime (M26 AOT bundle bootstrap).
+${recorderVersionDeclaration()}
 // Wire format: newline-delimited JSON over WebSocket.
 // Spec: codetracer-specs/GUI/Debugging-Features/Value-Origin-Tracking.md §14.4
 (function () {
@@ -267,8 +280,16 @@ function buildBrowserRuntimeStub(endpoint: string, manifest: unknown): string {
  * Entry point for the `instrument` command.
  */
 export function instrumentCommand(args: string[]): void {
-  const { src, outDir, sourceMaps, include, exclude, browser, endpoint } =
-    parseArgs(args);
+  const {
+    src,
+    outDir,
+    sourceMaps,
+    relativePaths,
+    include,
+    exclude,
+    browser,
+    endpoint,
+  } = parseArgs(args);
 
   const srcPath = path.resolve(src);
   if (!fs.existsSync(srcPath)) {
@@ -294,7 +315,9 @@ export function instrumentCommand(args: string[]): void {
 
   if (isDir) {
     baseDir = srcPath;
-    files = collectFiles(srcPath, filterOpts);
+    files = collectFiles(srcPath, filterOpts).map((rel) =>
+      path.join(srcPath, rel),
+    );
   } else {
     baseDir = path.dirname(srcPath);
     files = [srcPath];
@@ -305,8 +328,21 @@ export function instrumentCommand(args: string[]): void {
     process.exit(1);
   }
 
-  // Create output directory
+  // Create output directory, refusing one that holds an instrumented
+  // build of another recorder version: mixing its files with this
+  // version's would give a build no single runtime matches.
   const outPath = path.resolve(outDir);
+  const stale = checkInstrumentedBuild(outPath, RECORDER_VERSION);
+  if (stale.length > 0) {
+    const first = stale[0];
+    console.error(
+      `Error: refusing to reuse '${outPath}': it holds an instrumented build ` +
+        `whose ${first.file} declares recorder version ` +
+        `${first.declared ?? "(none)"}, not ${RECORDER_VERSION} ` +
+        `(${stale.length} file(s) differ). Remove it or choose another --out.`,
+    );
+    process.exit(1);
+  }
   fs.mkdirSync(outPath, { recursive: true });
 
   // Instrument each file.  Merge order IS instrumentation order: each
@@ -322,6 +358,11 @@ export function instrumentCommand(args: string[]): void {
     try {
       const result = instrument(code, {
         filename: path.resolve(file),
+        // Relative to <src>, `/`-separated, when the output must not
+        // depend on where the bundle sits.
+        ...(relativePaths
+          ? { recordedPath: relPath.split(path.sep).join("/") }
+          : {}),
         // See the note on `slices` above: ids are baked into the emitted
         // code, so they must be minted in the merged numbering.
         idBases: nextManifestIdBases(slices),
@@ -347,13 +388,10 @@ export function instrumentCommand(args: string[]): void {
 
   // Merge manifests and write
   const merged = mergeManifestSlices(slices);
-  const manifest = {
-    formatVersion: 1,
-    ...merged,
-  };
+  const manifest = manifestDocument(merged);
   fs.writeFileSync(
-    path.join(outPath, "codetracer.manifest.json"),
-    JSON.stringify(manifest, null, 2),
+    path.join(outPath, MANIFEST_FILE_NAME),
+    manifestFileContents(merged),
   );
 
   // M26: emit the browser-runtime bootstrap stub when --browser is set.
@@ -368,7 +406,5 @@ export function instrumentCommand(args: string[]): void {
   }
 
   console.log(`Instrumented ${instrumentedCount} file(s) -> ${outPath}`);
-  console.log(
-    `Manifest written to ${path.join(outPath, "codetracer.manifest.json")}`,
-  );
+  console.log(`Manifest written to ${path.join(outPath, MANIFEST_FILE_NAME)}`);
 }
