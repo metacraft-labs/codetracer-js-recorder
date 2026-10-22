@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>boundary reads</title>
+  </head>
+  <body>
+    <div id="app">
+      <button id="go">Go</button>
+      <form id="form">
+        <input name="q" type="text" />
+        <input name="agree" type="checkbox" />
+      </form>
+      <div id="box" style="width: 120px; height: 40px">box</div>
+      <ul id="out">
+        <li id="r-now"></li>
+        <li id="r-perf"></li>
+        <li id="r-rand"></li>
+        <li id="r-bytes"></li>
+        <li id="r-ls"></li>
+        <li id="r-ls-miss"></li>
+        <li id="r-rect"></li>
+        <li id="r-timeout"></li>
+        <li id="r-tick"></li>
+        <li id="r-raf"></li>
+        <li id="r-fetch"></li>
+        <li id="r-xhr"></li>
+        <li id="r-xhrctor"></li>
+      </ul>
+    </div>
+    <script src="reads.js"></script>
+  </body>
+</html>

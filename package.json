@@ -10,6 +10,7 @@
     "packages/runtime",
     "packages/runtime-browser",
     "packages/boundary-format",
+    "packages/boundary-shim",
     "packages/cli",
     "packages/express",
     "packages/vite-plugin",

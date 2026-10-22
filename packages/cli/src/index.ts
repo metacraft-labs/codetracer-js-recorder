@@ -6,6 +6,8 @@
  * Commands:
  *   instrument <src> --out <dir>   Instrument source files
  *   record <file> [-- args...]     Instrument and run, producing a trace
+ *   read-spans <trace>             Print a recording's web-request spans
+ *   boundary-shim <html|dir>...    Insert the boundary-recording shim
  */
 
 import * as fs from "node:fs";
@@ -13,6 +15,7 @@ import * as path from "node:path";
 import { instrumentCommand } from "./instrument-cmd.js";
 import { recordCommand } from "./record-cmd.js";
 import { readSpansCommand } from "./read-spans-cmd.js";
+import { boundaryShimCommand } from "./boundary-shim-cmd.js";
 
 const pkgJsonPath = path.join(__dirname, "..", "package.json");
 const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8")) as {
@@ -37,11 +40,13 @@ if (!command || command === "--help" || command === "-h") {
   codetracer-js-recorder instrument <src> --out <dir>
   codetracer-js-recorder record <file> [-- app-args...]
   codetracer-js-recorder read-spans <trace-dir|container.ct> [--all]
+  codetracer-js-recorder boundary-shim <html-file|dir>... [--build-hash <hex>]
 
 Commands:
   instrument    Instrument source files and write to output directory
   record        Instrument and run a program, producing a CTFS trace
   read-spans    Print a recording's web-request span stream as JSON
+  boundary-shim Insert the boundary-recording shim first in each page's <head>
 
 Instrument options:
   --out <dir>             Output directory for instrumented files (required)
@@ -61,6 +66,10 @@ Read-spans options:
                           included) instead of the settled, last-record-wins
                           view a panel displays
 
+Boundary-shim options:
+  --build-hash <hex>      The deployed bundle's build hash (64 lowercase hex
+                          digits), written to each session's Header
+
 Environment variables:
   CODETRACER_JS_RECORDER_OUT_DIR    Output directory (overridden by --out-dir)
   CODETRACER_JS_RECORDER_DISABLED   Set to "true" / "1" to disable recording
@@ -78,6 +87,8 @@ if (command === "instrument") {
   recordCommand(args.slice(1));
 } else if (command === "read-spans") {
   readSpansCommand(args.slice(1));
+} else if (command === "boundary-shim") {
+  boundaryShimCommand(args.slice(1));
 } else {
   console.error(`Unknown command '${command}'. Use --help for usage.`);
   process.exit(1);

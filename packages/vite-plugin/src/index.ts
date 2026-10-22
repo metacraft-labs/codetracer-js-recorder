@@ -35,6 +35,8 @@ import type {
   ManifestSlice,
   MergedManifest,
 } from "@codetracer/instrumenter-core";
+import { injectBoundaryShim } from "@codetracer/boundary-shim";
+import type { ShimConfig } from "@codetracer/boundary-shim";
 
 /**
  * Dev-server route serving the merged manifest as JSON.
@@ -289,3 +291,36 @@ export function codetracerVitePlugin(
 
 /** Default export for the `import codetracer from "@codetracer/vite-plugin"` shape. */
 export default codetracerVitePlugin;
+
+/**
+ * A Vite plugin that installs the generic boundary-recording shim
+ * (CodeTracer's JS-Boundary-Recording specification, §10) in record mode:
+ * its `transformIndexHtml` inserts the shim's bootstrap `<script>` as the
+ * first element of `<head>`, so the shim patches the page's globals before
+ * any application module runs.
+ *
+ * It does not instrument anything. Boundary recording runs the deployed,
+ * uninstrumented bundle (§8), and the two modes never run together in one
+ * page (§14), so this is a separate plugin rather than an option of
+ * {@link codetracerVitePlugin}.
+ */
+export interface CodetracerBoundaryShimVitePlugin {
+  name: string;
+  enforce: "post";
+  transformIndexHtml(html: string): string;
+}
+
+/** Build the boundary-shim plugin; `config` is written into every session's `Header`. */
+export function codetracerBoundaryShimPlugin(
+  config: ShimConfig = {},
+): CodetracerBoundaryShimVitePlugin {
+  return {
+    name: "codetracer:boundary-shim",
+    // After every other plugin's HTML transform, so nothing is inserted
+    // ahead of the shim by a later string transform.
+    enforce: "post",
+    transformIndexHtml(html: string): string {
+      return injectBoundaryShim(html, config);
+    },
+  };
+}

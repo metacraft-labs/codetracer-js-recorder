@@ -49,6 +49,14 @@ This is a monorepo managed with npm workspaces:
   `tests/boundary/vectors/` by `scripts/vendor-jsbound-vectors.sh` (re-run it
   after the Rust side regenerates them; `just verify-jsbound-vectors` checks
   the copy).
+* `packages/boundary-shim` — the generic boundary-recording shim (record mode):
+  patches a page's nondeterminism seams and writes the boundary log with
+  `packages/boundary-format`. Its browser half is bundled into
+  `dist/boundary-shim.iife.js` and inserted first in `<head>` by
+  `codetracer-js-recorder boundary-shim <html|dir>` or the vite plugin's
+  `codetracerBoundaryShimPlugin`. Its browser tests
+  (`tests/boundary/record-shim.test.ts`) run real headless Chromium, which the
+  dev shell provides (`PLAYWRIGHT_CORE_PATH`, `PLAYWRIGHT_BROWSERS_PATH`).
 * `crates/recorder_native` — Rust N-API addon (via napi-rs) for writing
   trace files in binary (CBOR+zstd) and JSON formats.
 * `tests/` — End-to-end integration tests.
@@ -71,6 +79,11 @@ touch:
    browser transport, which speaks a different (message-based) wire protocol to
    the recording daemon. New instrumenter arguments are accepted and ignored
    here unless that protocol is extended too.
+
+The two browser implementations (1 as `runtime-browser`, and 3) must make their
+own timers and sockets through the platform functions as they were before a
+boundary shim patched them (`resolveOriginals` in `runtime-browser`), or the
+recorder's flush timer is recorded as a task of the page.
 
 ## Manifest ids are minted in the MERGED numbering, never per file
 

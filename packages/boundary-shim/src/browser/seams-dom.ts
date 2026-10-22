@@ -1,0 +1,464 @@
+/**
+ * Storage, layout, navigation and input seams (JS-Boundary-Recording.md
+ * §5.2 `StorageRead`, `LayoutRead`, `Navigation`, `Input`, `DomEffect`;
+ * §10.1, §10.2).
+ */
+
+import { type SeamContext, replaceAccessor, replaceValue } from "./context.js";
+import { TaskKind } from "./recorder.js";
+import { targetOf } from "./targets.js";
+
+/** Patch every seam this module owns. */
+export function patchDomSeams(ctx: SeamContext): void {
+  patchStorage(ctx);
+  patchLayout(ctx);
+  patchHistory(ctx);
+}
+
+function patchStorage({ w, rec, orig }: SeamContext): void {
+  // The storage objects, fetched once: which one a getItem call is on is
+  // the record's `area`.
+  let local: Storage | undefined;
+  let session: Storage | undefined;
+  try {
+    local = w.localStorage;
+  } catch {
+    // Storage denied to this document: getItem cannot be called on it.
+  }
+  try {
+    session = w.sessionStorage;
+  } catch {
+    // As above.
+  }
+  const origGet = orig.storageGetItem;
+  replaceValue(
+    w.Storage.prototype,
+    "getItem",
+    function getItem(this: Storage, key: string): string | null {
+      const v = origGet.call(this, key);
+      const area = this === local ? 1 : this === session ? 2 : 0;
+      if (area !== 0) {
+        rec.guard(() =>
+          rec.emit("StorageRead", {
+            area,
+            key: String(key),
+            present: v === null ? 0 : 1,
+            value: v ?? "",
+          }),
+        );
+      }
+      return v;
+    },
+  );
+
+  const cookie = orig.cookie;
+  if (cookie !== undefined) {
+    const get = cookie.descriptor.get!;
+    const set = cookie.descriptor.set;
+    replaceAccessor(
+      cookie.owner,
+      "cookie",
+      function (this: unknown) {
+        const v = get.call(this) as string;
+        rec.guard(() =>
+          rec.emit("StorageRead", { area: 3, key: "", present: 1, value: v }),
+        );
+        return v;
+      },
+      set === undefined
+        ? undefined
+        : function (this: unknown, v: unknown) {
+            set.call(this, v);
+          },
+    );
+  }
+}
+
+function patchLayout({ w, rec, orig }: SeamContext): void {
+  const read = (target: unknown, prop: string, value: unknown) =>
+    rec.guard(() =>
+      rec.emit("LayoutRead", {
+        target: targetOf(target),
+        prop,
+        value: JSON.stringify(value === undefined ? null : value),
+      }),
+    );
+
+  const origRect = orig.getBoundingClientRect;
+  replaceValue(
+    w.Element.prototype,
+    "getBoundingClientRect",
+    function (this: Element): DOMRect {
+      const r = origRect.call(this);
+      read(this, "getBoundingClientRect", {
+        x: r.x,
+        y: r.y,
+        width: r.width,
+        height: r.height,
+        top: r.top,
+        right: r.right,
+        bottom: r.bottom,
+        left: r.left,
+      });
+      return r;
+    },
+  );
+
+  for (const [name, g] of orig.layoutGetters) {
+    const get = g.descriptor.get!;
+    const set = g.descriptor.set;
+    replaceAccessor(
+      g.owner,
+      name,
+      function (this: unknown) {
+        const v = get.call(this);
+        read(this, name, v);
+        return v;
+      },
+      set === undefined
+        ? undefined
+        : function (this: unknown, v: unknown) {
+            set.call(this, v);
+          },
+    );
+  }
+
+  // getComputedStyle returns a live declaration whose properties are read
+  // later; each read is logged when it happens, by a proxy that forwards
+  // everything else unchanged.
+  const origStyle = orig.getComputedStyle;
+  replaceValue(
+    w,
+    "getComputedStyle",
+    function getComputedStyle(
+      el: Element,
+      pseudo?: string | null,
+    ): CSSStyleDeclaration {
+      const style = origStyle.call(w, el, pseudo);
+      if (!rec.recording) return style;
+      const prefix = "getComputedStyle:" + (pseudo ? String(pseudo) + ":" : "");
+      return new Proxy(style, {
+        get(t, p) {
+          const v = Reflect.get(t, p, t) as unknown;
+          if (typeof p !== "string") return v;
+          if (p === "getPropertyValue") {
+            return function getPropertyValue(name: string): string {
+              const r = t.getPropertyValue(name);
+              read(el, prefix + String(name), r);
+              return r;
+            };
+          }
+          if (typeof v === "function") return v.bind(t);
+          read(el, prefix + p, v);
+          return v;
+        },
+        set(t, p, v) {
+          return Reflect.set(t, p, v, t);
+        },
+      });
+    },
+  );
+
+  const origMatch = orig.matchMedia;
+  if (origMatch !== undefined) {
+    replaceValue(
+      w,
+      "matchMedia",
+      function matchMedia(query: string): MediaQueryList {
+        const m = origMatch.call(w, query);
+        read(w, "matchMedia:" + String(query), { matches: m.matches });
+        return m;
+      },
+    );
+  }
+}
+
+function patchHistory({ w, rec, orig }: SeamContext): void {
+  const nav = (kind: number) =>
+    rec.guard(() => rec.emit("Navigation", { kind, url: w.location.href }));
+  const origPush = orig.pushState;
+  const origReplace = orig.replaceState;
+  replaceValue(
+    w.History.prototype,
+    "pushState",
+    function pushState(
+      this: History,
+      ...args: Parameters<History["pushState"]>
+    ): void {
+      origPush.apply(this, args);
+      nav(1);
+    },
+  );
+  replaceValue(
+    w.History.prototype,
+    "replaceState",
+    function replaceState(
+      this: History,
+      ...args: Parameters<History["replaceState"]>
+    ): void {
+      origReplace.apply(this, args);
+      nav(2);
+    },
+  );
+}
+
+/**
+ * Listen, on the window in the capture phase, for the events the browser
+ * dispatches to the page: input (§10.2) and navigation. Registered at
+ * install, before any page code, so these listeners run before every
+ * listener the page adds and the records they write precede everything
+ * the page's handlers read.
+ */
+export function listenForPageEvents(
+  ctx: SeamContext,
+  onPageHide: () => void,
+): void {
+  const { w, rec, orig } = ctx;
+  const add = (type: string, l: (ev: Event) => void) =>
+    orig.addEventListener.call(w, type, l, { capture: true, passive: true });
+
+  for (const type of INPUT_EVENT_TYPES) {
+    add(type, (ev) => {
+      // Events the page dispatches itself are its own deterministic
+      // behaviour and happen again on replay; only the browser's are input.
+      if (!ev.isTrusted || !rec.recording) return;
+      rec.guard(() => recordInput(ctx, ev));
+    });
+  }
+
+  for (const [type, kind] of [
+    ["popstate", 3],
+    ["hashchange", 4],
+  ] as const) {
+    add(type, (ev) => {
+      if (!ev.isTrusted || !rec.recording) return;
+      rec.guard(() => {
+        // Dispatched by the browser, not registered by the page: the task
+        // id is minted here, and no TaskReg precedes it.
+        rec.task(rec.nextTaskId(), TaskKind.navigation);
+        rec.emit("Navigation", { kind, url: w.location.href });
+      });
+    });
+  }
+
+  add("pagehide", (ev) => {
+    if (!ev.isTrusted || !rec.recording) return;
+    rec.guard(() => rec.emit("Navigation", { kind: 5, url: w.location.href }));
+    onPageHide();
+  });
+}
+
+/** The DOM events §10.2 captures, by group. */
+export const INPUT_EVENT_TYPES: readonly string[] = [
+  // pointer
+  "pointerdown",
+  "pointerup",
+  "pointermove",
+  "pointercancel",
+  "pointerover",
+  "pointerout",
+  // mouse
+  "mousedown",
+  "mouseup",
+  "mousemove",
+  "mouseover",
+  "mouseout",
+  "click",
+  "auxclick",
+  "dblclick",
+  "contextmenu",
+  // keyboard
+  "keydown",
+  "keypress",
+  "keyup",
+  // input and change
+  "beforeinput",
+  "input",
+  "change",
+  // submit
+  "submit",
+  "reset",
+  // focus
+  "focus",
+  "blur",
+  "focusin",
+  "focusout",
+  // wheel
+  "wheel",
+  // touch
+  "touchstart",
+  "touchmove",
+  "touchend",
+  "touchcancel",
+  // scroll
+  "scroll",
+  // composition
+  "compositionstart",
+  "compositionupdate",
+  "compositionend",
+];
+
+/** The event properties `Input.props` carries, when the event has them. */
+const INPUT_PROPS: readonly string[] = [
+  "key",
+  "code",
+  "location",
+  "repeat",
+  "isComposing",
+  "ctrlKey",
+  "shiftKey",
+  "altKey",
+  "metaKey",
+  "clientX",
+  "clientY",
+  "screenX",
+  "screenY",
+  "button",
+  "buttons",
+  "detail",
+  "pointerId",
+  "pointerType",
+  "pressure",
+  "width",
+  "height",
+  "isPrimary",
+  "deltaX",
+  "deltaY",
+  "deltaZ",
+  "deltaMode",
+  "data",
+  "inputType",
+];
+
+function eventProps(ev: Event): string {
+  const props: Record<string, unknown> = {};
+  const e = ev as unknown as Record<string, unknown>;
+  for (const k of INPUT_PROPS) {
+    if (!(k in ev)) continue;
+    const v = e[k];
+    if (
+      v === null ||
+      typeof v === "string" ||
+      typeof v === "number" ||
+      typeof v === "boolean"
+    ) {
+      props[k] = v;
+    }
+  }
+  for (const k of ["touches", "changedTouches"]) {
+    const list = e[k] as TouchList | undefined;
+    if (list === undefined || list === null) continue;
+    const touches = [];
+    for (let i = 0; i < list.length; i++) {
+      const t = list[i];
+      touches.push({
+        identifier: t.identifier,
+        clientX: t.clientX,
+        clientY: t.clientY,
+        screenX: t.screenX,
+        screenY: t.screenY,
+      });
+    }
+    props[k] = touches;
+  }
+  return JSON.stringify(props);
+}
+
+/** `DomEffect.effect` (§5.2). */
+const Effect = {
+  value: 1,
+  checked: 2,
+  selection: 3,
+  scroll: 4,
+  focus: 5,
+  files: 6,
+};
+
+/**
+ * An input event: a checkpoint if one is due, the `DomEffect`s of default
+ * actions that already changed state, then `Task{kind: input}` and `Input`
+ * (§9.5's order, at level 0).
+ */
+function recordInput(ctx: SeamContext, ev: Event): void {
+  const { rec } = ctx;
+  if (rec.checkpointDue()) rec.checkpoint();
+  const target = ev.target;
+  const name = targetOf(target);
+  for (const [effect, value] of domEffects(ctx, ev)) {
+    rec.emit("DomEffect", {
+      target: name,
+      effect,
+      value: JSON.stringify(value),
+    });
+  }
+  const taskId = rec.nextTaskId();
+  // Dispatched by the browser, not registered by the page: the task id is
+  // minted here, and no TaskReg precedes it.
+  rec.emit("Task", { task_id: taskId, kind: TaskKind.input });
+  rec.emit("Input", {
+    task_id: taskId,
+    type: ev.type,
+    target: name,
+    props: eventProps(ev),
+    label: "",
+  });
+}
+
+/** The state a default action has already changed when `ev` reaches the window. */
+function domEffects(ctx: SeamContext, ev: Event): [number, unknown][] {
+  const t = ev.target as Element | Document | null;
+  const out: [number, unknown][] = [];
+  if (t === null) return out;
+  const tag = (t as Element).localName;
+  const isControl = tag === "input" || tag === "textarea" || tag === "select";
+  if (ev.type === "scroll") {
+    const el =
+      t instanceof ctx.w.Document
+        ? (t.scrollingElement ?? t.documentElement)
+        : t;
+    if (el !== null) {
+      const top = ctx.orig.layoutGetters.get("scrollTop")!.descriptor.get!;
+      const left = ctx.orig.layoutGetters.get("scrollLeft")!.descriptor.get!;
+      out.push([Effect.scroll, { top: top.call(el), left: left.call(el) }]);
+    }
+  } else if (ev.type === "focus" || ev.type === "focusin") {
+    out.push([Effect.focus, true]);
+  } else if (isControl) {
+    const c = t as HTMLInputElement;
+    const checkable =
+      tag === "input" && (c.type === "checkbox" || c.type === "radio");
+    if (
+      checkable &&
+      (ev.type === "click" || ev.type === "input" || ev.type === "change")
+    ) {
+      out.push([Effect.checked, c.checked]);
+    } else if (ev.type === "input" || ev.type === "change") {
+      if (tag === "input" && c.type === "file") {
+        const files = [];
+        for (const f of Array.from(c.files ?? [])) {
+          files.push({ name: f.name, size: f.size, type: f.type });
+        }
+        out.push([Effect.files, files]);
+      } else {
+        out.push([Effect.value, c.value]);
+        const sel = selection(c);
+        if (sel !== null) out.push([Effect.selection, sel]);
+      }
+    }
+  }
+  return out;
+}
+
+/** The selection range of a text control, or `null` for one without. */
+function selection(c: HTMLInputElement): unknown {
+  try {
+    if (c.selectionStart === null || c.selectionEnd === null) return null;
+    return {
+      start: c.selectionStart,
+      end: c.selectionEnd,
+      direction: c.selectionDirection,
+    };
+  } catch {
+    return null; // input types without a selection throw on access
+  }
+}

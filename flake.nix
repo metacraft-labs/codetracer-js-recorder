@@ -186,6 +186,16 @@
               ++ pkgs.lib.optionals isLinux [ glibc.dev ]
               ++ preCommit.enabledPackages;
 
+            # Headless Chromium for the browser tests
+            # (tests/boundary/record-shim.test.ts). The playwright-core module
+            # and the browsers it drives come from the one nixpkgs package, so
+            # their revisions always agree, and nothing is downloaded: the
+            # tests load playwright-core from PLAYWRIGHT_CORE_PATH and fail,
+            # naming this shell, when it is unset.
+            PLAYWRIGHT_CORE_PATH = "${pkgs.playwright-driver}";
+            PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+            PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
+
             # `cargo <subcommand>` looks for `cargo-<subcommand>` in
             # `$CARGO_HOME/bin` BEFORE it searches PATH. On any machine with
             # rustup -- including the self-hosted macOS runner -- that
@@ -255,7 +265,7 @@
             # npm dependencies (pre-fetched for offline install)
             npmDeps = pkgs.fetchNpmDeps {
               src = ./.;
-              hash = "sha256-GckBE2l1g7pRZtlNENmkxpk2zyk3IqFDpUROnjOO5M0=";
+              hash = "sha256-/lWVuxc4/tO282mVVg882AIi+cifnBRaUYFB3V0jrTQ=";
             };
 
             # Rust dependencies for the native addon (vendored from Cargo.lock)

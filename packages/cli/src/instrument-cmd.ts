@@ -157,9 +157,20 @@ function buildBrowserRuntimeStub(endpoint: string, manifest: unknown): string {
   var stopped = false;
   var threshold = 256;
   var socket = null;
+  // The daemon socket is the recorder's, not the page's: open it with the
+  // WebSocket constructor as it was before a boundary shim patched it (the
+  // replay runner's or the shim's published originals), so it is not
+  // recorded as a socket the page opened. Mirrors resolveOriginals() in
+  // packages/runtime-browser/src/index.ts.
+  var published =
+    (globalThis.__ctReplay && globalThis.__ctReplay.originals) ||
+    (globalThis.__ctBoundaryShim && globalThis.__ctBoundaryShim.originals);
+  var WebSocketCtor =
+    (published && published.WebSocket) ||
+    (typeof WebSocket !== "undefined" ? WebSocket : undefined);
   try {
-    if (typeof WebSocket !== "undefined") {
-      socket = new WebSocket(endpoint);
+    if (WebSocketCtor) {
+      socket = new WebSocketCtor(endpoint);
       socket.onopen = function () { flush(); };
     }
   } catch (e) {

@@ -1,0 +1,20 @@
+{
+  "name": "@codetracer/boundary-shim",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "description": "Generic boundary-recording shim for pages with no cooperating framework (protocol level 0): patches the page's nondeterminism seams and writes the jsbound boundary log",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc && node scripts/bundle.mjs"
+  },
+  "dependencies": {
+    "@codetracer/boundary-format": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.27.0",
+    "typescript": "^5.7.0"
+  }
+}
