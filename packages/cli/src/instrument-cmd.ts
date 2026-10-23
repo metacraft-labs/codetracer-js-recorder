@@ -220,7 +220,19 @@ ${recorderVersionDeclaration()}
     if (t === "function") return { value: v.name || "anonymous", typeKind: "FunctionKind" };
     return { value: "[object]", typeKind: "Raw" };
   }
-  enqueue({ kind: "SessionStart", program: (typeof document !== "undefined" && document.title) || "browser", args: [] });
+  // The session's program and args: the page's title and no args, unless
+  // the page (or a replay runner, which records a materialised trace's
+  // provenance in its args) set __codetracer_program / __codetracer_args.
+  var program = typeof globalThis.__codetracer_program === "string"
+    ? globalThis.__codetracer_program
+    : (typeof document !== "undefined" && document.title) || "browser";
+  var sessionArgs = [];
+  if (Array.isArray(globalThis.__codetracer_args)) {
+    for (var a = 0; a < globalThis.__codetracer_args.length; a++) {
+      sessionArgs.push(String(globalThis.__codetracer_args[a]));
+    }
+  }
+  enqueue({ kind: "SessionStart", program: program, args: sessionArgs });
   if (manifest) enqueue({ kind: "Manifest", manifest: manifest });
   var safeFlush = function () { try { flush(); } catch (e) {} };
   if (typeof globalThis.addEventListener === "function") {
@@ -276,25 +288,58 @@ ${recorderVersionDeclaration()}
 `;
 }
 
+/** What {@link instrumentTree} instruments, and how. */
+export interface InstrumentTreeOptions {
+  /** A file, or a directory whose instrumentable files are instrumented. */
+  src: string;
+  /** The output directory. */
+  outDir: string;
+  sourceMaps?: boolean;
+  relativePaths?: boolean;
+  include?: string[];
+  exclude?: string[];
+  /** Also write the browser runtime stub `codetracer-runtime.js`. */
+  browser?: boolean;
+  /** The WebSocket endpoint baked into the stub. */
+  endpoint?: string;
+}
+
+/** What {@link instrumentTree} wrote. */
+export interface InstrumentTreeResult {
+  outDir: string;
+  /** Files instrumented. */
+  instrumented: number;
+  /** Files that failed to instrument (left out of the output), with why. */
+  failures: { file: string; error: string }[];
+  /** The merged manifest document (`codetracer.manifest.json`). */
+  manifest: unknown;
+  /** The browser runtime stub's path, with `browser`. */
+  stubPath?: string;
+}
+
 /**
- * Entry point for the `instrument` command.
+ * Instrument `options.src` into `options.outDir`: the `instrument`
+ * command as a library call, for the boundary replay runner, which
+ * instruments a deployed bundle itself (CodeTracer's JS-Boundary-Recording
+ * specification §8, §12). Throws instead of exiting.
  */
-export function instrumentCommand(args: string[]): void {
+export function instrumentTree(
+  options: InstrumentTreeOptions,
+): InstrumentTreeResult {
   const {
     src,
     outDir,
-    sourceMaps,
-    relativePaths,
-    include,
-    exclude,
-    browser,
+    sourceMaps = false,
+    relativePaths = false,
+    include = [],
+    exclude = [],
+    browser = false,
     endpoint,
-  } = parseArgs(args);
+  } = options;
 
   const srcPath = path.resolve(src);
   if (!fs.existsSync(srcPath)) {
-    console.error(`Error: source path '${srcPath}' does not exist.`);
-    process.exit(1);
+    throw new Error(`source path '${srcPath}' does not exist.`);
   }
 
   const stat = fs.statSync(srcPath);
@@ -324,8 +369,7 @@ export function instrumentCommand(args: string[]): void {
   }
 
   if (files.length === 0) {
-    console.error("No instrumentable files found.");
-    process.exit(1);
+    throw new Error("No instrumentable files found.");
   }
 
   // Create output directory, refusing one that holds an instrumented
@@ -335,13 +379,12 @@ export function instrumentCommand(args: string[]): void {
   const stale = checkInstrumentedBuild(outPath, RECORDER_VERSION);
   if (stale.length > 0) {
     const first = stale[0];
-    console.error(
-      `Error: refusing to reuse '${outPath}': it holds an instrumented build ` +
+    throw new Error(
+      `refusing to reuse '${outPath}': it holds an instrumented build ` +
         `whose ${first.file} declares recorder version ` +
         `${first.declared ?? "(none)"}, not ${RECORDER_VERSION} ` +
         `(${stale.length} file(s) differ). Remove it or choose another --out.`,
     );
-    process.exit(1);
   }
   fs.mkdirSync(outPath, { recursive: true });
 
@@ -349,6 +392,7 @@ export function instrumentCommand(args: string[]): void {
   // file is instrumented with `nextManifestIdBases(slices)` so the ids
   // baked into its `__ct.*` calls are already the merged manifest's ids.
   const slices: ManifestSlice[] = [];
+  const failures: { file: string; error: string }[] = [];
   let instrumentedCount = 0;
 
   for (const file of files) {
@@ -382,7 +426,7 @@ export function instrumentCommand(args: string[]): void {
       slices.push(result.manifestSlice);
       instrumentedCount++;
     } catch (err) {
-      console.error(`Warning: failed to instrument '${file}': ${err}`);
+      failures.push({ file, error: String(err) });
     }
   }
 
@@ -398,13 +442,44 @@ export function instrumentCommand(args: string[]): void {
   // The output directory becomes a drop-in static-hostable bundle: the
   // `<script src="./codetracer-runtime.js">` tag loads the runtime + the
   // manifest, then the instrumented modules can be loaded normally.
+  let stubPath: string | undefined;
   if (browser) {
     const stubEndpoint = endpoint ?? "ws://localhost:9230/ct-stream";
-    const stubPath = path.join(outPath, "codetracer-runtime.js");
+    stubPath = path.join(outPath, "codetracer-runtime.js");
     fs.writeFileSync(stubPath, buildBrowserRuntimeStub(stubEndpoint, manifest));
-    console.log(`Browser runtime stub written to ${stubPath}`);
   }
 
-  console.log(`Instrumented ${instrumentedCount} file(s) -> ${outPath}`);
-  console.log(`Manifest written to ${path.join(outPath, MANIFEST_FILE_NAME)}`);
+  return {
+    outDir: outPath,
+    instrumented: instrumentedCount,
+    failures,
+    manifest,
+    ...(stubPath === undefined ? {} : { stubPath }),
+  };
+}
+
+/**
+ * Entry point for the `instrument` command.
+ */
+export function instrumentCommand(args: string[]): void {
+  const options = parseArgs(args);
+  let result: InstrumentTreeResult;
+  try {
+    result = instrumentTree(options);
+  } catch (err) {
+    console.error(`Error: ${(err as Error).message}`);
+    process.exit(1);
+  }
+  for (const f of result.failures) {
+    console.error(`Warning: failed to instrument '${f.file}': ${f.error}`);
+  }
+  if (result.stubPath !== undefined) {
+    console.log(`Browser runtime stub written to ${result.stubPath}`);
+  }
+  console.log(
+    `Instrumented ${result.instrumented} file(s) -> ${result.outDir}`,
+  );
+  console.log(
+    `Manifest written to ${path.join(result.outDir, MANIFEST_FILE_NAME)}`,
+  );
 }

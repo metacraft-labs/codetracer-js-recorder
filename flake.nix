@@ -265,7 +265,7 @@
             # npm dependencies (pre-fetched for offline install)
             npmDeps = pkgs.fetchNpmDeps {
               src = ./.;
-              hash = "sha256-IzYXxPQ+WhItpg3mO7d+B+aXrWoKAZhpPNweThipBBM=";
+              hash = "sha256-xUJ/TfjIpHmjlSnMP8HrZmMVYRRxbPMxeGMXDGuUhBA=";
             };
 
             # Rust dependencies for the native addon (vendored from Cargo.lock)
@@ -378,6 +378,13 @@
               makeWrapper ${pkgs.nodejs_22}/bin/node \
                 $out/bin/ct-boundary-conformance \
                 --add-flags "$out/lib/codetracer-js-recorder/packages/boundary-conformance/dist/cli.js"
+
+              # The boundary replay runner. Like the conformance harness it
+              # drives the caller's headless Chromium; writing a trace also
+              # needs codetracer's session-manager (--session-manager).
+              makeWrapper ${pkgs.nodejs_22}/bin/node \
+                $out/bin/ct-boundary-replay \
+                --add-flags "$out/lib/codetracer-js-recorder/packages/boundary-replay/dist/cli.js"
 
               runHook postInstall
             '';

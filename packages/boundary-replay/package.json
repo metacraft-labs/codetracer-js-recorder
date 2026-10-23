@@ -1,0 +1,26 @@
+{
+  "name": "@codetracer/boundary-replay",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "description": "Replay runner of CodeTracer's browser boundary recording: replays a recorded boundary log in headless Chromium against the instrumented copy of the byte-identical bundle, reports every divergence as a typed error, and writes a materialised JavaScript trace",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "ct-boundary-replay": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc && node scripts/bundle.mjs"
+  },
+  "dependencies": {
+    "@codetracer/boundary-format": "*",
+    "@codetracer/boundary-shim": "*",
+    "@codetracer/cli": "*",
+    "@codetracer/instrumenter": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.27.0",
+    "typescript": "^5.7.0"
+  }
+}

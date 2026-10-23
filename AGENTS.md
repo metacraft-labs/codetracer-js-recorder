@@ -88,6 +88,34 @@ This is a monorepo managed with npm workspaces:
   the batch envelope codec (`batch.ts`, `encodeBatch`/`parseBatch`) the suite
   checks uploads with, held to the Rust parser by the shared batch vectors
   (`tests/boundary/vectors/batches.json`).
+* `packages/boundary-replay` — the replay runner of boundary recording:
+  `ct-boundary-replay --log <recording.ct|jsbound.log> --build <dir> [--out
+  <trace.ct>]` replays a recorded log in headless Chromium against the build
+  it ran (`replaySession` in `src/runner.ts`), reports the first divergence
+  as a typed error and, with `--out`, instruments the build itself and writes
+  the materialised trace through codetracer's `session-manager record-web`,
+  passing it the trace's recording id (`materialisedRecordingId`, derived from
+  the session, so a trace written again is byte-identical). Its in-page half
+  (`src/browser/runtime.ts`, bundled to `dist/replay-runtime.iife.js`) is `__ctReplay`, the one cursor every replayed
+  read is matched against, and the scheduler that owns the page's tasks. The
+  document's own loading (the parser's progress, external scripts,
+  `DOMContentLoaded`, `load`) is held back to the points the log has
+  (`Loading` and `DocTask` records, written by
+  `packages/boundary-shim/src/browser/document-progress.ts` on both sides)
+  by the runner's gates (`src/gates.ts`), pinned by `tests/boundary/gates.test.ts`
+  and the slow-loading session of `tests/boundary/replay.test.ts`. The
+  generic shim's replay mode is `packages/boundary-shim/src/browser/replay/`
+  (its own bundle, `dist/boundary-shim-replay.iife.js`, so recorded pages never
+  carry it), a client of `__ctReplay`; so is the reference framework's replay
+  mode. A `.ct` is read through the native addon's `readCtfsMember` (the
+  canonical CTFS reader), never a second container decoder. The conformance
+  suite's replay leg (`ct-boundary-conformance replay`,
+  `packages/boundary-conformance/src/replay-leg.ts`) runs it. Pinned by
+  `tests/boundary/replay.test.ts`, which needs two codetracer sibling binaries
+  besides `ct-print`: `session-manager` (`cargo build --bin session-manager` in
+  `codetracer/src/backend-manager`) and `ct-jsbound` (`cargo build --bin
+  ct-jsbound` in `codetracer/libs/jsbound`), or `CODETRACER_SESSION_MANAGER` and
+  `CT_JSBOUND`; without them it fails, naming the build command.
 * `crates/recorder_native` — Rust N-API addon (via napi-rs) for writing
   trace files in binary (CBOR+zstd) and JSON formats.
 * `tests/` — End-to-end integration tests.

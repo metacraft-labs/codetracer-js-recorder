@@ -491,6 +491,9 @@ export function ctPrintFull(ctFile: string): CtFullBundle {
   const stdout = execFileSync(bin, ["--full", "--strip-paths", ctFile], {
     encoding: "utf-8",
     timeout: 30000,
+    // A trace of a few thousand steps prints more than execFileSync's
+    // default 1 MiB of stdout, which it refuses with ENOBUFS.
+    maxBuffer: 512 * 1024 * 1024,
   });
   return JSON.parse(stdout) as CtFullBundle;
 }
