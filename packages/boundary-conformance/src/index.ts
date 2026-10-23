@@ -7,6 +7,9 @@
  * - the record leg's harness ({@link runRecordLeg}, and the
  *   `ct-boundary-conformance record` command), which runs a build of them in
  *   headless Chromium and checks what it recorded;
+ * - the replay leg ({@link runReplayLeg}, `ct-boundary-conformance replay`),
+ *   which replays those recordings with CodeTracer's replay runner and checks
+ *   that they replay, inject and diverge as the protocol requires;
  * - the suite's own builds: the generic build for the generic shim (level 0)
  *   and the test-only reference micro-framework's (level 1), which prove that
  *   the harness discriminates.
@@ -20,6 +23,7 @@ export * from "./cadence.js";
 export * from "./envelope.js";
 export * from "./checks.js";
 export * from "./harness.js";
+export * from "./replay-leg.js";
 export * from "./builds.js";
 export { startHarnessServer, type HarnessServer } from "./server.js";
 export { loadPlaywright, type Browser } from "./playwright.js";

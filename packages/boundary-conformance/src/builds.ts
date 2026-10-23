@@ -43,11 +43,15 @@ const SRC = path.resolve(__dirname, "..", "src");
 /**
  * The generic page's pre-hydration queue: clicks before the page hydrates
  * are kept in `__fxQueue` for the app to replay (`generic/apps/prehydration.ts`).
+ * It does not look at `isTrusted`: at level 0 the replay injects input as
+ * synthetic events (§10.3), and a page that told them apart would behave
+ * differently on replay, which is the level-0 limitation the fixture is not
+ * about.
  */
 const GENERIC_QUEUE_SCRIPT =
   "<script>window.__fxQueue=[];window.__fxHydrated=false;" +
   "document.addEventListener('click',function(e){" +
-  "if(!window.__fxHydrated&&e.isTrusted)window.__fxQueue.push(e)},true);</script>";
+  "if(!window.__fxHydrated)window.__fxQueue.push(e)},true);</script>";
 
 async function bundle(
   entry: string,

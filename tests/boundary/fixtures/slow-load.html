@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>slow load</title>
+<!--
+  A page that is slow to load, for tests/boundary/replay.test.ts
+  (replay_reproduces_tasks_that_ran_while_the_document_loaded). Served with
+  ?chunks=<ms> the fixture server sends it in pieces cut at each ct:chunk
+  comment; every resource below is answered late (?delay=<ms>). The pointer
+  moves over it the whole time, so the browser dispatches input while the
+  parser waits for the network, between two of its pieces, while a style
+  sheet holds an inline script, between parsing and DOMContentLoaded, and
+  before load. slow-load.js records what each listener saw.
+-->
+<link rel="stylesheet" href="slow-load.css?delay=250">
+<script src="slow-load.js"></script>
+<script>note("inline-head");</script>
+<script src="slow-load-late.js?delay=450"></script>
+<script async src="slow-load-async.js?delay=300"></script>
+<script defer src="slow-load-defer.js?delay=900"></script>
+</head>
+<body>
+<h1 id="title">A page that loads slowly</h1>
+<!--ct:chunk-->
+<section id="first">
+  <p>one</p><p>two</p><p>three</p><p>four</p><p>five</p>
+  <p>six</p><p>seven</p><p>eight</p><p>nine</p><p>ten</p>
+</section>
+<script>note("inline-body-1");</script>
+<!--ct:chunk-->
+<ul id="list">
+  <li>a</li><li>b</li><li>c</li><li>d</li><li>e</li><li>f</li><li>g</li>
+  <li>h</li><li>i</li><li>j</li><li>k</li><li>l</li><li>m</li><li>n</li>
+</ul>
+<img src="slow-load-pixel.svg?delay=1300" alt="" width="200" height="40">
+<!--ct:chunk-->
+<section id="last"><p>the end</p></section>
+<script>note("inline-body-2");</script>
+</body>
+</html>

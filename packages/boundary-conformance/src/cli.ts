@@ -8,6 +8,9 @@
  * ct-boundary-conformance record --build <dir> --level <0|1>
  *                                [--fixture <name>]... [--out <report.json>]
  *                                [--concurrency <n>] [--timeout-ms <n>]
+ * ct-boundary-conformance replay --build <dir> --level <0|1>
+ *                                [--fixture <name>]... [--out <report.json>]
+ *                                [--concurrency <n>] [--timeout-ms <n>]
  * ct-boundary-conformance fixtures
  * ```
  *
@@ -15,6 +18,9 @@
  * stdout), with a one-line verdict per failed check on stderr. Exit status:
  * 0 when every check passed or is not applicable, 1 when one failed, 2 for
  * a usage error or a harness that could not run (no browser, no build).
+ * `replay` records every fixture the same way, replays each recording with
+ * CodeTracer's replay runner, and reports the replay leg's checks
+ * (`replay-leg.ts`), with the same output and exit status.
  * `fixtures` prints every fixture's contract as JSON, for a framework
  * writing its own build of them.
  */
@@ -23,9 +29,11 @@ import * as fs from "node:fs";
 
 import { FIXTURES } from "./fixtures.js";
 import { runRecordLeg, SUITE_VERSION } from "./harness.js";
+import { runReplayLeg } from "./replay-leg.js";
 import type { ProtocolLevel } from "./protocol.js";
 
 const USAGE = `usage: ct-boundary-conformance record --build <dir> --level <0|1> [--fixture <name>]... [--out <report.json>] [--concurrency <n>] [--timeout-ms <n>]
+       ct-boundary-conformance replay --build <dir> --level <0|1> [--fixture <name>]... [--out <report.json>] [--concurrency <n>] [--timeout-ms <n>]
        ct-boundary-conformance fixtures
        ct-boundary-conformance --version`;
 
@@ -120,14 +128,17 @@ export async function main(argv: string[]): Promise<number> {
       process.stdout.write(`${JSON.stringify(FIXTURES, null, 2)}\n`);
       return 0;
     }
-    if (command !== "record")
+    if (command !== "record" && command !== "replay")
       throw new UsageError(
         command === undefined
           ? "no command"
           : `unknown command ${JSON.stringify(command)}`,
       );
     const args = parseRecordArgs(rest);
-    const { report } = await runRecordLeg(args);
+    const { report } =
+      command === "record"
+        ? await runRecordLeg(args)
+        : await runReplayLeg(args);
     const json = `${JSON.stringify(report, null, 2)}\n`;
     if (args.out !== undefined) fs.writeFileSync(args.out, json);
     else process.stdout.write(json);
@@ -141,7 +152,7 @@ export async function main(argv: string[]): Promise<number> {
     }
     const { pass, fail, notApplicable } = report.summary;
     process.stderr.write(
-      `record leg, level ${report.level}: ${pass} passed, ${fail} failed, ${notApplicable} not applicable at level 0\n`,
+      `${report.leg} leg, level ${report.level}: ${pass} passed, ${fail} failed, ${notApplicable} not applicable at level 0\n`,
     );
     return report.passed ? 0 : 1;
   } catch (e) {

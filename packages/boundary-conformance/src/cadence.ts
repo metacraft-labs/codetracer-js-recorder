@@ -13,6 +13,13 @@
  * anything was written since the last one. Recorded time comes from the
  * session's own `Clock` records: wall clock from `src` 1 and 3, monotonic
  * from `src` 2 and 4.
+ *
+ * No checkpoint is due, or may be taken, while the document parses (§7.3 as
+ * amended for §6, "The document's own tasks"): its extent between two of
+ * the parser's tokens is not in the log. A log that says the document
+ * parsed (a `Loading` record with phase 1) is parsing from its start until
+ * a `Loading` with a later phase, or the `DocTask` of `DOMContentLoaded` or
+ * `load`; the `Loading` that starts a macrotask precedes its checkpoint.
  */
 
 import type { BoundaryRecord } from "@codetracer/boundary-format";
@@ -64,18 +71,20 @@ export function checkpointCadence(
   const dueByCount: number[] = [];
   const dueByTime: number[] = [];
   const violations: string[] = [];
+  let parsing = records.some((r) => r.record === "Loading" && r.phase === 1);
   const due = (): boolean =>
-    since >= CHECKPOINT_RECORDS ||
-    (wallAt !== undefined &&
-      wallNow !== undefined &&
-      wallNow - wallAt >= CHECKPOINT_RECORDED_MS) ||
-    (monoAt !== undefined &&
-      monoNow !== undefined &&
-      monoNow - monoAt >= CHECKPOINT_RECORDED_MS);
+    !parsing &&
+    (since >= CHECKPOINT_RECORDS ||
+      (wallAt !== undefined &&
+        wallNow !== undefined &&
+        wallNow - wallAt >= CHECKPOINT_RECORDED_MS) ||
+      (monoAt !== undefined &&
+        monoNow !== undefined &&
+        monoNow - monoAt >= CHECKPOINT_RECORDED_MS));
 
   records.forEach((r, i) => {
     if (r.record === "End") {
-      if (since > 0) {
+      if (since > 0 && !parsing) {
         violations.push(
           `no final checkpoint before End: ${since} record(s) were written since the last one`,
         );
@@ -83,6 +92,8 @@ export function checkpointCadence(
       return;
     }
     if (!("seq" in r)) return;
+    if (r.record === "Loading") parsing = r.phase === 1;
+    if (r.record === "DocTask" && r.kind !== 1) parsing = false;
     if (r.record === "Checkpoint") {
       checkpoints += 1;
       if (r.ordinal !== ordinal) {
@@ -97,7 +108,11 @@ export function checkpointCadence(
       if (!atStart && !atEnd) {
         violations.push(`checkpoint at seq ${r.seq} is not at a task boundary`);
       }
-      if (since === 0) {
+      if (parsing) {
+        violations.push(
+          `checkpoint at seq ${r.seq} was taken while the document parsed`,
+        );
+      } else if (since === 0) {
         violations.push(
           `checkpoint at seq ${r.seq} follows another with nothing between`,
         );

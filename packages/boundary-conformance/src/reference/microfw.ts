@@ -20,6 +20,13 @@
  * `Recorder`, reused rather than written again; everything that makes this
  * level 1 rather than level 0 is here.
  *
+ * When the replay runner's `__ctReplay` is present (§9.7) the framework
+ * records nothing and installs replay backends instead: every seam reads
+ * from `__ctReplay.next`, timers and requests run when the runner's
+ * scheduler releases their tasks, and `__ctBoundaryProtocol.replay`
+ * offers `inject` (which calls the registered handler directly, §9.5) and
+ * `checkpoint` (its state hash, §9.6).
+ *
  * Seeded defects (`ReferenceDefects`, compiled in by the build) turn it into
  * the broken frameworks the suite must reject.
  */
@@ -31,6 +38,7 @@ import {
   seqOf,
 } from "@codetracer/boundary-format";
 import { domV1Hash } from "@codetracer/boundary-shim/dist/browser/dom-v1.js";
+import { recordDocumentProgress } from "@codetracer/boundary-shim/dist/browser/document-progress.js";
 import { readEnvironment } from "@codetracer/boundary-shim/dist/browser/install.js";
 import { captureOriginals } from "@codetracer/boundary-shim/dist/browser/originals.js";
 import {
@@ -38,6 +46,11 @@ import {
   type RecorderOptions,
   numberToBits,
 } from "@codetracer/boundary-shim/dist/browser/recorder.js";
+import {
+  type CtReplay,
+  type ReplayHooks,
+  replayOf,
+} from "@codetracer/boundary-shim/dist/browser/replay-api.js";
 import { sha256Hex } from "@codetracer/boundary-shim/dist/browser/sha256.js";
 
 import {
@@ -57,6 +70,11 @@ export interface ReferenceDefects {
   noCheckpoints?: boolean;
   /** Leave this capability out of the declaration. */
   omitCapability?: string;
+  /**
+   * On replay, inject input by dispatching a synthetic DOM event at the
+   * target instead of calling the registered handler (§9.5 forbids it).
+   */
+  injectByDispatch?: boolean;
 }
 
 /** Set by the build (esbuild `define`). */
@@ -116,6 +134,8 @@ const w = window as Window & typeof globalThis;
 const doc = document;
 const orig = captureOriginals(w);
 const utf8 = new TextEncoder();
+/** The replay runner, when this page is being replayed (§9.7). */
+const replay: CtReplay | undefined = replayOf(w);
 
 // ── State and checkpoints ───────────────────────────────────────────────
 
@@ -154,19 +174,25 @@ orig.getRandomValues.call(w.crypto, sessionBytes);
 const sessionId = Array.from(sessionBytes, (b) =>
   b.toString(16).padStart(2, "0"),
 ).join("");
-rec.start(
-  {
-    vocab: 1,
-    protocol_level: 1,
-    recorder_id: RECORDER_ID,
-    framework: FRAMEWORK,
-    build_hash: config.buildHash ?? "",
-    session_id: sessionId,
-    prev_session: "",
-    capabilities: JSON.stringify(capabilities),
-  },
-  readEnvironment(w, orig),
-);
+if (replay === undefined)
+  rec.start(
+    {
+      vocab: 1,
+      protocol_level: 1,
+      recorder_id: RECORDER_ID,
+      framework: FRAMEWORK,
+      build_hash: config.buildHash ?? "",
+      session_id: sessionId,
+      prev_session: "",
+      capabilities: JSON.stringify(capabilities),
+    },
+    readEnvironment(w, orig),
+  );
+// The document's own loading (§6, "The document's own tasks"): a
+// cooperating framework records it as the generic shim does, with the same
+// implementation, so its tasks recorded while the page loads replay where
+// they ran.
+if (replay === undefined) recordDocumentProgress(w, rec, orig.addEventListener);
 
 // ── Targets (§9.3) ──────────────────────────────────────────────────────
 
@@ -265,7 +291,7 @@ function recordInvocation(
   hydrationTask?: bigint,
 ): void {
   const target = targetOf(reg.el);
-  if (hydrationTask === undefined && rec.checkpointDue()) rec.checkpoint();
+  if (hydrationTask === undefined) rec.macrotask();
   for (const [effect, value] of effectsOf(reg.el, ev)) {
     rec.emit("DomEffect", { target, effect, value: JSON.stringify(value) });
   }
@@ -295,6 +321,12 @@ function on(el: Element, type: string, handler: (ev: Event) => void): void {
     return;
   }
   orig.addEventListener.call(el, type, ((ev: Event) => {
+    if (replay !== undefined) {
+      // Replayed input arrives through `inject`; only what the page
+      // dispatches itself reaches the handler through the DOM.
+      if (!ev.isTrusted) handler(ev);
+      return;
+    }
     // A page-dispatched event is the page's own deterministic behaviour.
     if (ev.isTrusted) recordInvocation(reg, ev);
     handler(ev);
@@ -307,7 +339,7 @@ const deferred =
   doc.documentElement.getAttribute("data-ref-hydration") === "deferred";
 let hydrated = !deferred;
 const queued: Event[] = [];
-if (deferred) {
+if (deferred && replay === undefined) {
   orig.addEventListener.call(
     doc,
     "click",
@@ -319,6 +351,10 @@ if (deferred) {
 }
 
 function hydrate(register: () => void): void {
+  if (replay !== undefined) {
+    replayHydrate(replay, register);
+    return;
+  }
   // Hydration is a macrotask of its own, and the framework mints its id:
   // `Task{kind: 11}` with no `TaskReg` (§6).
   orig.setTimeout.call(
@@ -515,6 +551,10 @@ const api: ReferenceApi = {
     rec.emit("Navigation", { kind: 1, url: w.location.href });
   },
   onPopState(fn) {
+    if (replay !== undefined) {
+      replayOnPopState(replay, fn);
+      return;
+    }
     orig.addEventListener.call(w, "popstate", ((ev: Event) => {
       if (ev.isTrusted) {
         // Dispatched by the browser: no TaskReg, the id is minted here (§6).
@@ -578,28 +618,251 @@ async function upload(): Promise<void> {
   }
 }
 
-const declaration: ProtocolDeclaration = {
-  protocol: PROTOCOL_VERSION,
-  framework: FRAMEWORK,
-  capabilities,
-  record: {
-    stop() {
-      stopped ??= (async () => {
-        rec.end(2);
-        await upload();
-      })();
-      return stopped;
-    },
-    resolveTarget,
-  },
-};
+const declaration: ProtocolDeclaration & { replay?: ReplayHooks } =
+  replay === undefined
+    ? {
+        protocol: PROTOCOL_VERSION,
+        framework: FRAMEWORK,
+        capabilities,
+        record: {
+          stop() {
+            stopped ??= (async () => {
+              rec.end(2);
+              await upload();
+            })();
+            return stopped;
+          },
+          resolveTarget,
+        },
+      }
+    : {
+        protocol: PROTOCOL_VERSION,
+        framework: FRAMEWORK,
+        capabilities,
+        replay: replayHooks(replay),
+      };
 Object.defineProperty(w, PROTOCOL_GLOBAL, {
   value: declaration,
   configurable: false,
   writable: false,
 });
 Object.defineProperty(w, "__ctRef", {
-  value: api,
+  value: replay === undefined ? api : replayApi(replay),
   configurable: false,
   writable: false,
 });
+
+// ── Replay (§9.5, §9.7) ─────────────────────────────────────────────────
+//
+// The same seams, answering from the runner's cursor. Task and request ids
+// are minted at the points the record side minted them, so they are the
+// log's ids and the cursor checks them.
+
+let replayTaskIds = 1n;
+let replayReqIds = 1n;
+
+/** The task id the browser's dispatch was recorded under must be the next. */
+function claimTask(r: CtReplay, logged: bigint): void {
+  if (logged !== replayTaskIds) {
+    r.fail(
+      "TaskOrderMismatch",
+      `task ${logged} was minted when it ran, but the framework's next task id is ${replayTaskIds}`,
+    );
+  }
+  replayTaskIds++;
+}
+
+function replayClock(r: CtReplay, src: number): number {
+  const bits = r.next("Clock", { src }).bits;
+  const v = new DataView(new ArrayBuffer(8));
+  v.setBigUint64(0, bits, true);
+  return v.getFloat64(0, true);
+}
+
+/** The `DomEffect`s of default actions, applied before a handler runs. */
+function applyEffects(
+  effects: { target: string; effect: number; value: string }[],
+): string | undefined {
+  for (const e of effects) {
+    const t = resolveTarget(e.target) as HTMLInputElement | null;
+    if (t === null) return `DomEffect target ${e.target} does not resolve`;
+    const v = JSON.parse(e.value) as unknown;
+    if (e.effect === 1) t.value = String(v);
+    else if (e.effect === 2) t.checked = v === true;
+    else return `DomEffect ${e.effect} is not one this framework records`;
+  }
+  return undefined;
+}
+
+/** An event with the recorded properties, as a handler of `type` reads it. */
+function eventFor(
+  type: string,
+  props: Record<string, unknown>,
+  target: Element,
+): Event {
+  const init = { ...props, bubbles: true, cancelable: true };
+  const ev =
+    type === "click"
+      ? new w.MouseEvent(type, init as MouseEventInit)
+      : type === "input"
+        ? new w.InputEvent(type, init as InputEventInit)
+        : new w.Event(type, init);
+  Object.defineProperty(ev, "target", { value: target });
+  Object.defineProperty(ev, "currentTarget", { value: target });
+  return ev;
+}
+
+/** Call the registered handler for `input` (§9.5); `"ok"` or why not. */
+function invoke(
+  input: { type: string; target: string; props: string },
+  effects: { target: string; effect: number; value: string }[],
+): string {
+  const problem = applyEffects(effects);
+  if (problem !== undefined) return problem;
+  const el = resolveTarget(input.target);
+  if (!(el instanceof w.Element))
+    return `target ${input.target} does not resolve`;
+  const reg = registrations.find((r) => r.el === el && r.type === input.type);
+  if (reg === undefined) {
+    return `no ${input.type} handler is registered on ${input.target}`;
+  }
+  const ev = eventFor(
+    input.type,
+    JSON.parse(input.props) as Record<string, unknown>,
+    el,
+  );
+  if (defects.injectByDispatch) {
+    el.dispatchEvent(ev);
+    return "ok";
+  }
+  reg.handler(ev);
+  return "ok";
+}
+
+function replayHooks(r: CtReplay): ReplayHooks {
+  return {
+    inject(input, effects) {
+      claimTask(r, input.task_id);
+      return invoke(input, effects);
+    },
+    checkpoint: () => ({ scheme: SCHEME, state_hash: stateHash() }),
+  };
+}
+
+function replayHydrate(r: CtReplay, register: () => void): void {
+  r.onUnregisteredTask(11, (task) => {
+    claimTask(r, task.task_id);
+    hydrated = true;
+    register();
+    // The inputs that waited for hydration ran inside the hydration task
+    // (§9.5): their effects and Inputs follow its Task in the log.
+    let effects: { target: string; effect: number; value: string }[] = [];
+    for (;;) {
+      const v = r.peek().record;
+      if (v?.record === "DomEffect") {
+        effects.push(r.next("DomEffect"));
+      } else if (v?.record === "Input" && v.task_id === task.task_id) {
+        const input = r.next("Input");
+        const result = invoke(input, effects);
+        if (result !== "ok") r.fail("InjectionFailed", result);
+        effects = [];
+      } else {
+        break;
+      }
+    }
+  });
+}
+
+function replayOnPopState(r: CtReplay, fn: () => void): void {
+  r.onUnregisteredTask(12, (task) => {
+    claimTask(r, task.task_id);
+    const nav = r.next("Navigation", { kind: 3 });
+    orig.replaceState.call(w.history, null, "", nav.url);
+    fn();
+  });
+  orig.addEventListener.call(w, "popstate", ((ev: Event) => {
+    if (!ev.isTrusted) fn();
+  }) as EventListener);
+}
+
+function replayApi(r: CtReplay): ReferenceApi {
+  return {
+    state: api.state,
+    create: api.create,
+    on,
+    hydrate,
+    onPopState: api.onPopState,
+    now: () => replayClock(r, 1),
+    perfNow: () => replayClock(r, 2),
+    random() {
+      const b = r.next("Random", { src: 1 }).bytes;
+      if (b.length !== 8)
+        r.fail("ArgumentMismatch", `a Random of ${b.length} bytes`);
+      return new DataView(b.buffer, b.byteOffset, 8).getFloat64(0, true);
+    },
+    storageGet(key) {
+      const s = r.next("StorageRead", { area: 1, key });
+      return s.present === 1 ? s.value : null;
+    },
+    rect(el) {
+      return JSON.parse(
+        r.next("LayoutRead", {
+          target: targetOf(el),
+          prop: "getBoundingClientRect",
+        }).value,
+      ) as { height: number; width: number };
+    },
+    fetchText(method, url, body) {
+      const reqId = replayReqIds++;
+      r.next("NetRequest", {
+        req_id: reqId,
+        api: 1,
+        method,
+        url: new URL(url, w.location.href).href,
+        body_digest: body === undefined ? "" : sha256Hex(body),
+      });
+      const taskId = replayTaskIds++;
+      r.registerTask(taskId, 4, 0);
+      return new orig.Promise<string>((resolve, reject) => {
+        r.onTask(taskId, () => {
+          r.offTask(taskId);
+          const res = r.next("NetResponse", { req_id: reqId });
+          if (res.outcome !== 1 || res.body.kind !== "inline") {
+            reject(new TypeError("Failed to fetch"));
+            return;
+          }
+          resolve(new TextDecoder().decode(res.body.bytes));
+        });
+      });
+    },
+    setTimeout(fn, ms) {
+      const id = replayTaskIds++;
+      r.registerTask(id, 1, ms);
+      r.onTask(id, () => {
+        r.offTask(id);
+        fn();
+      });
+    },
+    setInterval(fn, ms) {
+      const id = replayTaskIds++;
+      r.registerTask(id, 2, ms);
+      r.onTask(id, fn);
+      return Number(id);
+    },
+    clearInterval(handle) {
+      r.offTask(BigInt(handle));
+    },
+    raf(fn) {
+      const id = replayTaskIds++;
+      r.registerTask(id, 3, 0);
+      r.onTask(id, () => {
+        r.offTask(id);
+        fn(replayClock(r, 4));
+      });
+    },
+    pushState(url) {
+      orig.pushState.call(w.history, null, "", url);
+      r.next("Navigation", { kind: 1, url: w.location.href });
+    },
+  };
+}

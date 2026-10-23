@@ -119,3 +119,18 @@ export const LEVEL_1_ONLY: ReadonlySet<RecordCheckName> = new Set([
   "targets",
   "envelope",
 ]);
+
+/** The checks of the replay leg, in report order (§9.9). */
+export const REPLAY_CHECKS = ["replay", "inject", "divergence"] as const;
+
+/** A replay-leg check's name. */
+export type ReplayCheckName = (typeof REPLAY_CHECKS)[number];
+
+/**
+ * The replay-leg checks that apply only at level 1: `inject` is the
+ * framework calling its registered handler (§9.5); at level 0 the generic
+ * shim injects synthetic events (§10.3), which `replay` covers.
+ */
+export const REPLAY_LEVEL_1_ONLY: ReadonlySet<ReplayCheckName> = new Set([
+  "inject",
+]);
