@@ -395,7 +395,7 @@ export function decodeRecord(payload: Uint8Array, offset = 0): BoundaryRecord {
     throw new BoundaryFormatError(
       "UnknownTag",
       offset,
-      `frame tag 0x${tag.toString(16).padStart(2, "0")} is not a jsbound record (vocab ${VOCAB} defines 0x40-0x53 and 0x5f)`,
+      `frame tag 0x${tag.toString(16).padStart(2, "0")} is not a record of jsbound vocab ${VOCAB} (§5.2)`,
     );
   }
   const record: Record<string, unknown> = { record: def.name };

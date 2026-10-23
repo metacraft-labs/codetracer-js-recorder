@@ -284,6 +284,25 @@ export const RECORD_SCHEMA = [
     ],
   },
   {
+    tag: 0x57,
+    name: "Loading",
+    fields: [
+      ["seq", "u64"],
+      ["phase", "u8"],
+      ["elements", "u32"],
+      ["scripts", "u32"],
+    ],
+  },
+  {
+    tag: 0x58,
+    name: "DocTask",
+    fields: [
+      ["seq", "u64"],
+      ["kind", "u8"],
+      ["src", "str"],
+    ],
+  },
+  {
     tag: 0x5f,
     name: "End",
     fields: [
@@ -329,6 +348,12 @@ export const ENUM_VALUE_SETS: Readonly<
   // 1 the request, 2 its upload object; the seven `ProgressEvent` types an
   // XMLHttpRequest dispatches (XHR_EVENT); a boolean.
   XhrEvent: { target: [1, 2], event: [1, 7], length_computable: [0, 1] },
+  // 1 parsing, 2 parsed and DOMContentLoaded not yet dispatched, 3 after
+  // DOMContentLoaded and before load (LOADING_PHASE).
+  Loading: { phase: [1, 3] },
+  // 1 a script runs, 2 DOMContentLoaded, 3 load, 4 a script ran that wrote no
+  // record while it ran (DOC_TASK).
+  DocTask: { kind: [1, 4] },
 };
 
 /**
@@ -346,6 +371,32 @@ export const XHR_EVENT = {
     timeout: 6,
     loadend: 7,
   },
+} as const;
+
+/**
+ * `Loading.phase` values (spec §5.2, §6 "The document's own tasks"): where
+ * the document was in its own loading when the records that follow ran.
+ */
+export const LOADING_PHASE = {
+  parsing: 1,
+  parsed: 2,
+  contentLoaded: 3,
+} as const;
+
+/**
+ * `DocTask.kind` values (spec §5.2, §6 "The document's own tasks"): a task
+ * of the document's own loading that runs page code.
+ */
+export const DOC_TASK = {
+  /** A script runs: written before its first record, which follow. */
+  script: 1,
+  domContentLoaded: 2,
+  load: 3,
+  /**
+   * A script ran that wrote no record while it ran (a module, or one whose
+   * first boundary read was in a microtask): written when it settled.
+   */
+  scriptSettled: 4,
 } as const;
 
 type Schema = (typeof RECORD_SCHEMA)[number];
