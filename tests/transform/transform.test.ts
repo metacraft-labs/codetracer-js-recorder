@@ -443,6 +443,117 @@ const add = (a, b) => { return a + b; };
     expect(instrumentedResult).toEqual([10, 7]);
   });
 
+  /**
+   * A `return` whose argument is a comma expression returns its LAST
+   * operand. The instrumenter moves the argument into a call,
+   * `__ct.ret(fnId, <argument>)`, where an unparenthesised comma would
+   * split it into two call arguments and return the first operand
+   * instead. Bundlers emit exactly this shape in their module wrappers:
+   * esbuild's `__commonJS` (`return mod || cb(...), mod.exports`) and
+   * `__esm`, so before the fix every `require` of an instrumented esbuild
+   * bundle returned `undefined`.
+   */
+  it("a returned comma expression yields its last operand", () => {
+    const original = `
+var __commonJS = (cb, mod) => function __require() {
+  return mod || (0, cb[Object.getOwnPropertyNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+};
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[Object.getOwnPropertyNames(fn)[0]])(fn = 0)), res;
+};
+var requireA = __commonJS({ "a.js"(exports) { exports.x = 41; } });
+var initB = __esm({ "b.js"() { return "b"; } });
+function seq(n) {
+  if (n) return n++, n * 2;
+  return 0, -1;
+}
+const arrow = (a) => (a += 1, a * 3);
+`;
+    const call =
+      "\nreturn [requireA().x, requireA() === requireA(), initB(), initB(), seq(4), seq(0), arrow(1)];";
+    const originalResult = new Function(original + call)();
+    expect(originalResult).toEqual([41, true, "b", "b", 10, -1, 6]);
+
+    const { code } = inst(original);
+    const instrumentedResult = new Function(
+      `
+      const __ct = {
+        step: function(_siteId) {},
+        enter: function(_fnId, _args) {},
+        ret: function(_fnId, value) { return value; },
+        write: function(_siteId) {},
+      };
+      ${code}${call}`,
+    )();
+    expect(instrumentedResult).toEqual(originalResult);
+  });
+
+  /**
+   * The instrumenter moves a returned expression (and an arrow's concise
+   * body) into `__ct.ret(fnId, <expression>)`, an argument position. Every
+   * expression that can stand there must keep its meaning: the lowest
+   * precedences (`yield`, assignment, conditional, arrow), `in` (which a
+   * `for` head would forbid), `await`, `new` without arguments, an
+   * optional chain, and an object literal body, which needs its
+   * parentheses in a concise body but not as an argument.
+   */
+  it("returned expressions of every precedence keep their meaning", () => {
+    const original = `
+function* gen() { const got = yield 1; return yield got, 7; }
+function inOp(o) { return "a" in o; }
+function cond(n) { return n ? n > 1 ? "big" : "one" : "zero"; }
+function assign(o) { var x; return x = o.v, x += 1; }
+function arrowRet() { return (a) => a + 1; }
+function newNoArgs() { return new Date instanceof Date; }
+function chain(o) { return o?.a?.b ?? "none"; }
+const obj = () => ({ k: [1, 2] });
+const seqBody = (a) => (a.n++, a.n);
+async function aw(p) { return await p, 3; }
+function forIn(o) { var r = []; for (var k = ("a" in o) ? 1 : 0; k < 3; k++) r.push(k); return r; }
+`;
+    const call = `
+const g = gen(); g.next(); const y1 = g.next(5).value; const y2 = g.next(6);
+return Promise.resolve(aw(Promise.resolve(1))).then((a) => [
+  y1, y2.value, y2.done, inOp({ a: 1 }), inOp({}), cond(0), cond(1), cond(2),
+  assign({ v: 4 }), arrowRet()(1), newNoArgs(), chain({ a: { b: 0 } }),
+  chain(undefined), obj().k[1], seqBody({ n: 1 }), a, forIn({ a: 1 }),
+]);`;
+    return (async () => {
+      const originalResult = await new Function(original + call)();
+      expect(originalResult).toEqual([
+        5,
+        7,
+        true,
+        true,
+        false,
+        "zero",
+        "one",
+        "big",
+        5,
+        2,
+        true,
+        0,
+        "none",
+        2,
+        2,
+        3,
+        [1, 2],
+      ]);
+      const { code } = inst(original);
+      const instrumentedResult = await new Function(
+        `
+      const __ct = {
+        step: function(_siteId) {},
+        enter: function(_fnId, _args) {},
+        ret: function(_fnId, value) { return value; },
+        write: function(_siteId) {},
+      };
+      ${code}${call}`,
+      )();
+      expect(instrumentedResult).toEqual(originalResult);
+    })();
+  });
+
   it("instrumented code handles complex control flow", () => {
     const original = `
 function classify(n) {

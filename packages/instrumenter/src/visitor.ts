@@ -73,14 +73,40 @@ function mkMemberExpr(obj: string, prop: string): Expression {
   } as unknown as Expression;
 }
 
+/**
+ * Build a call. An argument that is a comma (sequence) expression is
+ * parenthesised: SWC's code generator prints the AST it is given and does
+ * not add the parentheses an argument list needs, so
+ * `__ct.ret(fnId, a, b)` would be printed for the program's `return a, b`
+ * and the call would receive two arguments instead of one, returning `a`
+ * where the program returned `b`. A sequence expression is the only
+ * expression of lower precedence than an argument (an
+ * `AssignmentExpression` in the grammar,
+ * https://tc39.es/ecma262/#prod-ArgumentList), so it is the only one that
+ * needs this. Every bundler's module wrapper returns one (esbuild's
+ * `__commonJS` and `__esm`: `return mod || cb(...), mod.exports`).
+ */
 function mkCallExpr(callee: Expression, args: Expression[]): Expression {
   return {
     type: "CallExpression",
     span: DUMMY_SPAN,
     ctxt: 0,
     callee,
-    arguments: args.map((expression) => ({ spread: null, expression })),
+    arguments: args.map((expression) => ({
+      spread: null,
+      expression: asArgument(expression),
+    })),
     typeArguments: null,
+  } as unknown as Expression;
+}
+
+/** `e`, parenthesised when it cannot stand as a call argument as it is. */
+function asArgument(e: Expression): Expression {
+  if ((e as { type: string }).type !== "SequenceExpression") return e;
+  return {
+    type: "ParenthesisExpression",
+    span: DUMMY_SPAN,
+    expression: e,
   } as unknown as Expression;
 }
 
