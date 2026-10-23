@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import {
+  BatchFormatError,
   BoundaryFormatError,
   DECODE_ERROR_CODES,
   ENUM_VALUE_SETS,
@@ -26,8 +27,10 @@ import {
   type BoundaryRecord,
   type Json,
   decodeLog,
+  encodeBatch,
   encodeFrame,
   encodeLog,
+  parseBatch,
   recordFromJson,
   recordToJson,
 } from "../../packages/boundary-format/src/index.js";
@@ -56,6 +59,21 @@ function loadVectors(): Vector[] {
     data: new Uint8Array(readFileSync(join(VECTORS, entry.bytes))),
     want: JSON.parse(readFileSync(join(VECTORS, entry.expected), "utf8")),
   }));
+}
+
+/** JSON with every object's keys sorted, for comparing values. */
+function canonicalJson(v: unknown): string {
+  const sort = (x: unknown): unknown =>
+    Array.isArray(x)
+      ? x.map(sort)
+      : x !== null && typeof x === "object"
+        ? Object.fromEntries(
+            Object.keys(x)
+              .sort()
+              .map((k) => [k, sort((x as Record<string, unknown>)[k])]),
+          )
+        : x;
+  return JSON.stringify(sort(v));
 }
 
 /** What decoding `v` gives, as the expectation files spell it. */
@@ -205,6 +223,84 @@ describe("@codetracer/boundary-format", () => {
       if (log.termination === "TruncatedUnterminated") unterminated++;
     }
     expect(unterminated).toBe(full.records.length);
+  });
+
+  it("jsbound_ts_batch_codec_agrees_with_rust_vectors", () => {
+    // The batch vectors (`batches.json`): uploaded batch bodies the Rust
+    // `parse_batch` is held to, with expectations written from what each
+    // was built from. Valid ones must parse to the same envelope and
+    // records and, when canonical, `encodeBatch` must give the bytes back;
+    // refusals must be refused with the same error name.
+    const manifest = JSON.parse(
+      readFileSync(join(VECTORS, "batches.json"), "utf8"),
+    ) as { vectors: ManifestEntry[] };
+    const failures: string[] = [];
+    const errorsSeen = new Set<string>();
+    let valid = 0;
+    let nonCanonical = 0;
+    for (const v of manifest.vectors) {
+      const bytes = new Uint8Array(readFileSync(join(VECTORS, v.bytes)));
+      const want = JSON.parse(
+        readFileSync(join(VECTORS, v.expected), "utf8"),
+      ) as {
+        envelope?: Json;
+        records?: Json[];
+        canonical?: boolean;
+        error?: string;
+      };
+      let got;
+      try {
+        got = parseBatch(bytes);
+      } catch (e) {
+        if (!(e instanceof BatchFormatError)) throw e;
+        if (v.class !== "refusal")
+          failures.push(`${v.name}: refused: ${e.message}`);
+        else if (e.code !== want.error)
+          failures.push(
+            `${v.name}: refused with ${e.code}, expected ${want.error}`,
+          );
+        else errorsSeen.add(e.code);
+        continue;
+      }
+      if (v.class === "refusal") {
+        failures.push(`${v.name}: parses, expected ${want.error}`);
+        continue;
+      }
+      valid += 1;
+      const envelope = canonicalJson(got.envelope);
+      if (envelope !== canonicalJson(want.envelope)) {
+        failures.push(
+          `${v.name}: envelope ${envelope}, expected ${canonicalJson(want.envelope)}`,
+        );
+      }
+      const records = canonicalJson(got.records.map(recordToJson));
+      if (records !== canonicalJson(want.records)) {
+        failures.push(`${v.name}: records ${records}`);
+      }
+      const same =
+        Buffer.compare(
+          Buffer.from(encodeBatch(got.envelope, got.frames)),
+          Buffer.from(bytes),
+        ) === 0;
+      if (same !== want.canonical) {
+        failures.push(
+          `${v.name}: encodeBatch ${same ? "gives" : "does not give"} the bytes back, canonical is ${want.canonical}`,
+        );
+      }
+      if (!want.canonical) nonCanonical += 1;
+    }
+    expect(failures).toEqual([]);
+    // Vacuity guard: the set is the batch vector set, not a stub of it.
+    expect(valid).toBeGreaterThanOrEqual(4);
+    expect(nonCanonical).toBeGreaterThanOrEqual(1);
+    expect([...errorsSeen].sort()).toEqual([
+      "BadEnvelope",
+      "BadMagic",
+      "EnvelopeTooLarge",
+      "Frame",
+      "Truncated",
+      "UnsupportedVersion",
+    ]);
   });
 
   it("the encoder refuses values that do not fit their wire type", () => {

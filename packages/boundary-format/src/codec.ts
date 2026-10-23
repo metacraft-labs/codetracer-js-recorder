@@ -436,6 +436,13 @@ export class StreamRules {
   private nextSeq = 1n;
   private isEnded = false;
 
+  /**
+   * @param options.inlineBodies `"log"` (the default) refuses an inline body
+   *   over 1024 bytes, as `jsbound.log` must; `"batch"` accepts one, as an
+   *   uploaded batch may carry it (spec §5.2: the assembler moves it).
+   */
+  constructor(private readonly options: DecodeOptions = {}) {}
+
   /** Whether `End` has been accepted. */
   get ended(): boolean {
     return this.isEnded;
@@ -505,8 +512,9 @@ export class StreamRules {
       this.nextSeq = this.after(seq, offset);
     }
     if (
-      (record.record === "NetResponse" && isLargeInline(record.body)) ||
-      (record.record === "WsMessage" && isLargeInline(record.data))
+      this.options.inlineBodies !== "batch" &&
+      ((record.record === "NetResponse" && isLargeInline(record.body)) ||
+        (record.record === "WsMessage" && isLargeInline(record.data)))
     ) {
       fail(
         "InlineBlobTooLarge",
@@ -532,12 +540,63 @@ function isLargeInline(blob: BlobRef): boolean {
   return blob.kind === "inline" && blob.bytes.length > MAX_INLINE_BLOB;
 }
 
+/** Options of {@link decodeLog} and {@link StreamRules}. */
+export interface DecodeOptions {
+  /**
+   * `"log"` (the default): an inline body over 1024 bytes is refused, as in
+   * `jsbound.log`. `"batch"`: it is accepted, for the frames of uploaded
+   * batches, which inline bodies of any length (spec §5.2).
+   */
+  inlineBodies?: "log" | "batch";
+}
+
+/** One whole frame: its offset in the input and its payload (`tag body`). */
+export interface Frame {
+  offset: number;
+  payload: Uint8Array;
+}
+
+/**
+ * The frame at `pos`, or `undefined` when fewer bytes remain than its
+ * length prefix declares (a stop inside a frame). Refuses a frame of length
+ * 0 or over 64 MiB as soon as its four length bytes are read (spec §5.3
+ * rule 2), never as a truncation. Shared by {@link decodeLog} and the batch
+ * parser, so a frame run is split one way.
+ */
+export function nextFrame(bytes: Uint8Array, pos: number): Frame | undefined {
+  if (bytes.length - pos < 4) return undefined;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const len = view.getUint32(pos, true);
+  if (len === 0) {
+    throw new BoundaryFormatError(
+      "EmptyFrame",
+      pos,
+      "a frame of length 0 has no room for its tag",
+    );
+  }
+  if (len > MAX_FRAME_LEN) {
+    throw new BoundaryFormatError(
+      "FrameTooLarge",
+      pos,
+      `a frame declares ${len} bytes; the limit is ${MAX_FRAME_LEN} (64 MiB)`,
+    );
+  }
+  if (bytes.length - pos < 4 + len) return undefined;
+  return { offset: pos, payload: bytes.subarray(pos + 4, pos + 4 + len) };
+}
+
 /**
  * Decode a whole `jsbound.log` strictly. Throws {@link BoundaryFormatError}
  * on a refusal; a stream that stops early decodes with its termination
  * class, its partial last frame (if any) discarded.
+ *
+ * `options.inlineBodies: "batch"` decodes the frames of uploaded batches
+ * (see {@link DecodeOptions}).
  */
-export function decodeLog(bytes: Uint8Array): DecodedLog {
+export function decodeLog(
+  bytes: Uint8Array,
+  options: DecodeOptions = {},
+): DecodedLog {
   const magicLen = Math.min(bytes.length, 4);
   for (let i = 0; i < magicLen; i++) {
     if (bytes[i] !== CTBL_MAGIC[i]) {
@@ -559,8 +618,7 @@ export function decodeLog(bytes: Uint8Array): DecodedLog {
     return { records: [], offsets: [], termination: "TruncatedMidRecord" };
   }
 
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const rules = new StreamRules();
+  const rules = new StreamRules(options);
   const records: BoundaryRecord[] = [];
   const offsets: number[] = [];
   let pos = 5;
@@ -573,28 +631,13 @@ export function decodeLog(bytes: Uint8Array): DecodedLog {
         `${remaining} byte(s) follow the End frame`,
       );
     }
-    if (remaining < 4) break;
-    const len = view.getUint32(pos, true);
-    if (len === 0) {
-      throw new BoundaryFormatError(
-        "EmptyFrame",
-        pos,
-        "a frame of length 0 has no room for its tag",
-      );
-    }
-    if (len > MAX_FRAME_LEN) {
-      throw new BoundaryFormatError(
-        "FrameTooLarge",
-        pos,
-        `a frame declares ${len} bytes; the limit is ${MAX_FRAME_LEN} (64 MiB)`,
-      );
-    }
-    if (remaining < 4 + len) break;
-    const record = decodeRecord(bytes.subarray(pos + 4, pos + 4 + len), pos);
+    const frame = nextFrame(bytes, pos);
+    if (frame === undefined) break;
+    const record = decodeRecord(frame.payload, pos);
     rules.accept(record, pos);
     records.push(record);
     offsets.push(pos);
-    pos += 4 + len;
+    pos += 4 + frame.payload.length;
   }
   const termination: Termination =
     pos < bytes.length
