@@ -317,13 +317,14 @@ const Effect = {
 };
 
 /**
- * An input event: a checkpoint if one is due, the `DomEffect`s of default
- * actions that already changed state, then `Task{kind: input}` and `Input`
- * (§9.5's order, at level 0).
+ * An input event: the start of a macrotask (`Loading` while the document
+ * loads, a checkpoint if one is due), the `DomEffect`s of default actions
+ * that already changed state, then `Task{kind: input}` and `Input` (§9.5's
+ * order, at level 0).
  */
 function recordInput(ctx: SeamContext, ev: Event): void {
   const { rec } = ctx;
-  if (rec.checkpointDue()) rec.checkpoint();
+  rec.macrotask();
   const target = ev.target;
   const name = targetOf(target);
   for (const [effect, value] of domEffects(ctx, ev)) {

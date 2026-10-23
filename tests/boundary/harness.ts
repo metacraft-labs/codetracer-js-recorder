@@ -107,6 +107,8 @@ export interface FixtureServer {
 const TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
 };
 
 /**
@@ -296,11 +298,7 @@ export async function startFixtureServer(
         res.end();
         return;
       }
-      res.writeHead(200, {
-        "content-type": TYPES[path.extname(file)] ?? "application/octet-stream",
-        "cache-control": "no-store",
-      });
-      res.end(fs.readFileSync(file));
+      serveFile(res, file, new URL(url, "http://x").searchParams);
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -410,4 +408,58 @@ export async function waitForDone(
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** The marker a page's HTML is cut at when it is served in pieces. */
+export const CHUNK_MARKER = "<!--ct:chunk-->";
+
+/**
+ * Answer a fixture file. `delay=<ms>` answers it that much later (a slow
+ * script, style sheet or image). `chunks=<ms>` sends an HTML page in pieces,
+ * cut after each {@link CHUNK_MARKER}, `ms` apart, as a server streaming its
+ * response does: the browser parses each piece as it arrives, and runs
+ * other tasks while it waits for the next.
+ */
+function serveFile(
+  res: http.ServerResponse,
+  file: string,
+  params: URLSearchParams,
+): void {
+  const delay = Number(params.get("delay") ?? "0");
+  const gap = Number(params.get("chunks") ?? "0");
+  const send = () => {
+    if (res.destroyed) return;
+    res.writeHead(200, {
+      "content-type": TYPES[path.extname(file)] ?? "application/octet-stream",
+      "cache-control": "no-store",
+    });
+    const body = fs.readFileSync(file);
+    if (!(gap > 0)) {
+      res.end(body);
+      return;
+    }
+    const text = body.toString("utf-8");
+    const pieces: string[] = [];
+    let at = 0;
+    for (;;) {
+      const cut = text.indexOf(CHUNK_MARKER, at);
+      if (cut < 0) break;
+      pieces.push(text.slice(at, cut + CHUNK_MARKER.length));
+      at = cut + CHUNK_MARKER.length;
+    }
+    pieces.push(text.slice(at));
+    const next = () => {
+      if (res.destroyed) return;
+      const piece = pieces.shift()!;
+      if (pieces.length === 0) {
+        res.end(piece);
+        return;
+      }
+      res.write(piece);
+      setTimeout(next, gap);
+    };
+    next();
+  };
+  if (delay > 0) setTimeout(send, delay);
+  else send();
 }

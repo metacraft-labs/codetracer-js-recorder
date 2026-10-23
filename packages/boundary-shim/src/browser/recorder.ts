@@ -16,6 +16,7 @@ import {
   encodeFrame,
   streamPrefix,
 } from "@codetracer/boundary-format";
+import type { RecorderProgress } from "./document-progress.js";
 
 /** A record of kind `K` without its `record` and `seq` fields. */
 export type SeqFields<K extends RecordKind> = Omit<
@@ -92,12 +93,24 @@ export class Recorder {
   private wallNow: number | undefined;
   private monoAtCheckpoint: number | undefined;
   private wallAtCheckpoint: number | undefined;
+  /** The document's loading, once attached ({@link attachProgress}). */
+  private progress: RecorderProgress | undefined;
 
   constructor(private readonly opts: RecorderOptions) {}
 
   /** Whether records are still being written. */
   get recording(): boolean {
     return this.state === "recording";
+  }
+
+  /**
+   * Record the document's loading through this recorder (§6, "The
+   * document's own tasks"; `recordDocumentProgress` attaches it): the
+   * `Loading` at the start of each macrotask, the `DocTask` of a script
+   * before its first record, and no checkpoint while the document parses.
+   */
+  attachProgress(progress: RecorderProgress): void {
+    this.progress = progress;
   }
 
   /** A fresh `task_id` (§6: assigned at registration). */
@@ -124,6 +137,7 @@ export class Recorder {
    */
   emit<K extends SeqKind>(kind: K, fields: SeqFields<K>): void {
     if (this.state !== "recording") return;
+    if (kind !== "Loading" && kind !== "DocTask") this.progress?.beforeRecord();
     const record = {
       record: kind,
       seq: this.nextSeq,
@@ -163,13 +177,29 @@ export class Recorder {
    */
   task(taskId: bigint, kind: number): void {
     if (this.state !== "recording") return;
-    if (this.checkpointDue()) this.checkpoint();
+    this.macrotask();
     this.emit("Task", { task_id: taskId, kind });
+  }
+
+  /**
+   * A macrotask starts (a quiescent point, §7.3): where the document is in
+   * its loading (`Loading`, while it loads), then a checkpoint if one is
+   * due. A recorder that writes a task's records itself (an input's
+   * `DomEffect`s before its `Task`) calls this first.
+   */
+  macrotask(): void {
+    if (this.state !== "recording") return;
+    this.progress?.macrotask();
+    if (this.checkpointDue()) this.checkpoint();
   }
 
   /** Whether §7.3's cadence calls for a checkpoint at this quiescent point. */
   checkpointDue(): boolean {
     if (this.recordsSinceCheckpoint === 0) return false;
+    // Not while the document parses: its extent between two of the parser's
+    // tokens is not in the log, so a replay could not compare the same
+    // document (§7.3, as amended for §6 "The document's own tasks").
+    if (this.progress?.checkpointsAllowed() === false) return false;
     if (this.recordsSinceCheckpoint >= CHECKPOINT_RECORDS) return true;
     return (
       elapsed(this.monoAtCheckpoint, this.monoNow) >= CHECKPOINT_RECORDED_MS ||
@@ -199,7 +229,12 @@ export class Recorder {
   end(reason: number): void {
     if (this.state !== "recording") return;
     this.guard(() => {
-      if (this.recordsSinceCheckpoint > 0) this.checkpoint();
+      if (
+        this.recordsSinceCheckpoint > 0 &&
+        this.progress?.checkpointsAllowed() !== false
+      ) {
+        this.checkpoint();
+      }
       this.push({
         record: "End",
         last_seq: this.nextSeq - 1n,

@@ -11,6 +11,7 @@
 import { CONTROL_GLOBAL, RECORDER_NAME, type ShimConfig } from "./config.js";
 import type { SeamContext, ShimWindow } from "./context.js";
 import { domV1Hash } from "./dom-v1.js";
+import { recordDocumentProgress } from "./document-progress.js";
 import { captureOriginals, type ShimOriginals } from "./originals.js";
 import { Recorder } from "./recorder.js";
 import { listenForPageEvents, patchDomSeams } from "./seams-dom.js";
@@ -106,6 +107,10 @@ export function installBoundaryShim(
     },
   };
 
+  // The document's own loading (§6, "The document's own tasks"): its
+  // listeners go first, so a script's `DocTask` precedes the page's own
+  // listeners of its `load`.
+  rec.guard(() => recordDocumentProgress(w, rec, orig.addEventListener));
   // A seam that cannot be patched would leave a silent hole in the log, so
   // it is a recorder fault: the log says why it stops.
   for (const patch of [

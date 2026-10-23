@@ -316,10 +316,16 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
         .filter((r) => r.record === "Task")
         .pop();
       expect(lastTaskBefore).toMatchObject({ task_id: timer.task_id, kind: 1 });
-      expect(
-        recordsOf(log, "Task", (r) => r.task_id === taskId),
-        "the request's tasks",
-      ).toHaveLength(1);
+      // The request's tasks: its head's, and the one `json()` settles in
+      // once the body is read, after the body's end (§6, as amended
+      // 2026-10-23: the platform settles a whole-body read in a task of its
+      // own).
+      const requestTasks = indicesOf(
+        log,
+        (r) => r.record === "Task" && r.task_id === taskId,
+      );
+      expect(requestTasks, "the request's tasks").toHaveLength(2);
+      expect(requestTasks[1]).toBeGreaterThan(end[0]);
       expect(
         log.records
           .slice(chunks[0], end[0] + 1)
@@ -817,11 +823,16 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
       expect(events.length, "the platform's events").toBeGreaterThan(0);
       expect(events.filter((e) => e.loaded === BigInt(99))).toEqual([]);
 
-      // The task that sent the request, up to the next Task: the platform's
-      // loadstart events inside send(), then the listeners of the page's two
-      // progress events, and nothing else.
+      // The task that sent the request, up to the next task (a `Task`, or the
+      // `Loading` or `DocTask` of one while the document loads, §6): the
+      // platform's loadstart events inside send(), then the listeners of the
+      // page's two progress events, and nothing else.
       const nextTask = log.records.findIndex(
-        (r, i) => i > at && r.record === "Task",
+        (r, i) =>
+          i > at &&
+          (r.record === "Task" ||
+            r.record === "Loading" ||
+            r.record === "DocTask"),
       );
       expect(nextTask).toBeGreaterThan(at);
       expect(

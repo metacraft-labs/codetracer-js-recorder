@@ -28,7 +28,28 @@
  * answer those from the platform's response, `clone()` carries them to the
  * clone, and the `Headers` mutators throw on a rebuilt response's headers
  * exactly as the platform's immutable headers do (by calling them on those).
+ *
+ * Reading a whole body (`json()`, `text()`, …) resolves in a task of the
+ * platform's own once the body is read (Fetch, "fully read body": "queue a
+ * fetch task"), between which and the body's end the browser may run any
+ * other task (an input). That task is the page's too, since its
+ * continuation runs in it, so it is recorded: a `Task` with the request's
+ * id when such a call settles, before the page's continuation runs
+ * ({@link BODY_CONSUMERS}; §6, as amended 2026-10-23).
  */
+
+/**
+ * The methods that read a whole body and settle in a task of their own
+ * (Fetch, "consume body"), as `Response.prototype` has them.
+ */
+export const BODY_CONSUMERS: readonly string[] = [
+  "arrayBuffer",
+  "blob",
+  "bytes",
+  "formData",
+  "json",
+  "text",
+];
 
 import {
   type SeamContext,
@@ -129,6 +150,8 @@ export function patchResponses(
   const queueMicrotask = orig.queueMicrotask;
 
   const meta = new WeakMap<object, ResponseMeta>();
+  // A rebuilt response (and its clones) -> the task id of its request.
+  const tasks = new WeakMap<object, bigint>();
   // A rebuilt response's headers object -> the platform's immutable one.
   const frozen = new WeakMap<object, Headers>();
 
@@ -156,9 +179,41 @@ export function patchResponses(
         meta.set(c, m);
         frozen.set(c.headers, m.headers);
       }
+      const t = tasks.get(this);
+      if (t !== undefined) tasks.set(c, t);
       return c;
     },
   );
+  for (const name of BODY_CONSUMERS) {
+    const read = (OrigResponse.prototype as unknown as Record<string, unknown>)[
+      name
+    ];
+    if (typeof read !== "function") continue;
+    replaceValue(OrigResponse.prototype, name, function (this: Response) {
+      const settled = (read as (...a: unknown[]) => Promise<unknown>).apply(
+        this,
+        Array.from(arguments),
+      );
+      const taskId = tasks.get(this);
+      if (taskId === undefined) return settled;
+      // The page's continuation follows the record of the task it runs in.
+      const task = () =>
+        rec.guard(() => rec.task(taskId, TaskKind.networkCompletion));
+      return new OrigPromise((resolve, reject) => {
+        (then as Promise<unknown>["then"]).call(
+          settled,
+          (v) => {
+            task();
+            resolve(v);
+          },
+          (e: unknown) => {
+            task();
+            reject(e);
+          },
+        );
+      });
+    });
+  }
   for (const [name, f] of orig.headersMutators) {
     const patched = function (this: unknown): unknown {
       const platform = frozen.get(this as object);
@@ -322,6 +377,7 @@ export function patchResponses(
         headers: resp.headers,
       });
       frozen.set(page.headers, resp.headers);
+      tasks.set(page, taskId);
 
       // A failure (an abort, a network error) errors the platform's body at
       // once, discarding what it had queued, whether or not anyone reads:
