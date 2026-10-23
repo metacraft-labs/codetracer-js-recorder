@@ -67,3 +67,70 @@ function elementPath(el: Element): string {
 function escapeId(id: string): string {
   return id.replace(/[\\>]/g, (c) => "\\" + c);
 }
+
+/**
+ * The node a level-0 target string names in `doc` now: the inverse of
+ * {@link targetOf}. `win` is `doc`'s window, `doc` the document, and a
+ * `path:` the element its steps reach from its start. `null` when the
+ * string is not a target, its start is a detached subtree (`~<tag>`, which
+ * no document lookup can reach), or a step names no element.
+ */
+export function resolveTarget(
+  target: string,
+  doc: Document,
+): Element | Document | Window | null {
+  if (target === "win") return doc.defaultView;
+  if (target === "doc") return doc;
+  if (!target.startsWith("path:")) return null;
+  const steps = splitPath(target.slice("path:".length));
+  if (steps === null || steps.length === 0) return null;
+  const start = steps[0];
+  let cur: Element | null;
+  if (start.startsWith("#")) {
+    cur = doc.getElementById(start.slice(1));
+  } else if (start.startsWith("~")) {
+    return null;
+  } else {
+    const root = doc.documentElement;
+    cur = root !== null && root.localName === start ? root : null;
+  }
+  for (const step of steps.slice(1)) {
+    if (cur === null) return null;
+    const m = /^([^:]+):(\d+)$/.exec(step);
+    if (m === null) return null;
+    const [, tag, n] = m;
+    let index = Number(n);
+    let found: Element | null = null;
+    for (let c = cur.firstElementChild; c !== null; c = c.nextElementSibling) {
+      if (c.localName === tag && index-- === 0) {
+        found = c;
+        break;
+      }
+    }
+    cur = found;
+  }
+  return cur;
+}
+
+/**
+ * Split a path at its unescaped `>`s, unescaping the start's id (only an
+ * id can hold `\` or `>`). `null` for a dangling backslash.
+ */
+function splitPath(path: string): string[] | null {
+  const steps: string[] = [];
+  let cur = "";
+  for (let i = 0; i < path.length; i++) {
+    const c = path[i];
+    if (c === "\\") {
+      if (i + 1 >= path.length) return null;
+      cur += path[++i];
+    } else if (c === ">") {
+      steps.push(cur);
+      cur = "";
+    } else {
+      cur += c;
+    }
+  }
+  steps.push(cur);
+  return steps;
+}

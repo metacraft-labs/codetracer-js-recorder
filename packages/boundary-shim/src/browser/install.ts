@@ -91,7 +91,7 @@ export function installBoundaryShim(
       prev_session: config.prevSession ?? "",
       capabilities: "[]",
     },
-    environment(w, orig),
+    readEnvironment(w, orig),
   );
 
   const refused = new Set<string>();
@@ -160,10 +160,11 @@ function u32(v: number): number {
 
 /**
  * The `Env` record, read before any seam is patched so none of it is
- * logged as the page's. `color_scheme` is 0 (no preference), 1 (light) or
+ * logged as the page's (a cooperating framework that records natively
+ * reads it the same way). `color_scheme` is 0 (no preference), 1 (light) or
  * 2 (dark); `reduced_motion` is 1 when the user asked for reduced motion.
  */
-function environment(w: ShimWindow, orig: ShimOriginals) {
+export function readEnvironment(w: ShimWindow, orig: ShimOriginals) {
   const nav = w.navigator;
   const ua = nav.userAgent;
   const major = /(?:Chrome|Chromium|Firefox|Version)\/(\d+)/.exec(ua);

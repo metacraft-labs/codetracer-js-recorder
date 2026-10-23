@@ -68,6 +68,12 @@ export interface RecorderOptions {
   checkpointHash: () => string;
   /** The checkpoint scheme name. */
   checkpointScheme: string;
+  /**
+   * Computes the checkpoint's `dom_digest`. Absent for `dom-v1` (level 0),
+   * whose hash is the `state_hash`; a cooperating framework's scheme
+   * carries `dom-v1` here beside its own state hash (§7.3).
+   */
+  checkpointDomDigest?: () => string;
 }
 
 export class Recorder {
@@ -179,7 +185,7 @@ export class Recorder {
       ordinal: this.checkpointOrdinal,
       scheme: this.opts.checkpointScheme,
       state_hash: stateHash,
-      dom_digest: "",
+      dom_digest: this.opts.checkpointDomDigest?.() ?? "",
     });
     this.checkpointOrdinal += 1;
     this.monoAtCheckpoint = this.monoNow;
@@ -237,6 +243,14 @@ export class Recorder {
    */
   injectEncoderFault(): void {
     this.faultArmed = true;
+  }
+
+  /**
+   * The frames written so far, one per record, in order. A recorder that
+   * uploads batches slices it; nothing may modify it.
+   */
+  get frameList(): readonly Uint8Array[] {
+    return this.frames;
   }
 
   /** The frames written so far, as one batch body (no stream prefix). */
