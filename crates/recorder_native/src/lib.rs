@@ -2728,3 +2728,41 @@ mod path_table_tests {
         );
     }
 }
+
+/// Read one member of a CTFS container (`<file>.ct`) whole, through the
+/// canonical reader (`codetracer_ctfs::CtfsReader`), so a TypeScript
+/// consumer never needs a second, drifting container decoder.
+///
+/// The browser boundary replay runner (`@codetracer/boundary-replay`) reads
+/// a boundary recording's `jsbound.log` and `jsbound.blb` this way.
+/// Errors name the container and the member: a missing member, or a
+/// container the reader refuses.
+#[napi]
+pub fn read_ctfs_member(container_path: String, name: String) -> Result<Buffer> {
+    let mut reader =
+        codetracer_ctfs::CtfsReader::open(Path::new(&container_path)).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("cannot open the CTFS container {container_path}: {e}"),
+            )
+        })?;
+    let bytes = reader.read_file(&name).map_err(|e| {
+        Error::new(
+            Status::GenericFailure,
+            format!("cannot read member {name} of {container_path}: {e}"),
+        )
+    })?;
+    Ok(bytes.into())
+}
+
+/// The names of a CTFS container's members, in the container's order.
+#[napi]
+pub fn list_ctfs_members(container_path: String) -> Result<Vec<String>> {
+    let reader = codetracer_ctfs::CtfsReader::open(Path::new(&container_path)).map_err(|e| {
+        Error::new(
+            Status::GenericFailure,
+            format!("cannot open the CTFS container {container_path}: {e}"),
+        )
+    })?;
+    Ok(reader.list_files())
+}
