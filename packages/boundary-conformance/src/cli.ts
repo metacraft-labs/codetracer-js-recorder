@@ -1,0 +1,167 @@
+#!/usr/bin/env node
+/**
+ * `ct-boundary-conformance`: the cooperation protocol's conformance suite
+ * on the command line (CodeTracer's JS-Boundary-Recording specification
+ * §9.9).
+ *
+ * ```text
+ * ct-boundary-conformance record --build <dir> --level <0|1>
+ *                                [--fixture <name>]... [--out <report.json>]
+ *                                [--concurrency <n>] [--timeout-ms <n>]
+ * ct-boundary-conformance fixtures
+ * ```
+ *
+ * `record` runs the record leg and writes its JSON report to `--out` (or to
+ * stdout), with a one-line verdict per failed check on stderr. Exit status:
+ * 0 when every check passed or is not applicable, 1 when one failed, 2 for
+ * a usage error or a harness that could not run (no browser, no build).
+ * `fixtures` prints every fixture's contract as JSON, for a framework
+ * writing its own build of them.
+ */
+
+import * as fs from "node:fs";
+
+import { FIXTURES } from "./fixtures.js";
+import { runRecordLeg, SUITE_VERSION } from "./harness.js";
+import type { ProtocolLevel } from "./protocol.js";
+
+const USAGE = `usage: ct-boundary-conformance record --build <dir> --level <0|1> [--fixture <name>]... [--out <report.json>] [--concurrency <n>] [--timeout-ms <n>]
+       ct-boundary-conformance fixtures
+       ct-boundary-conformance --version`;
+
+class UsageError extends Error {}
+
+interface RecordArgs {
+  build: string;
+  level: ProtocolLevel;
+  fixtures?: string[];
+  out?: string;
+  concurrency?: number;
+  timeoutMs?: number;
+}
+
+function positiveInt(flag: string, v: string): number {
+  const n = Number(v);
+  if (!Number.isSafeInteger(n) || n < 1)
+    throw new UsageError(
+      `${flag} ${JSON.stringify(v)} is not a positive integer`,
+    );
+  return n;
+}
+
+function parseRecordArgs(argv: string[]): RecordArgs {
+  let build: string | undefined;
+  let level: ProtocolLevel | undefined;
+  const fixtures: string[] = [];
+  const args: Partial<RecordArgs> = {};
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i];
+    const value = () => {
+      const v = argv[++i];
+      if (v === undefined) throw new UsageError(`${flag} needs a value`);
+      return v;
+    };
+    switch (flag) {
+      case "--build":
+        build = value();
+        break;
+      case "--level": {
+        const v = value();
+        if (v !== "0" && v !== "1")
+          throw new UsageError(`--level ${JSON.stringify(v)} is not 0 or 1`);
+        level = Number(v) as ProtocolLevel;
+        break;
+      }
+      case "--fixture":
+        fixtures.push(value());
+        break;
+      case "--out":
+        args.out = value();
+        break;
+      case "--concurrency":
+        args.concurrency = positiveInt(flag, value());
+        break;
+      case "--timeout-ms":
+        args.timeoutMs = positiveInt(flag, value());
+        break;
+      default:
+        throw new UsageError(`unknown argument ${JSON.stringify(flag)}`);
+    }
+  }
+  if (build === undefined) throw new UsageError("--build is required");
+  if (level === undefined) throw new UsageError("--level is required");
+  const known = new Set(FIXTURES.map((f) => f.name));
+  for (const f of fixtures) {
+    if (!known.has(f))
+      throw new UsageError(`no fixture named ${JSON.stringify(f)}`);
+  }
+  return {
+    ...args,
+    build,
+    level,
+    fixtures: fixtures.length > 0 ? fixtures : undefined,
+  };
+}
+
+/** Run the CLI on `argv` (without the node and script paths); the exit status. */
+export async function main(argv: string[]): Promise<number> {
+  try {
+    const [command, ...rest] = argv;
+    if (command === "--version") {
+      process.stdout.write(`${SUITE_VERSION}\n`);
+      return 0;
+    }
+    if (command === "--help" || command === "-h") {
+      process.stdout.write(`${USAGE}\n`);
+      return 0;
+    }
+    if (command === "fixtures") {
+      if (rest.length > 0) throw new UsageError("fixtures takes no arguments");
+      process.stdout.write(`${JSON.stringify(FIXTURES, null, 2)}\n`);
+      return 0;
+    }
+    if (command !== "record")
+      throw new UsageError(
+        command === undefined
+          ? "no command"
+          : `unknown command ${JSON.stringify(command)}`,
+      );
+    const args = parseRecordArgs(rest);
+    const { report } = await runRecordLeg(args);
+    const json = `${JSON.stringify(report, null, 2)}\n`;
+    if (args.out !== undefined) fs.writeFileSync(args.out, json);
+    else process.stdout.write(json);
+    for (const f of report.fixtures) {
+      for (const c of f.checks) {
+        if (c.status === "fail")
+          process.stderr.write(
+            `FAIL ${f.name} ${c.name}: ${c.detail.join("; ")}\n`,
+          );
+      }
+    }
+    const { pass, fail, notApplicable } = report.summary;
+    process.stderr.write(
+      `record leg, level ${report.level}: ${pass} passed, ${fail} failed, ${notApplicable} not applicable at level 0\n`,
+    );
+    return report.passed ? 0 : 1;
+  } catch (e) {
+    if (e instanceof UsageError) {
+      process.stderr.write(`ct-boundary-conformance: ${e.message}\n${USAGE}\n`);
+      return 2;
+    }
+    process.stderr.write(`ct-boundary-conformance: ${(e as Error).message}\n`);
+    return 2;
+  }
+}
+
+if (require.main === module) {
+  main(process.argv.slice(2)).then(
+    (code) => {
+      process.exitCode = code;
+    },
+    (e: unknown) => {
+      process.stderr.write(`ct-boundary-conformance: ${String(e)}\n`);
+      process.exitCode = 2;
+    },
+  );
+}

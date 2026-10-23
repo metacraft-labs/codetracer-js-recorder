@@ -30,6 +30,7 @@ import {
   type DecodedLog,
   decodeLog,
 } from "../../packages/boundary-format/src/index.js";
+import { checkpointCadence } from "../../packages/boundary-conformance/src/cadence.js";
 import {
   BUNDLE_PATH,
   injectBoundaryShimIntoFiles,
@@ -697,71 +698,13 @@ describe("record-side generic boundary shim", () => {
       expect(pageErrors).toEqual([]);
       expect(log.termination).toBe("Complete");
 
-      // §7.3: at a quiescent point (the start of a macrotask: its Task
-      // record, or the DomEffects an input's Task follows), at most once
-      // there, and whenever 256 records or 2 s of recorded time have passed
-      // since the last checkpoint.
-      const isTaskStart = (i: number): boolean => {
-        const r = log.records[i];
-        if (r.record === "Task")
-          return log.records[i - 1]?.record !== "DomEffect";
-        return (
-          r.record === "DomEffect" && log.records[i - 1]?.record !== "DomEffect"
-        );
-      };
-      let since = 0;
-      let wallAt: number | undefined;
-      let wallNow: number | undefined;
-      let monoAt: number | undefined;
-      let monoNow: number | undefined;
-      const byCount: number[] = [];
-      const byTime: number[] = [];
-      const violations: string[] = [];
-      log.records.forEach((r, i) => {
-        if (!("seq" in r)) return;
-        if (r.record === "Checkpoint") {
-          const due =
-            since >= 256 ||
-            (wallAt !== undefined && wallNow! - wallAt >= 2000) ||
-            (monoAt !== undefined && monoNow! - monoAt >= 2000);
-          const atStart = i + 1 < log.records.length && isTaskStart(i + 1);
-          const atEnd = log.records[i + 1]?.record === "End";
-          if (!atStart && !atEnd)
-            violations.push(
-              `checkpoint at seq ${r.seq} is not at a task boundary`,
-            );
-          if (!due && !atEnd)
-            violations.push(`checkpoint at seq ${r.seq} was not due`);
-          if (since >= 256) byCount.push(Number(r.seq));
-          else if (due) byTime.push(Number(r.seq));
-          since = 0;
-          wallAt = wallNow;
-          monoAt = monoNow;
-          return;
-        }
-        if (isTaskStart(i)) {
-          const due =
-            since >= 256 ||
-            (wallAt !== undefined && wallNow! - wallAt >= 2000) ||
-            (monoAt !== undefined && monoNow! - monoAt >= 2000);
-          if (due)
-            violations.push(`no checkpoint before the task at seq ${r.seq}`);
-        }
-        since += 1;
-        if (r.record === "Clock") {
-          const v = new DataView(new ArrayBuffer(8));
-          v.setBigUint64(0, r.bits, true);
-          const value = v.getFloat64(0, true);
-          // §7.3: wall clock from src 1 and 3, monotonic from 2 and 4.
-          if (r.src === 1 || r.src === 3) {
-            wallNow = value;
-            wallAt ??= value;
-          } else if (r.src === 2 || r.src === 4) {
-            monoNow = value;
-            monoAt ??= value;
-          }
-        }
-      });
+      // §7.3's cadence, by the conformance suite's oracle: the one
+      // implementation of the rule, which its `checkpoints` check calls too.
+      const {
+        violations,
+        dueByCount: byCount,
+        dueByTime: byTime,
+      } = checkpointCadence(log.records);
       expect(violations).toEqual([]);
       // Both triggers fired, so the check above was not vacuous.
       expect(byCount.length, "checkpoints due by record count").toBeGreaterThan(

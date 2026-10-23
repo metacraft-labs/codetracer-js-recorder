@@ -1,0 +1,24 @@
+{
+  "name": "@codetracer/boundary-conformance",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "description": "Conformance suite of the CodeTracer boundary-recording cooperation protocol: fixture scenarios, the ct-boundary-conformance harness that runs a framework's build of them in headless Chromium, and a test-only reference micro-framework",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "ct-boundary-conformance": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc && node scripts/bundle.mjs"
+  },
+  "dependencies": {
+    "@codetracer/boundary-format": "*",
+    "@codetracer/boundary-shim": "*",
+    "esbuild": "^0.27.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -265,7 +265,7 @@
             # npm dependencies (pre-fetched for offline install)
             npmDeps = pkgs.fetchNpmDeps {
               src = ./.;
-              hash = "sha256-smcsN6eAyloYwN+N4pVcuOkxiFy5+MBJUCuZvsh8gAI=";
+              hash = "sha256-IzYXxPQ+WhItpg3mO7d+B+aXrWoKAZhpPNweThipBBM=";
             };
 
             # Rust dependencies for the native addon (vendored from Cargo.lock)
@@ -370,6 +370,14 @@
               makeWrapper ${pkgs.nodejs_22}/bin/node \
                 $out/bin/codetracer-js-recorder \
                 --add-flags "$out/lib/codetracer-js-recorder/packages/cli/dist/index.js"
+
+              # The cooperation protocol's conformance harness. It drives the
+              # headless Chromium of the caller's environment (playwright-core
+              # from PLAYWRIGHT_CORE_PATH, as a dev shell with nixpkgs'
+              # playwright-driver exports it), so no browser is in this closure.
+              makeWrapper ${pkgs.nodejs_22}/bin/node \
+                $out/bin/ct-boundary-conformance \
+                --add-flags "$out/lib/codetracer-js-recorder/packages/boundary-conformance/dist/cli.js"
 
               runHook postInstall
             '';

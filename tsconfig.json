@@ -14,6 +14,7 @@
     { "path": "packages/runtime-browser" },
     { "path": "packages/boundary-format" },
     { "path": "packages/boundary-shim" },
+    { "path": "packages/boundary-conformance" },
     { "path": "packages/cli" },
     { "path": "packages/vite-plugin" },
     { "path": "packages/webpack-plugin" },

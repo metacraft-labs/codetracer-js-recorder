@@ -11,6 +11,7 @@
     "packages/runtime-browser",
     "packages/boundary-format",
     "packages/boundary-shim",
+    "packages/boundary-conformance",
     "packages/cli",
     "packages/express",
     "packages/vite-plugin",

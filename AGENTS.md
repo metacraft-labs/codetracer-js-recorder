@@ -69,6 +69,25 @@ This is a monorepo managed with npm workspaces:
   `codetracerBoundaryShimPlugin`. Its browser tests
   (`tests/boundary/record-shim.test.ts`) run real headless Chromium, which the
   dev shell provides (`PLAYWRIGHT_CORE_PATH`, `PLAYWRIGHT_BROWSERS_PATH`).
+* `packages/boundary-conformance` — the conformance suite of the
+  boundary-recording cooperation protocol, the definition of "a framework
+  implements the protocol": the fixture scenarios (`src/fixtures.ts`), the
+  record-leg harness `ct-boundary-conformance record --build <dir> --level
+  <0|1>` (a real server and headless Chromium; the checks in
+  `src/checks.ts`), the suite's generic build for the shim at level 0, and a
+  **test-only** reference micro-framework at level 1 (`src/reference/`, with
+  seeded defects) that proves the harness discriminates. It is a public
+  contract other repositories run against their own builds, so the fixture
+  pages' `data-fx` names and the `/ct-conformance/` routes are part of it.
+  The checkpoint cadence oracle (`src/cadence.ts`) is the one implementation
+  of that rule; the shim's own tests call it too. The probe's `dom-v1`
+  serialiser (`src/browser/probe.ts`) is deliberately a second, independent
+  implementation of the scheme, the oracle the recorders' hashes are checked
+  against; do not replace it with the shim's. Pinned by
+  `tests/boundary/conformance.test.ts`. `packages/boundary-format` also has
+  the batch envelope codec (`batch.ts`, `encodeBatch`/`parseBatch`) the suite
+  checks uploads with, held to the Rust parser by the shared batch vectors
+  (`tests/boundary/vectors/batches.json`).
 * `crates/recorder_native` — Rust N-API addon (via napi-rs) for writing
   trace files in binary (CBOR+zstd) and JSON formats.
 * `tests/` — End-to-end integration tests.
