@@ -44,10 +44,12 @@
  *   head. So no gate goes before the first start tag other than `<html>`
  *   or the first text (each makes the head), except the one stand-in below.
  * - At protocol level 0 the recorded page had the record bootstrap at the
- *   start of its head (`@codetracer/boundary-shim` `bootstrapPosition`),
- *   and a page without a `<head>` tag had its head implied there, early:
- *   the replayed page gets a gate at that same position
- *   (`GateOptions.bootstrapAt`), so its tree is the recorded one.
+ *   start of its head (`@codetracer/boundary-shim` `bootstrapPosition`:
+ *   after the page's `<head>` tag, or where the tree builder implies the
+ *   head, the bootstrap implying it there): the replayed page gets a gate at
+ *   that same position (`GateOptions.bootstrapAt`), so its tree is the
+ *   recorded one and replay can hold the parser where the recording could
+ *   first have stopped.
  * - Not before `<col>`: a script ends
  *   the column group it would be in, and the `<col>` then implies another;
  *   nor right after `<pre>` or `<listing>`, whose first newline the parser
@@ -58,17 +60,19 @@
  *   content, where a `<script>` is an SVG script); and never in a
  *   frameset document or after `<plaintext>`.
  *
- * The tokenizer below is the part of the HTML tokenizer
- * (https://html.spec.whatwg.org/multipage/parsing.html#tokenization) that
- * finds those positions: tags with their quoted attribute values,
- * comments, doctypes and bogus comments, and the end of raw text. It does
- * not build a tree; the elements the tree builder makes from a start tag
+ * The positions are found with the part of the HTML tokenizer
+ * (https://html.spec.whatwg.org/multipage/parsing.html#tokenization) in
+ * `@codetracer/boundary-shim` (`html-scan.ts`): tags with their quoted
+ * attribute values, comments, doctypes and bogus comments, and the end of
+ * raw text. The record side places the bootstrap with the same scanner, so
+ * the two agree on where things are. It does not build a tree; the elements the tree builder makes from a start tag
  * are the browser's business, and a position the gates cannot reach is a
  * typed divergence on replay, never a wrong trace.
  */
 
 import type { BoundaryRecord } from "@codetracer/boundary-format";
 import { REPLAY_GATE_MARKER } from "@codetracer/boundary-shim/dist/browser/document-progress.js";
+import { scanTags } from "@codetracer/boundary-shim/dist/html-scan.js";
 
 /** The marker attribute of a gate, which a document position never counts. */
 export const GATE_MARKER = REPLAY_GATE_MARKER;
@@ -84,19 +88,6 @@ export const DCL_GATE = `<script ${GATE_MARKER} defer src="${GATE_PATH}dcl"></sc
 
 /** The `load` gate (an `async` script). */
 export const LOAD_GATE = `<script ${GATE_MARKER} async src="${GATE_PATH}load"></script>`;
-
-/** Elements whose content is text up to their end tag. */
-const RAW_TEXT = new Set([
-  "script",
-  "style",
-  "xmp",
-  "iframe",
-  "noembed",
-  "noframes",
-  "noscript",
-  "textarea",
-  "title",
-]);
 
 /** Which gates to put into a document. */
 export interface GateOptions {
@@ -121,175 +112,6 @@ export interface GatedDocument {
   parserGates: number;
   /** Why no gate at all was inserted, when none was. */
   skipped?: string;
-}
-
-const isSpace = (c: string) =>
-  c === " " || c === "\t" || c === "\n" || c === "\f" || c === "\r";
-const isAlpha = (c: string) => (c >= "a" && c <= "z") || (c >= "A" && c <= "Z");
-
-/** Whether `html` between `from` and `to` holds anything but whitespace. */
-function hasText(html: string, from: number, to: number): boolean {
-  for (let k = from; k < to; k++) if (!isSpace(html[k])) return true;
-  return false;
-}
-
-/** A start or end tag the tokenizer found. */
-interface Tag {
-  end: boolean;
-  /** Lower case. */
-  name: string;
-  /** Where the tag starts (`<`) and ends (after `>`). */
-  start: number;
-  stop: number;
-  /** The text between the name and `>`. */
-  attributes: string;
-  selfClosing: boolean;
-  /**
-   * The end of the last tag, comment or doctype before this tag, when only
-   * whitespace lies between them; `-1` otherwise.
-   */
-  afterToken: number;
-  /** The start tag right before this tag, if the token before it was one. */
-  afterStartTag: string;
-  /** Inside `<template>` contents or `<svg>`/`<math>`. */
-  nested: boolean;
-  /**
-   * Whether the tree builder has made the head before this tag: a start
-   * tag other than `<html>`, or text that is not whitespace, came before
-   * it.
-   */
-  headMade: boolean;
-}
-
-/**
- * Walk the tags of `html` (see the module comment), calling `visit` for
- * each; `visit` returning `false` stops the walk.
- */
-function scanTags(html: string, visit: (tag: Tag) => boolean | void): void {
-  let lastTokenEnd = -1;
-  let lastStartTag = "";
-  let headMade = false;
-  let template = 0;
-  let foreign = 0;
-  let i = 0;
-  const n = html.length;
-  const lower = html.toLowerCase();
-
-  while (i < n) {
-    const lt = html.indexOf("<", i);
-    if (lt < 0) return;
-    // Text between the last token and this one: only whitespace keeps the
-    // last token's end as a place a gate may go.
-    if (lastTokenEnd >= 0) {
-      for (let k = lastTokenEnd; k < lt; k++) {
-        if (!isSpace(html[k])) {
-          lastTokenEnd = -1;
-          break;
-        }
-      }
-    }
-    if (!headMade && lastTokenEnd < 0 && hasText(html, i, lt)) headMade = true;
-    const c = html[lt + 1] ?? "";
-    if (html.startsWith("<!--", lt)) {
-      // A comment; `<!-->` and `<!--->` end at once (abrupt closing).
-      let end: number;
-      if (html.startsWith("<!-->", lt)) end = lt + 5;
-      else if (html.startsWith("<!--->", lt)) end = lt + 6;
-      else {
-        const close = html.indexOf("-->", lt + 4);
-        end = close < 0 ? n : close + 3;
-      }
-      i = end;
-      lastTokenEnd = end;
-      lastStartTag = "";
-      continue;
-    }
-    if (c === "!" || c === "?") {
-      // A doctype, CDATA outside foreign content, or a bogus comment: to `>`.
-      const gt = html.indexOf(">", lt + 2);
-      i = gt < 0 ? n : gt + 1;
-      lastTokenEnd = i;
-      lastStartTag = "";
-      continue;
-    }
-    const end = c === "/";
-    const nameStart = end ? lt + 2 : lt + 1;
-    if (!isAlpha(html[nameStart] ?? "")) {
-      // `<` that starts no tag is text.
-      i = lt + 1;
-      lastTokenEnd = -1;
-      headMade = true;
-      continue;
-    }
-    let k = nameStart;
-    while (k < n && !isSpace(html[k]) && html[k] !== "/" && html[k] !== ">")
-      k++;
-    const name = lower.slice(nameStart, k);
-    const attrStart = k;
-    // The attributes, to the tag's `>`, as the tokenizer reads them: a
-    // quote starts a quoted value (which may hold `>`) only right after an
-    // attribute's `=` and any whitespace; elsewhere (in a name, or in an
-    // unquoted value such as `title=it's`) it is an ordinary character.
-    let selfClosing = false;
-    let afterEquals = false;
-    while (k < n && html[k] !== ">") {
-      const ch = html[k];
-      if (afterEquals && (ch === '"' || ch === "'")) {
-        const q = html.indexOf(ch, k + 1);
-        k = q < 0 ? n : q + 1;
-        afterEquals = false;
-        continue;
-      }
-      if (afterEquals && !isSpace(ch)) {
-        // An unquoted value: to whitespace or `>`.
-        while (k < n && !isSpace(html[k]) && html[k] !== ">") k++;
-        afterEquals = false;
-        continue;
-      }
-      if (ch === "=") afterEquals = true;
-      else if (ch === "/" && html[k + 1] === ">") selfClosing = true;
-      k++;
-    }
-    const stop = Math.min(n, k + 1);
-    const tag: Tag = {
-      end,
-      name,
-      start: lt,
-      stop,
-      attributes: html.slice(attrStart, k),
-      selfClosing,
-      afterToken: lastTokenEnd,
-      afterStartTag: lastTokenEnd >= 0 ? lastStartTag : "",
-      nested: template > 0 || foreign > 0,
-      headMade,
-    };
-    if (visit(tag) === false) return;
-    if (end) {
-      if (name === "template" && template > 0) template--;
-      else if ((name === "svg" || name === "math") && foreign > 0) foreign--;
-    } else if (name === "template") template++;
-    else if ((name === "svg" || name === "math") && !selfClosing) foreign++;
-    i = stop;
-    lastTokenEnd = stop;
-    lastStartTag = end ? "" : name;
-    if (!end && name !== "html") headMade = true;
-    if (!end && RAW_TEXT.has(name) && foreign === 0) {
-      // Text to the matching end tag (`</name` then whitespace, `/` or `>`).
-      let close = stop;
-      for (;;) {
-        close = lower.indexOf(`</${name}`, close);
-        if (close < 0) {
-          close = n;
-          break;
-        }
-        const after = html[close + 2 + name.length] ?? ">";
-        if (isSpace(after) || after === "/" || after === ">") break;
-        close += 2;
-      }
-      i = close;
-      lastTokenEnd = -1;
-    }
-  }
 }
 
 /** The value of attribute `name` in a tag's attribute text, if present. */

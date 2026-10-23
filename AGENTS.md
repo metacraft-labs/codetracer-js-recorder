@@ -66,7 +66,13 @@ This is a monorepo managed with npm workspaces:
   `packages/boundary-format`. Its browser half is bundled into
   `dist/boundary-shim.iife.js` and inserted first in `<head>` by
   `codetracer-js-recorder boundary-shim <html|dir>` or the vite plugin's
-  `codetracerBoundaryShimPlugin`. Its browser tests
+  `codetracerBoundaryShimPlugin`. Where the bootstrap goes (`bootstrapPosition`,
+  `src/placement.ts`) is found with the HTML tokenizer in `src/html-scan.ts`,
+  never a text search (a `<head>` in a comment or a script is not the head);
+  the replay runner's gates use the same scanner, so record and replay agree
+  on positions (`tests/boundary/bootstrap-placement.test.ts`). It follows an
+  encoding declaration that begins the head, which must stay in the first
+  1024 bytes for the encoding prescan. Its browser tests
   (`tests/boundary/record-shim.test.ts`) run real headless Chromium, which the
   dev shell provides (`PLAYWRIGHT_CORE_PATH`, `PLAYWRIGHT_BROWSERS_PATH`).
 * `packages/boundary-conformance` — the conformance suite of the

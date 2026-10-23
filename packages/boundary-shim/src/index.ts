@@ -16,7 +16,7 @@ import * as path from "node:path";
 
 import { sortedFilesUnder } from "@codetracer/instrumenter";
 
-import { BOOTSTRAP_ELEMENT_SOURCE } from "./bundle-manifest.js";
+import { bootstrapPosition, withoutBootstraps } from "./placement.js";
 
 import {
   BOOTSTRAP_MARKER,
@@ -128,30 +128,30 @@ export function bootstrapScript(
   return `<script ${BOOTSTRAP_MARKER}>${body}</script>`;
 }
 
-const EXISTING = new RegExp(BOOTSTRAP_ELEMENT_SOURCE);
+/**
+ * Where the bootstrap goes and where an earlier one is, found with the HTML
+ * tokenizer (`./placement.ts`); the replay runner places its stand-in for
+ * the bootstrap with the same function.
+ */
+export { bootstrapPosition, bootstrapRanges } from "./placement.js";
 
 /**
- * Where {@link injectBoundaryShim} puts the bootstrap in `html` (a page
- * without one): right after `<head …>`; without one right after
- * `<html …>`; without that after a leading doctype, or at the very start.
- * The replay runner puts a stand-in for the bootstrap at the same position,
- * so that the replayed document is built as the recorded one was.
+ * The page cannot get the bootstrap without being changed otherwise: the
+ * injector refuses, naming the page, rather than write a page that would
+ * not be recorded or would not be the page.
  */
-export function bootstrapPosition(html: string): number {
-  const head = /<head(\s[^>]*)?>/i.exec(html);
-  if (head !== null) return head.index + head[0].length;
-  const root = /<html(\s[^>]*)?>/i.exec(html);
-  if (root !== null) return root.index + root[0].length;
-  const doctype = /^\s*<!doctype[^>]*>/i.exec(html);
-  return doctype === null ? 0 : doctype[0].length;
+export class BoundaryShimInjectionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BoundaryShimInjectionError";
+  }
 }
 
 /**
- * Insert the bootstrap as the first element of `<head>` (creating no
- * `<head>`: without one it goes right after `<html …>`, and without that at
- * the very start, which the HTML parser places in the implied head; see
- * {@link bootstrapPosition}). An existing bootstrap is replaced, so injecting
- * twice leaves one.
+ * Insert the bootstrap as the first element of the page's head, before any
+ * script of the page (creating no `<head>`: without one it goes where the
+ * tree builder implies the head; see {@link bootstrapPosition}). An
+ * existing bootstrap is replaced, so injecting twice leaves one.
  */
 export function injectBoundaryShim(
   html: string,
@@ -159,7 +159,7 @@ export function injectBoundaryShim(
   options: InjectOptions = {},
 ): string {
   const tag = bootstrapScript(config, options);
-  const without = html.replace(EXISTING, "");
+  const without = withoutBootstraps(html);
   const at = bootstrapPosition(without);
   return without.slice(0, at) + tag + without.slice(at);
 }
@@ -176,23 +176,45 @@ export function htmlFilesUnder(root: string): string[] {
   );
 }
 
-/** Inject the bootstrap into each file, in place. Returns the files changed. */
+/**
+ * The text of the page `file`, which must be UTF-8: the bootstrap is UTF-8,
+ * and a page in another encoding (UTF-16 with its byte order mark, or bytes
+ * that are not UTF-8) would be written back with every byte that is not
+ * UTF-8 replaced. A leading UTF-8 byte order mark is kept.
+ */
+function readUtf8Page(file: string): string {
+  const bytes = fs.readFileSync(file);
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+      bytes,
+    );
+  } catch {
+    throw new BoundaryShimInjectionError(
+      `${file}: the page is not UTF-8, so the boundary-shim bootstrap ` +
+        "cannot be inserted without changing the rest of it",
+    );
+  }
+}
+
+/**
+ * Inject the bootstrap into each file, in place. Returns the files changed.
+ * Throws {@link BoundaryShimInjectionError} for a page it cannot install the
+ * shim in, before it writes any file.
+ */
 export function injectBoundaryShimIntoFiles(
   files: readonly string[],
   config: ShimConfig = {},
   options: InjectOptions = {},
 ): string[] {
   const bundleSource = options.bundleSource ?? boundaryShimBundle();
-  const changed: string[] = [];
+  const writes: [string, string][] = [];
   for (const f of files) {
-    const before = fs.readFileSync(f, "utf-8");
+    const before = readUtf8Page(f);
     const after = injectBoundaryShim(before, config, { bundleSource });
-    if (after !== before) {
-      fs.writeFileSync(f, after);
-      changed.push(f);
-    }
+    if (after !== before) writes.push([f, after]);
   }
-  return changed;
+  for (const [f, after] of writes) fs.writeFileSync(f, after, "utf-8");
+  return writes.map(([f]) => f);
 }
 
 export {

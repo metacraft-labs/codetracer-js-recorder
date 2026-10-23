@@ -22,9 +22,11 @@
  * `ruby` and `object`, and an unquoted attribute value holding a quote.
  *
  * At protocol level 0 the recorded document carried the record bootstrap
- * at the start of its head, so the reference is the document with a
- * bootstrap there (left out of the comparison: `dom-v1` leaves scripts out
- * too), and the gated one has the runner's stand-in for it.
+ * at the start of its head (`bootstrapPosition`), so the reference is the
+ * document with a bootstrap there (left out of the comparison: `dom-v1`
+ * leaves scripts out too), and the gated one has the runner's stand-in for
+ * it. That reference is also the page's own tree: the bootstrap goes where
+ * the tree builder makes the head, and changes nothing else.
  *
  * And a gate the page refuses (a Content-Security-Policy without
  * 'unsafe-inline', a Trusted Types policy that refuses `document.write`)
@@ -39,8 +41,9 @@
  *
  * Negative controls: a gate put where `insertGates` refuses to (before a
  * `<col>`; after a doctype, before the head exists) gives a different
- * tree, so the comparison discriminates; and so does a level-0 document
- * replayed without the stand-in.
+ * tree, so the comparison discriminates; and so does the bootstrap where
+ * the injector put it before it used the tokenizer (after `<html>` or a
+ * doctype, before whitespace the modes before the head drop).
  */
 
 import * as fs from "node:fs";
@@ -70,6 +73,7 @@ import {
   PARSER_GATE,
   parserScriptUrls,
 } from "../../packages/boundary-replay/src/gates.js";
+import { documentTree } from "./harness.js";
 
 const TIMEOUT = 120_000;
 
@@ -159,6 +163,15 @@ t</textarea>`,
 <span>x</span></div>`,
   "ruby and object": `<ruby>a<rb>b</rb> <rt>c</rt> <rp>(</rp></ruby>
 <object><param name=a value=b> <embed src=x></object>`,
+  // Tags that are not tags (a `<head>` in an attribute value and in a
+  // comment), a byte order mark and upper-case names: the bootstrap goes
+  // after the real `<head>`.
+  "head in a comment and an attribute": `<!doctype html><html data-x="<head>"><!-- <head> -->
+<head data-y="a>b"><title>t</title></head><body><p>x</p></body></html>`,
+  "byte order mark and upper case": `\uFEFF<!DOCTYPE HTML>
+<HTML>
+<!-- c -->
+<BODY><P>x</BODY>`,
   // An unquoted value holding a quote: the quote starts no quoted value, so
   // the `>` in the title below is in a quoted value, not a tag's end.
   "unquoted value with a quote": `<img alt=it's><span title='a >
@@ -210,33 +223,7 @@ async function treeOf(html: string): Promise<string[]> {
     });
     const page = await context.newPage();
     await page.goto("http://gates.test/", { waitUntil: "load" });
-    return await page.evaluate(() => {
-      const out: string[] = [];
-      const walk = (n: Node, depth: number): void => {
-        const pad = " ".repeat(depth);
-        if (n.nodeType === Node.ELEMENT_NODE) {
-          const e = n as Element;
-          if (e.hasAttribute("data-codetracer-boundary-shim")) return;
-          const attrs = Array.from(e.attributes)
-            .map((a) => `${a.name}=${JSON.stringify(a.value)}`)
-            .join(" ");
-          out.push(`${pad}<${e.namespaceURI} ${e.localName} ${attrs}>`);
-          const kids =
-            e.localName === "template"
-              ? (e as HTMLTemplateElement).content.childNodes
-              : e.childNodes;
-          for (const c of Array.from(kids)) walk(c, depth + 1);
-        } else if (n.nodeType === Node.TEXT_NODE) {
-          out.push(`${pad}#text ${JSON.stringify(n.nodeValue)}`);
-        } else if (n.nodeType === Node.COMMENT_NODE) {
-          out.push(`${pad}#comment ${JSON.stringify(n.nodeValue)}`);
-        } else {
-          out.push(`${pad}#${n.nodeType}`);
-        }
-      };
-      for (const c of Array.from(document.childNodes)) walk(c, 0);
-      return out;
-    });
+    return await documentTree(page);
   } finally {
     await context.close();
   }
@@ -299,13 +286,7 @@ describe("the replay runner's document gates", () => {
     async () => {
       const options = { parser: true, domContentLoaded: true, load: true };
       const bootstrap = `<script ${BOOTSTRAP_MARKER}></script>`;
-      let differs = 0;
       for (const [name, html] of Object.entries(DOCUMENTS)) {
-        // Not this one: its only `<head>` tag is a stray one in the body,
-        // where the bootstrap went on record and split a text node the
-        // stand-in, which takes itself out, cannot split (a checkpoint
-        // there diverges, typed).
-        if (name === "stray tags") continue;
         const at = bootstrapPosition(html);
         // The recorded document: the bootstrap at the start of its head.
         const recorded = html.slice(0, at) + bootstrap + html.slice(at);
@@ -323,16 +304,40 @@ describe("the replay runner's document gates", () => {
         expect(await treeOf(standIn.html), name).toEqual(
           await treeOf(recorded),
         );
+        // The bootstrap went where the tree builder makes the head, so the
+        // recorded document is the page's own but for the bootstrap.
+        expect(await treeOf(recorded), name).toEqual(await treeOf(html));
+      }
+      // Negative control: the bootstrap where the injector put it before it
+      // used the tokenizer (after `<html>`, or after a leading doctype,
+      // when the page has no `<head>` tag) implies the head before the
+      // whitespace the modes before the head drop, which then becomes a
+      // text node of the head: a different tree, so the comparison
+      // discriminates.
+      let differs = 0;
+      for (const name of [
+        "implied head after a doctype",
+        "implied head after html",
+        "implied head and body after html",
+      ]) {
+        const html = DOCUMENTS[name];
+        const root = /<html(\s[^>]*)?>/i.exec(html);
+        const doctype = /^\s*<!doctype[^>]*>/i.exec(html);
+        const legacy =
+          root !== null
+            ? root.index + root[0].length
+            : doctype === null
+              ? 0
+              : doctype[0].length;
+        const recorded = html.slice(0, legacy) + bootstrap + html.slice(legacy);
         if (
-          JSON.stringify(await treeOf(html)) !==
-          JSON.stringify(await treeOf(recorded))
+          JSON.stringify(await treeOf(recorded)) !==
+          JSON.stringify(await treeOf(html))
         ) {
           differs++;
         }
       }
-      // Negative control: the documents where the bootstrap implied the
-      // head early, replayed without a stand-in, are not the recorded ones.
-      expect(differs).toBeGreaterThanOrEqual(3);
+      expect(differs).toBe(3);
     },
     TIMEOUT,
   );

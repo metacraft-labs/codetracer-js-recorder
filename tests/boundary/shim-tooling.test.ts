@@ -20,6 +20,7 @@ import {
   SHIM_VERSION,
   bootstrapScript,
   injectBoundaryShim,
+  stripBoundaryShim,
 } from "../../packages/boundary-shim/src/index.js";
 import { sha256Hex } from "../../packages/boundary-shim/src/browser/sha256.js";
 import { codetracerBoundaryShimPlugin } from "../../packages/vite-plugin/src/index.js";
@@ -51,7 +52,8 @@ describe("@codetracer/boundary-shim tooling", () => {
     );
     expect(injectBoundaryShim(once, {}, { bundleSource: BUNDLE })).toBe(once);
     expect(once.split(BOOTSTRAP_MARKER).length).toBe(2);
-    // Without <head>: after <html …>; without that: after the doctype.
+    // Without <head>: where the tree builder implies the head (before the
+    // first start tag but <html>, here <body> and <p>).
     expect(
       injectBoundaryShim(
         "<html><body></body></html>",
@@ -70,6 +72,91 @@ describe("@codetracer/boundary-shim tooling", () => {
     expect(
       injectBoundaryShim("<header></header>", {}, { bundleSource: BUNDLE }),
     ).toBe(`${TAG}<header></header>`);
+  });
+
+  it("keeps the page's encoding declaration ahead of the bootstrap", () => {
+    const at = (html: string, expected: string) =>
+      expect(injectBoundaryShim(html, {}, { bundleSource: BUNDLE }), html).toBe(
+        expected.replace("|", TAG),
+      );
+    // The declaration begins the head, after whitespace, a comment and
+    // inert `<meta>` elements: the bootstrap follows it.
+    at(
+      '<head>\n <!-- c -->\n <meta name="viewport" content="w"><META CHARSET=utf-8/>\n<script></script>',
+      '<head>\n <!-- c -->\n <meta name="viewport" content="w"><META CHARSET=utf-8/>|\n<script></script>',
+    );
+    // The `http-equiv` form, in a head the `<meta>` implies.
+    at(
+      '<!doctype html><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><p>x',
+      '<!doctype html><meta http-equiv="Content-Type" content="text/html; charset=utf-8">|<p>x',
+    );
+    // Inert `<meta>` elements with no declaration after them: the bootstrap
+    // stays first (implying the head before them when there is no tag).
+    at("<meta name=a><script></script>", "|<meta name=a><script></script>");
+    at("<head><meta name=a>x", "<head>|<meta name=a>x");
+    // Not a declaration that begins the head: a Content-Security-Policy
+    // (it would apply to the bootstrap) even with a charset, one after a
+    // title, after text, or after a `<meta http-equiv>` of another kind.
+    at(
+      '<head><meta http-equiv="content-security-policy" charset=utf-8 content="x">',
+      '<head>|<meta http-equiv="content-security-policy" charset=utf-8 content="x">',
+    );
+    at(
+      "<head><title>t</title><meta charset=utf-8>",
+      "<head>|<title>t</title><meta charset=utf-8>",
+    );
+    at("<head>x<meta charset=utf-8>", "<head>|x<meta charset=utf-8>");
+    at(
+      "<head><meta http-equiv=refresh content=5><meta charset=utf-8>",
+      "<head>|<meta http-equiv=refresh content=5><meta charset=utf-8>",
+    );
+    // A declaration's attribute value holding `>` and a duplicate
+    // `http-equiv` (the tokenizer keeps the first).
+    at(
+      '<head><meta content="a>b" http-equiv=Content-Type http-equiv=refresh>',
+      '<head><meta content="a>b" http-equiv=Content-Type http-equiv=refresh>|',
+    );
+  });
+
+  it("reads `</` as the tokenizer does", () => {
+    // `</>` emits nothing, `</ x>` is a bogus comment, neither makes the
+    // head: the page's `<head>` is still the first start tag.
+    for (const lead of ["</>", "</ x>", "</1>"]) {
+      expect(
+        injectBoundaryShim(
+          `${lead}<head><script></script>`,
+          {},
+          {
+            bundleSource: BUNDLE,
+          },
+        ),
+      ).toBe(`${lead}<head>${TAG}<script></script>`);
+    }
+    // `</` at the end of the document is text.
+    expect(injectBoundaryShim("<html></", {}, { bundleSource: BUNDLE })).toBe(
+      `<html>${TAG}</`,
+    );
+  });
+
+  it("replaces and strips only a bootstrap the tokenizer sees as an element", () => {
+    // Text that looks like a bootstrap, in a comment and in a script's text,
+    // is the page's: injection keeps it, and stripping keeps it.
+    const decoy = `<script ${BOOTSTRAP_MARKER}>decoy</script>`;
+    const page =
+      `<!doctype html><!-- ${decoy} --><head>` +
+      `<script>var s = '${decoy.replace("</", "<\\/")}';</script>` +
+      `</head><body></body>`;
+    const once = injectBoundaryShim(page, {}, { bundleSource: BUNDLE });
+    expect(once).toBe(page.replace("<head>", `<head>${TAG}`));
+    expect(injectBoundaryShim(once, {}, { bundleSource: BUNDLE })).toBe(once);
+    expect(stripBoundaryShim(Buffer.from(once)).toString()).toBe(page);
+    // A byte order mark and bytes that are not ASCII survive the latin1 view.
+    const bom = `\uFEFF<!DOCTYPE html><HEAD></HEAD><p>é</p>`;
+    const injected = Buffer.from(
+      injectBoundaryShim(bom, {}, { bundleSource: BUNDLE }),
+    );
+    expect(injected.toString()).toBe(bom.replace("<HEAD>", `<HEAD>${TAG}`));
+    expect(stripBoundaryShim(injected).toString()).toBe(bom);
   });
 
   it("cannot be closed early by the bundle or the configuration", () => {

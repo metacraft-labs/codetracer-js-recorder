@@ -25,7 +25,7 @@ import * as path from "node:path";
 
 import { compareUtf8, sortedFilesUnder } from "@codetracer/instrumenter";
 
-import { BOOTSTRAP_MARKER } from "./browser/config.js";
+import { withoutBootstraps } from "./placement.js";
 
 /** The manifest's file name. */
 export const BUNDLE_MANIFEST_FILE = "ct-bundle.json";
@@ -80,25 +80,18 @@ function isHtml(relativePath: string): boolean {
 }
 
 /**
- * The source of a pattern matching one bootstrap element as
- * `bootstrapScript` writes it (its body never holds `</script`, which it
- * escapes). Shared by injection, which replaces an earlier bootstrap, and
- * by {@link stripBoundaryShim}.
- */
-export const BOOTSTRAP_ELEMENT_SOURCE = `<script ${BOOTSTRAP_MARKER}>[\\s\\S]*?</script>`;
-
-const BOOTSTRAP = new RegExp(BOOTSTRAP_ELEMENT_SOURCE, "g");
-
-/**
  * The HTML bytes without the boundary-shim bootstrap element(s): exactly
  * the bytes `injectBoundaryShim` inserted are removed, so for any page
- * `stripBoundaryShim(inject(page))` is `page`. Works on bytes (through a
- * byte-preserving latin1 view, the marker being ASCII), so the rest of a
- * file is never re-encoded.
+ * `stripBoundaryShim(inject(page))` is `page`. The elements are found with
+ * the HTML tokenizer, as injection finds the one it replaces
+ * (`bootstrapRanges`): text in a comment or a script that only looks like a
+ * bootstrap is the page's. Works on bytes (through a byte-preserving latin1
+ * view: everything the tokenizer acts on is ASCII), so the rest of a file is
+ * never re-encoded.
  */
 export function stripBoundaryShim(html: Buffer): Buffer {
   const text = html.toString("latin1");
-  const stripped = text.replace(BOOTSTRAP, "");
+  const stripped = withoutBootstraps(text);
   return stripped === text ? html : Buffer.from(stripped, "latin1");
 }
 

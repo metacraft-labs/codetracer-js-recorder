@@ -59,7 +59,14 @@ export function boundaryShimCommand(args: string[]): void {
   const sorted = [...files].sort();
   if (sorted.length === 0) fail("no .html files found.");
 
-  const changed = injectBoundaryShimIntoFiles(sorted, { buildHash });
+  let changed: string[];
+  try {
+    changed = injectBoundaryShimIntoFiles(sorted, { buildHash });
+  } catch (e) {
+    // A page the shim cannot be installed in (BoundaryShimInjectionError,
+    // naming the page) or one that cannot be read: no file was written.
+    fail((e as Error).message);
+  }
   for (const f of sorted) {
     console.log(`${changed.includes(f) ? "injected" : "unchanged"}: ${f}`);
   }

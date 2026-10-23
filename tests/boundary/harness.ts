@@ -463,3 +463,45 @@ function serveFile(
   if (delay > 0) setTimeout(send, delay);
   else send();
 }
+
+// ── The document's tree ─────────────────────────────────────────────────
+
+/**
+ * The page's document, node by node in document order (text nodes one by
+ * one, so two adjacent text nodes are not one, `<template>` contents
+ * included), with every element's namespace, name and attributes. The
+ * record bootstrap's element is left out, so a page with the shim installed
+ * compares equal to the page without it when the bootstrap changed nothing
+ * else.
+ */
+export async function documentTree(page: {
+  evaluate<T>(fn: () => T): Promise<T>;
+}): Promise<string[]> {
+  return page.evaluate(() => {
+    const out: string[] = [];
+    const walk = (n: Node, depth: number): void => {
+      const pad = " ".repeat(depth);
+      if (n.nodeType === Node.ELEMENT_NODE) {
+        const e = n as Element;
+        if (e.hasAttribute("data-codetracer-boundary-shim")) return;
+        const attrs = Array.from(e.attributes)
+          .map((a) => `${a.name}=${JSON.stringify(a.value)}`)
+          .join(" ");
+        out.push(`${pad}<${e.namespaceURI} ${e.localName} ${attrs}>`);
+        const kids =
+          e.localName === "template"
+            ? (e as HTMLTemplateElement).content.childNodes
+            : e.childNodes;
+        for (const c of Array.from(kids)) walk(c, depth + 1);
+      } else if (n.nodeType === Node.TEXT_NODE) {
+        out.push(`${pad}#text ${JSON.stringify(n.nodeValue)}`);
+      } else if (n.nodeType === Node.COMMENT_NODE) {
+        out.push(`${pad}#comment ${JSON.stringify(n.nodeValue)}`);
+      } else {
+        out.push(`${pad}#${n.nodeType}`);
+      }
+    };
+    for (const c of Array.from(document.childNodes)) walk(c, 0);
+    return out;
+  });
+}
