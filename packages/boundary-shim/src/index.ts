@@ -38,6 +38,34 @@ export {
 export { RECORDER_FAULT } from "./browser/recorder.js";
 export { UNRECORDABLE_TIMER_HANDLER } from "./browser/seams-time.js";
 export { SHAPE_READ } from "./browser/seams-storage.js";
+export {
+  DIVERGENCE_KINDS,
+  REPLAY_CONFIG_GLOBAL,
+  REPLAY_GLOBAL,
+} from "./browser/replay-api.js";
+export type {
+  CheckedFields,
+  CtReplay,
+  DivergenceKind,
+  DivergenceReport,
+  RecordView,
+  ReplayConfig,
+  ReplayHooks,
+} from "./browser/replay-api.js";
+export type { ShimReplayControl } from "./browser/replay/install.js";
+// The document's own loading (JS-Boundary-Recording.md §6, "The document's own
+// tasks"): a cooperating framework's recorder writes `Loading` and `DocTask`
+// with the same implementation the shim uses.
+export {
+  DocumentProgress,
+  recordDocumentProgress,
+  REPLAY_GATE_MARKER,
+  samePosition,
+} from "./browser/document-progress.js";
+export type {
+  DocumentPosition,
+  RecorderProgress,
+} from "./browser/document-progress.js";
 
 /**
  * The path of the browser bundle, `dist/boundary-shim.iife.js`. Resolved from
@@ -50,6 +78,22 @@ export const BUNDLE_PATH = path.join(
   "dist",
   "boundary-shim.iife.js",
 );
+
+/**
+ * The path of the replay-mode bundle, `dist/boundary-shim-replay.iife.js`,
+ * which the replay runner installs after `__ctReplay` (§9.7, §10).
+ */
+export const REPLAY_BUNDLE_PATH = path.join(
+  __dirname,
+  "..",
+  "dist",
+  "boundary-shim-replay.iife.js",
+);
+
+/** The replay-mode bundle's source. Throws if the package has not been built. */
+export function boundaryShimReplayBundle(): string {
+  return fs.readFileSync(REPLAY_BUNDLE_PATH, "utf-8");
+}
 
 /** The browser bundle's source. Throws if the package has not been built. */
 export function boundaryShimBundle(): string {
@@ -87,10 +131,27 @@ export function bootstrapScript(
 const EXISTING = new RegExp(BOOTSTRAP_ELEMENT_SOURCE);
 
 /**
+ * Where {@link injectBoundaryShim} puts the bootstrap in `html` (a page
+ * without one): right after `<head …>`; without one right after
+ * `<html …>`; without that after a leading doctype, or at the very start.
+ * The replay runner puts a stand-in for the bootstrap at the same position,
+ * so that the replayed document is built as the recorded one was.
+ */
+export function bootstrapPosition(html: string): number {
+  const head = /<head(\s[^>]*)?>/i.exec(html);
+  if (head !== null) return head.index + head[0].length;
+  const root = /<html(\s[^>]*)?>/i.exec(html);
+  if (root !== null) return root.index + root[0].length;
+  const doctype = /^\s*<!doctype[^>]*>/i.exec(html);
+  return doctype === null ? 0 : doctype[0].length;
+}
+
+/**
  * Insert the bootstrap as the first element of `<head>` (creating no
  * `<head>`: without one it goes right after `<html …>`, and without that at
- * the very start, which the HTML parser places in the implied head). An
- * existing bootstrap is replaced, so injecting twice leaves one.
+ * the very start, which the HTML parser places in the implied head; see
+ * {@link bootstrapPosition}). An existing bootstrap is replaced, so injecting
+ * twice leaves one.
  */
 export function injectBoundaryShim(
   html: string,
@@ -99,18 +160,7 @@ export function injectBoundaryShim(
 ): string {
   const tag = bootstrapScript(config, options);
   const without = html.replace(EXISTING, "");
-  const head = /<head(\s[^>]*)?>/i.exec(without);
-  if (head !== null) {
-    const at = head.index + head[0].length;
-    return without.slice(0, at) + tag + without.slice(at);
-  }
-  const root = /<html(\s[^>]*)?>/i.exec(without);
-  if (root !== null) {
-    const at = root.index + root[0].length;
-    return without.slice(0, at) + tag + without.slice(at);
-  }
-  const doctype = /^\s*<!doctype[^>]*>/i.exec(without);
-  const at = doctype === null ? 0 : doctype[0].length;
+  const at = bootstrapPosition(without);
   return without.slice(0, at) + tag + without.slice(at);
 }
 

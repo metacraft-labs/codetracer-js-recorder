@@ -63,14 +63,14 @@ export function patchNetSeams(ctx: SeamContext): void {
 }
 
 /** A method normalised as the Fetch standard normalises it. */
-function normaliseMethod(m: unknown): string {
+export function normaliseMethod(m: unknown): string {
   const s = m === undefined || m === null ? "GET" : String(m);
   const upper = s.toUpperCase();
   return STANDARD_METHODS.includes(upper) ? upper : s;
 }
 
 /** `url` resolved against the document, as the request will be made. */
-function absoluteUrl(w: SeamContext["w"], url: unknown): string {
+export function absoluteUrl(w: SeamContext["w"], url: unknown): string {
   try {
     return new URL(String(url), w.document.baseURI).href;
   } catch {
@@ -83,7 +83,7 @@ function absoluteUrl(w: SeamContext["w"], url: unknown): string {
  * `""` when there is none. Returns `null` for a body whose bytes cannot be
  * read synchronously.
  */
-function bodyDigest(body: unknown): string | null {
+export function bodyDigest(body: unknown): string | null {
   if (body === undefined || body === null) return "";
   if (typeof body === "string") return sha256Hex(body);
   if (body instanceof URLSearchParams) return sha256Hex(body.toString());
@@ -93,7 +93,7 @@ function bodyDigest(body: unknown): string | null {
   return null;
 }
 
-function typeName(v: unknown): string {
+export function typeName(v: unknown): string {
   const ctor = (v as { constructor?: { name?: string } })?.constructor?.name;
   return typeof ctor === "string" ? ctor : typeof v;
 }
@@ -805,7 +805,7 @@ function patchBeacon(ctx: SeamContext): void {
 }
 
 /** The bytes of a message's data, or `null` when they cannot be read now. */
-function messageBytes(data: unknown): Uint8Array | null {
+export function messageBytes(data: unknown): Uint8Array | null {
   if (typeof data === "string") return utf8Bytes(data);
   if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
     return copyBytes(data as ArrayBuffer | ArrayBufferView);

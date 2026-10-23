@@ -18,10 +18,8 @@ import { fileURLToPath } from "node:url";
 
 const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-await esbuild.build({
+const common = {
   absWorkingDir: pkgDir,
-  entryPoints: ["src/browser/entry.ts"],
-  outfile: "dist/boundary-shim.iife.js",
   bundle: true,
   format: "iife",
   platform: "browser",
@@ -34,4 +32,19 @@ await esbuild.build({
   legalComments: "none",
   charset: "utf8",
   logLevel: "warning",
+};
+
+await esbuild.build({
+  ...common,
+  entryPoints: ["src/browser/entry.ts"],
+  outfile: "dist/boundary-shim.iife.js",
+});
+
+// The replay mode (src/browser/replay/), which the replay runner installs
+// with addInitScript. A separate file, so the bundle every recorded page
+// inlines carries no replay code.
+await esbuild.build({
+  ...common,
+  entryPoints: ["src/browser/replay-entry.ts"],
+  outfile: "dist/boundary-shim-replay.iife.js",
 });

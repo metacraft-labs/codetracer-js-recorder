@@ -231,9 +231,43 @@ export function patchStorage(ctx: SeamContext): void {
     );
   }
 
-  // A storage event names its area by the real object; the page compares
-  // it with the proxy it knows. A page that constructs one passes the
-  // proxy, which the platform's conversion would refuse.
+  patchStorageEvents(ctx, areaOf, wrap, unwrap);
+
+  const cookie = orig.cookie;
+  if (cookie !== undefined) {
+    const get = cookie.descriptor.get!;
+    const set = cookie.descriptor.set;
+    replaceAccessor(
+      cookie.owner,
+      "cookie",
+      function (this: unknown) {
+        const v = get.call(this) as string;
+        log(Area.cookie, "", 1, v);
+        return v;
+      },
+      set === undefined
+        ? undefined
+        : function (this: unknown, v: unknown) {
+            set.call(this, v);
+          },
+    );
+  }
+}
+
+/**
+ * A storage event names its area by the real object, which the page
+ * compares with the proxy it knows; a page that constructs one passes the
+ * proxy, which the platform's conversion would refuse. Shared by record and
+ * replay mode (`replay/dom.ts`), whose storage proxies are different but
+ * stand in for the real objects the same way.
+ */
+export function patchStorageEvents(
+  ctx: Pick<SeamContext, "w" | "orig">,
+  areaOf: Map<Storage, number>,
+  wrap: (real: Storage, area: number) => Storage,
+  unwrap: (s: unknown) => unknown,
+): void {
+  const { w, orig } = ctx;
   const area = orig.storageEventArea;
   if (area !== undefined) {
     const get = area.descriptor.get!;
@@ -287,25 +321,5 @@ export function patchStorage(ctx: SeamContext): void {
         },
       );
     }
-  }
-
-  const cookie = orig.cookie;
-  if (cookie !== undefined) {
-    const get = cookie.descriptor.get!;
-    const set = cookie.descriptor.set;
-    replaceAccessor(
-      cookie.owner,
-      "cookie",
-      function (this: unknown) {
-        const v = get.call(this) as string;
-        log(Area.cookie, "", 1, v);
-        return v;
-      },
-      set === undefined
-        ? undefined
-        : function (this: unknown, v: unknown) {
-            set.call(this, v);
-          },
-    );
   }
 }
