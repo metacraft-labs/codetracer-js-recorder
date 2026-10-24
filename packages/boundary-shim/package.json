@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "@codetracer/boundary-format": "*",
-    "@codetracer/instrumenter": "*"
+    "@codetracer/instrumenter": "*",
+    "@codetracer/runtime-browser": "*"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

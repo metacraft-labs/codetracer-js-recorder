@@ -896,3 +896,10 @@ export function installBrowserRuntime(
   (globalThis as { __ct?: CtBrowserRuntime }).__ct = runtime;
   return runtime;
 }
+
+// ── Boundary recording's batched upload transport ───────────────────────
+//
+// `HttpBatchTransport` (CodeTracer's JS-Boundary-Recording specification
+// §11.1) lives in its own module so the boundary shim's bundle can import it
+// without the `__ct` runtime above (`@codetracer/runtime-browser/dist/batch-transport.js`).
+export * from "./batch-transport.js";

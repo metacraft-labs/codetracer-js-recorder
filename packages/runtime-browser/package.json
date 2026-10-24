@@ -3,11 +3,14 @@
   "version": "0.1.0",
   "license": "Apache-2.0",
   "private": true,
-  "description": "Browser-side CodeTracer runtime (__ct) — batched WebSocket producer streaming newline-delimited JSON events to the M26 daemon receiver",
+  "description": "Browser-side CodeTracer runtime (__ct) — batched WebSocket producer streaming newline-delimited JSON events to the M26 daemon receiver — and HttpBatchTransport, the batched upload transport of boundary recording",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc"
+  },
+  "dependencies": {
+    "@codetracer/boundary-format": "*"
   },
   "devDependencies": {
     "typescript": "^5.7.0"
