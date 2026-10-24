@@ -75,12 +75,30 @@ This is a monorepo managed with npm workspaces:
   1024 bytes for the encoding prescan. Its browser tests
   (`tests/boundary/record-shim.test.ts`) run real headless Chromium, which the
   dev shell provides (`PLAYWRIGHT_CORE_PATH`, `PLAYWRIGHT_BROWSERS_PATH`).
+* `packages/runtime-browser/src/batch-transport.ts` — `HttpBatchTransport`,
+  the batched upload transport of boundary recording: a capped ring with
+  drop accounting, batches of at most 256 records or 50 ms with the
+  Boundary-Ingest envelope (`encodeBatch` from `packages/boundary-format`,
+  never a second codec), `sendBeacon` at `pagehide`/hidden, and the consent
+  gates (DNT, GPC, the page's consent callback, the ingest's `config`). The
+  shim uses it when installed with `boundary-shim --ingest <url>` and imports
+  it by its subpath (`@codetracer/runtime-browser/dist/batch-transport.js`)
+  so the shim bundle carries no `__ct` runtime; cooperating frameworks can
+  use it the same way. Every platform function it calls is a captured
+  original, or its timers and requests would be recorded as the page's.
+  Without `--ingest` the shim keeps its log in the page (`log()`), which is
+  what the replay and shim tests read. Pinned by
+  `tests/boundary/transport.test.ts` against a local stub ingest
+  (`tests/boundary/stub-ingest.ts`, the one allowed mock until the real
+  ingest exists).
 * `packages/boundary-conformance` — the conformance suite of the
   boundary-recording cooperation protocol, the definition of "a framework
   implements the protocol": the fixture scenarios (`src/fixtures.ts`), the
   record-leg harness `ct-boundary-conformance record --build <dir> --level
   <0|1>` (a real server and headless Chromium; the checks in
-  `src/checks.ts`), the suite's generic build for the shim at level 0, and a
+  `src/checks.ts`), the suite's generic build for the shim at level 0 (installed with
+  `--ingest /ct-conformance`: at both levels the log is the batches the
+  harness's server received), and a
   **test-only** reference micro-framework at level 1 (`src/reference/`, with
   seeded defects) that proves the harness discriminates. It is a public
   contract other repositories run against their own builds, so the fixture
