@@ -7,13 +7,16 @@
  *
  * How the log leaves the page depends on the level:
  *
- * - **level 0**, the generic shim: through its control surface,
- *   `__ctBoundaryShim.stop()` then `log()` (the shim keeps its log in the
- *   page until it has a batch transport);
+ * - **level 0**, the generic shim, installed with `--ingest
+ *   /ct-conformance`: `await __ctBoundaryShim.stop()`, after which its
+ *   `HttpBatchTransport` has uploaded every batch to the harness's batch
+ *   route, the last one `final`;
  * - **level 1**, a cooperating framework: `await
  *   __ctBoundaryProtocol.record.stop()`, after which the framework has
- *   uploaded every batch to the harness's batch route, the last one
- *   `final`; the harness joins them.
+ *   uploaded every batch the same way.
+ *
+ * At both levels the harness joins the batches its server received, in
+ * arrival order, as the assembler does.
  *
  * At level 1 every fixture is also recorded on its perturbed page, for the
  * `targets` check. Nothing here is a mock: a real server, a real browser,
@@ -233,25 +236,23 @@ async function recordPage(
       recording.declaration = await page.evaluate(snapshotDeclaration);
     try {
       if (level === 0) {
-        recording.log = Uint8Array.from(
-          await within(page.evaluate(stopShim), ms, "the shim did not stop"),
-        );
+        await within(page.evaluate(stopShim), ms, "the shim did not stop");
       } else {
         await within(
           page.evaluate(stopFramework),
           ms,
           "record.stop() did not resolve",
         );
-        await within(server.finalBatch, ms, "no final batch arrived").catch(
-          () => undefined,
-        );
-        recording.batches = server.batches.slice();
-        recording.envelope = checkBatches(recording.batches);
-        recording.log = recording.envelope.log;
       }
+      await within(server.finalBatch, ms, "no final batch arrived").catch(
+        () => undefined,
+      );
+      recording.batches = server.batches.slice();
+      recording.envelope = checkBatches(recording.batches);
+      recording.log = recording.envelope.log;
     } catch (e) {
       recording.collectError = (e as Error).message;
-      if (level === 1 && server.batches.length > 0) {
+      if (server.batches.length > 0) {
         recording.batches = server.batches.slice();
         recording.envelope = checkBatches(recording.batches);
       }
@@ -347,13 +348,19 @@ function snapshotDeclaration(): DeclarationSnapshot {
   };
 }
 
-function stopShim(): number[] {
+async function stopShim(): Promise<void> {
   const shim = (globalThis as unknown as Record<string, unknown>)
-    .__ctBoundaryShim as { stop(): void; log(): Uint8Array } | undefined;
+    .__ctBoundaryShim as
+    | { stop(): Promise<void> | void; uploadStatus?(): unknown }
+    | undefined;
   if (shim === undefined)
     throw new Error("the generic shim is not installed (no __ctBoundaryShim)");
-  shim.stop();
-  return Array.from(shim.log());
+  if (shim.uploadStatus?.() === undefined) {
+    throw new Error(
+      "the generic shim does not upload: install it with --ingest /ct-conformance",
+    );
+  }
+  await shim.stop();
 }
 
 async function stopFramework(): Promise<void> {

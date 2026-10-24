@@ -54,6 +54,7 @@ import {
   buildGenericFixtures,
   buildReferenceFixtures,
   type ReferenceDefects,
+  ROUTES,
   runReplayLeg,
 } from "../../packages/boundary-conformance/src/index.js";
 import { type FixtureServer, FIXTURES, startFixtureServer } from "./harness.js";
@@ -104,8 +105,11 @@ interface Recorded {
 }
 let recorded: Recorded;
 
-/** Install the shim into `dir` by the shipped deploy route. */
-function deployShim(dir: string): void {
+/**
+ * Install the shim into `dir` by the shipped deploy route; with `ingest`,
+ * uploading there (the conformance builds upload to the harness's ingest).
+ */
+function deployShim(dir: string, ingest?: string): void {
   const hash = execFileSync(
     process.execPath,
     [RECORDER_CLI, "bundle-manifest", dir],
@@ -113,7 +117,14 @@ function deployShim(dir: string): void {
   ).trim();
   execFileSync(
     process.execPath,
-    [RECORDER_CLI, "boundary-shim", dir, "--build-hash", hash],
+    [
+      RECORDER_CLI,
+      "boundary-shim",
+      dir,
+      "--build-hash",
+      hash,
+      ...(ingest === undefined ? [] : ["--ingest", ingest]),
+    ],
     { stdio: "pipe" },
   );
 }
@@ -863,7 +874,7 @@ describe("conformance replay leg", () => {
     async () => {
       const generic = path.join(tmp("ct-conformance-generic-"), "site");
       await buildGenericFixtures(generic);
-      deployShim(generic);
+      deployShim(generic, ROUTES.ingest);
       const reference = path.join(tmp("ct-conformance-reference-"), "site");
       await buildReferenceFixtures(reference);
       const names = [

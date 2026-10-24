@@ -14,7 +14,7 @@
  * | `targets`     | 1      | every target is a stable id, `ord:`, `doc` or `win`, and the targets are the same in the perturbed page |
  * | `checkpoints` | 0, 1   | §7.3's cadence, the level's scheme, and the final checkpoint's `dom-v1` equal to the document's |
  * | `reads`       | 0, 1   | the log holds at least the fixture's declared multiset of boundary reads |
- * | `envelope`    | 1      | the uploaded batches conform to the batch envelope (`envelope.ts`) |
+ * | `envelope`    | 0, 1   | the uploaded batches conform to the batch envelope (`envelope.ts`) |
  */
 
 import {
@@ -60,11 +60,11 @@ export interface Recording {
   interactionProblems: string[];
   /** Why the log could not be collected, if it could not. */
   collectError?: string;
-  /** The log: from the shim's control surface (level 0) or the joined batches. */
+  /** The log: the uploaded batches, joined as the assembler joins them. */
   log?: Uint8Array;
-  /** The batch bodies the page uploaded, in arrival order (level 1). */
+  /** The batch bodies the page uploaded, in arrival order. */
   batches?: Uint8Array[];
-  /** The uploaded batches' check (level 1). */
+  /** The uploaded batches' check. */
   envelope?: EnvelopeResult;
   declaration?: DeclarationSnapshot;
   /** Every target string the log names, resolved in the page. */
@@ -574,11 +574,7 @@ export function runRecordChecks(run: FixtureRun): CheckResult[] {
       return {
         name,
         status: "not-applicable-at-level-0" as const,
-        detail: [
-          name === "envelope"
-            ? "the generic shim keeps its log in the page until it has a batch transport"
-            : `${name} is a level-1 property`,
-        ],
+        detail: [`${name} is a level-1 property`],
       };
     }
     let detail: string[];

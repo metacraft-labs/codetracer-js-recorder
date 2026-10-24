@@ -2,7 +2,8 @@
  * The harness's server: a real local HTTP server that serves a build's
  * files and answers the conformance routes (`ROUTES` in `protocol.ts`):
  * the fixtures' backend, the hydration gate the harness holds, and the
- * batch endpoint a level-1 build uploads to, which keeps every body in
+ * ingest a build uploads to: the recorder configuration, always
+ * `{"enabled": true}`, and the batch endpoint, which keeps every body in
  * arrival order for the `envelope` check.
  */
 
@@ -74,6 +75,14 @@ export async function startHarnessServer(root: string): Promise<HarnessServer> {
         }
         res.writeHead(202);
         res.end();
+        return;
+      }
+      if (pathname === ROUTES.config && req.method === "GET") {
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "cache-control": "no-store",
+        });
+        res.end(JSON.stringify({ enabled: true }));
         return;
       }
       if (pathname === ROUTES.items && req.method === "GET") {

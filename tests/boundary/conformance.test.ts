@@ -41,6 +41,7 @@ import {
   LEVEL_1_ONLY,
   loadPlaywright,
   RECORD_CHECKS,
+  ROUTES,
   runRecordLeg,
 } from "../../packages/boundary-conformance/src/index.js";
 
@@ -118,8 +119,12 @@ function failures(report: RecordLegReport): string[] {
   );
 }
 
-/** The generic build with the shim installed by the shipped deploy route. */
-async function genericShimBuild(): Promise<string> {
+/**
+ * The generic build with the shim installed by the shipped deploy route,
+ * uploading to the harness's ingest (`--ingest /ct-conformance`), or,
+ * with `upload` false, keeping its log in the page.
+ */
+async function genericShimBuild(upload = true): Promise<string> {
   const site = path.join(tmp("ct-conformance-generic-"), "site");
   await buildGenericFixtures(site);
   const hash = execFileSync(
@@ -129,7 +134,14 @@ async function genericShimBuild(): Promise<string> {
   ).trim();
   execFileSync(
     process.execPath,
-    [RECORDER_CLI, "boundary-shim", site, "--build-hash", hash],
+    [
+      RECORDER_CLI,
+      "boundary-shim",
+      site,
+      "--build-hash",
+      hash,
+      ...(upload ? ["--ingest", ROUTES.ingest] : []),
+    ],
     { stdio: "pipe" },
   );
   return site;
@@ -189,6 +201,56 @@ describe("the conformance suite's record leg", () => {
           );
         }
       }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "conformance_envelope_check_applies_to_generic_shim_at_level_0",
+    async () => {
+      const envelopeOf = (report: RecordLegReport) =>
+        report.fixtures.map(
+          (f) =>
+            `${f.name} ${f.checks.find((c) => c.name === "envelope")?.status}`,
+        );
+      // The shipped command, at level 0, on the generic build: envelope is
+      // a pass on every fixture, never not-applicable.
+      expect(LEVEL_1_ONLY.has("envelope")).toBe(false);
+      const { status, report, stderr } = runCli(await genericShimBuild(), 0);
+      expect(envelopeOf(report)).toEqual(FIXTURES.map((f) => `${f.name} pass`));
+      expect(status, stderr).toBe(0);
+
+      // Vacuity guard: what the check passed were batches the shim itself
+      // uploaded to the harness's batch route through its transport: a
+      // level-0 Header written by the shim, the last batch final.
+      const { runs } = await runRecordLeg({
+        build: await genericShimBuild(),
+        level: 0,
+        browser,
+      });
+      for (const run of runs) {
+        const bodies = run.recording.batches ?? [];
+        expect(bodies.length, run.fixture.name).toBeGreaterThan(0);
+        const parsed = bodies.map(parseBatch);
+        const header = parsed[0].records[0];
+        expect(header.record, run.fixture.name).toBe("Header");
+        if (header.record === "Header") {
+          expect(header.recorder_id).toMatch(/^codetracer-boundary-shim\//);
+          expect(header.protocol_level).toBe(0);
+        }
+        expect(parsed[parsed.length - 1].envelope.final).toBe(true);
+      }
+
+      // Negative control, in the same run: the same build installed
+      // without an ingest uploads nothing, and envelope fails everywhere.
+      const silent = await runRecordLeg({
+        build: await genericShimBuild(false),
+        level: 0,
+        browser,
+      });
+      expect(envelopeOf(silent.report)).toEqual(
+        FIXTURES.map((f) => `${f.name} fail`),
+      );
     },
     TIMEOUT,
   );

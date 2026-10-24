@@ -58,11 +58,19 @@ export interface ProtocolDeclaration {
 
 /**
  * The routes the harness's server answers besides the build's files. A
- * framework's build of the fixtures uses them exactly (§9.9): the batch
- * endpoint is where a level-1 build uploads, and the API routes are the
- * fixtures' backend.
+ * framework's build of the fixtures uses them exactly (§9.9): the ingest
+ * routes are where a build uploads (the generic build's shim is installed
+ * with `--ingest /ct-conformance`), and the API routes are the fixtures'
+ * backend.
  */
 export const ROUTES = {
+  /**
+   * The ingest base URL (Boundary-Ingest §3): `<ingest>/config` and
+   * `<ingest>/batches` are the two routes below.
+   */
+  ingest: "/ct-conformance",
+  /** `GET`: the recorder configuration, answered `{"enabled": true}`. */
+  config: "/ct-conformance/config",
   /** `POST`: one batch body (Boundary-Ingest §4), answered `202`. */
   batches: "/ct-conformance/batches",
   /** `GET`: the fetch-driven list's items, a JSON array. */
@@ -110,14 +118,12 @@ export type RecordCheckName = (typeof RECORD_CHECKS)[number];
 /**
  * The checks that apply only at level 1. `declaration` and `targets` are
  * level-1 properties by definition (§9.1, §9.2, §9.3). `envelope` applies
- * to whatever uploads batches, and the generic shim keeps its log in the
- * page until it has a transport (§10.4), so at level 0 it is not applicable
- * yet.
+ * at both levels: the generic shim uploads through `HttpBatchTransport`
+ * (§11.1) as a framework uploads through it or its own transport.
  */
 export const LEVEL_1_ONLY: ReadonlySet<RecordCheckName> = new Set([
   "declaration",
   "targets",
-  "envelope",
 ]);
 
 /** The checks of the replay leg, in report order (§9.9). */
