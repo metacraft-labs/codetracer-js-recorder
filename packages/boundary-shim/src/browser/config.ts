@@ -35,6 +35,23 @@ export interface ShimConfig {
    * the caller knows it. Empty otherwise.
    */
   prevSession?: string;
+  /**
+   * The ingest's base URL, absolute or relative to the page
+   * (Boundary-Ingest §3: `/api/v1/ingest/js-boundary/<site key>`). When
+   * set, the shim uploads its log through `HttpBatchTransport`
+   * (JS-Boundary-Recording.md §11.1): `GET <ingest>/config`, then batches
+   * to `POST <ingest>/batches`. When absent, the log stays in the page
+   * and leaves it only through the control surface's `log()` (§10.4).
+   */
+  ingest?: string;
+  /**
+   * The site requires consent: nothing is requested from the ingest until
+   * the page's consent callback (`__ctBoundaryShim.consent(callback)`)
+   * answers yes (§11.2). The log is kept, capped, in the page meanwhile.
+   */
+  consentRequired?: boolean;
+  /** The upload ring's cap in bytes until the ingest's configuration sets one. */
+  ringBytes?: number;
 }
 
 /** The recorder identity written to `Header.recorder_id`. */

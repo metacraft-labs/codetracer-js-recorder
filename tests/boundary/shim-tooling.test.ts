@@ -230,6 +230,26 @@ describe("@codetracer/boundary-shim tooling", () => {
     expect(r.stderr).toContain("--build-hash must be 64 lowercase hex digits");
   });
 
+  it("the CLI step refuses an ingest without a build hash, and consent without an ingest", () => {
+    const hash = "0123456789abcdef".repeat(4);
+    for (const [args, message] of [
+      [["--ingest", "/ingest"], "--ingest needs --build-hash"],
+      [["--build-hash", hash, "--ingest", ""], "--ingest needs a URL"],
+      [
+        ["--build-hash", hash, "--consent-required"],
+        "--consent-required needs --ingest",
+      ],
+    ] as const) {
+      const r = spawnSync(
+        process.execPath,
+        [CLI, "boundary-shim", ".", ...args],
+        { encoding: "utf-8" },
+      );
+      expect(r.status, args.join(" ")).toBe(1);
+      expect(r.stderr).toContain(message);
+    }
+  });
+
   it("declares the package's version as the recorder version", () => {
     const pkg = JSON.parse(
       fs.readFileSync(

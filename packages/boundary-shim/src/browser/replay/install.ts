@@ -37,6 +37,12 @@ export interface ShimReplayControl extends ReplayInjector {
   readonly recording: false;
   /** The `dom-v1` hash of the document now. */
   domV1Hash(): string;
+  /**
+   * The site's consent callback (§11.2), called at once as record mode
+   * calls it, so the page code it runs runs at the same point; its answer
+   * is not used: nothing is uploaded in replay mode.
+   */
+  consent(callback: () => unknown): void;
 }
 
 /** Install the replay-mode shim on `w`, a client of `replay`. */
@@ -62,6 +68,13 @@ export function installReplayShim(
     originals: replay.originals,
     recording: false,
     domV1Hash: () => domV1Hash(w.document),
+    consent: (callback) => {
+      try {
+        callback();
+      } catch {
+        // Record mode swallows it too (a throw is a "no").
+      }
+    },
     inject: (input, effects) => injector.inject(input, effects),
   };
   Object.defineProperty(w, CONTROL_GLOBAL, {

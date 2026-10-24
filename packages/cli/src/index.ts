@@ -43,6 +43,7 @@ if (!command || command === "--help" || command === "-h") {
   codetracer-js-recorder record <file> [-- app-args...]
   codetracer-js-recorder read-spans <trace-dir|container.ct> [--all]
   codetracer-js-recorder boundary-shim <html-file|dir>... [--build-hash <hex>]
+                         [--ingest <url> [--consent-required]]
   codetracer-js-recorder bundle-manifest <dir> [--out <file>]
 
 Commands:
@@ -76,6 +77,11 @@ Read-spans options:
 Boundary-shim options:
   --build-hash <hex>      The deployed bundle's build hash (64 lowercase hex
                           digits), written to each session's Header
+  --ingest <url>          Upload each session's log in batches to this
+                          ingest base URL (GET <url>/config, POST
+                          <url>/batches); needs --build-hash
+  --consent-required      Request nothing from the ingest until the page's
+                          consent callback answers yes
 
 Bundle-manifest options:
   --out <file>            Where to write the manifest (default:

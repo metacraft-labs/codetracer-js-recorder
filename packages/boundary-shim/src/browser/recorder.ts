@@ -5,8 +5,10 @@
  * `Refusal{feature: "recorder-fault"}` and silence (JS-Boundary-Recording.md
  * §10.1: the shim never throws into the page).
  *
- * Until a batched upload transport exists the frames are kept in memory
- * for the life of the page and read back through `log()`.
+ * The frames go to a {@link FrameSink} when one is given (the batched
+ * upload transport, `HttpBatchTransport`, §11.1), which owns them from
+ * then on; without one they are kept in memory for the life of the page
+ * and read back through `log()` (§10.4).
  */
 
 import {
@@ -64,6 +66,22 @@ export const RECORDER_FAULT = "recorder-fault";
 
 type State = "recording" | "faulted" | "ended";
 
+/**
+ * Where the frames go when they are not kept in memory: every frame, in
+ * the order written, with its record's `seq` (`undefined` for `Header`,
+ * `Env` and `End`). `HttpBatchTransport` is one.
+ */
+export interface FrameSink {
+  append(frame: Uint8Array, seq: bigint | undefined): void;
+  /**
+   * The session ended; `endFrame` is its `End`, the last frame.
+   * `unloading` when the page is going away (`pagehide`).
+   */
+  end(unloading: boolean, endFrame: Uint8Array): unknown;
+  /** The recorder stopped without an `End` (a fault): take nothing more. */
+  halt(): void;
+}
+
 export interface RecorderOptions {
   /** Computes the checkpoint's `state_hash` (the `dom-v1` scheme). */
   checkpointHash: () => string;
@@ -75,6 +93,8 @@ export interface RecorderOptions {
    * carries `dom-v1` here beside its own state hash (§7.3).
    */
   checkpointDomDigest?: () => string;
+  /** Where the frames go; absent, they are kept in memory (§10.4). */
+  sink?: FrameSink;
 }
 
 export class Recorder {
@@ -224,9 +244,10 @@ export class Recorder {
 
   /**
    * End the session: a final checkpoint (if anything was written since the
-   * last), then `End{reason}`. Nothing is written after it.
+   * last), then `End{reason}`. Nothing is written after it. `unloading`
+   * tells the sink the page is going away (`pagehide`).
    */
-  end(reason: number): void {
+  end(reason: number, unloading = false): void {
     if (this.state !== "recording") return;
     this.guard(() => {
       if (
@@ -235,13 +256,28 @@ export class Recorder {
       ) {
         this.checkpoint();
       }
-      this.push({
+      const end = {
         record: "End",
         last_seq: this.nextSeq - 1n,
         reason,
-      } as BoundaryRecord);
+      } as BoundaryRecord;
+      const sink = this.opts.sink;
+      if (sink === undefined) {
+        this.push(end);
+      } else {
+        sink.end(unloading, this.encode(end));
+      }
       this.state = "ended";
     });
+  }
+
+  /**
+   * Stop recording without writing anything more, not even `End`: the
+   * upload transport turned off (no consent, recording disabled by the
+   * ingest), so the records would go nowhere.
+   */
+  halt(): void {
+    if (this.state === "recording") this.state = "ended";
   }
 
   /**
@@ -268,6 +304,11 @@ export class Recorder {
     } finally {
       this.state = "faulted";
       this.inFault = false;
+      try {
+        this.opts.sink?.halt();
+      } catch {
+        // The sink's own failure is its own (it never throws).
+      }
     }
   }
 
@@ -312,11 +353,21 @@ export class Recorder {
   }
 
   private push(record: BoundaryRecord): void {
+    const frame = this.encode(record);
+    const sink = this.opts.sink;
+    if (sink === undefined) {
+      this.frames.push(frame);
+    } else {
+      sink.append(frame, "seq" in record ? record.seq : undefined);
+    }
+  }
+
+  private encode(record: BoundaryRecord): Uint8Array {
     if (this.faultArmed) {
       this.faultArmed = false;
       throw new Error("injected encoder fault");
     }
-    this.frames.push(encodeFrame(record));
+    return encodeFrame(record);
   }
 
   private noteClock(c: SeqFields<"Clock">): void {

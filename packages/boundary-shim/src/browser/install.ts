@@ -2,11 +2,21 @@
  * Install the generic boundary shim in record mode
  * (JS-Boundary-Recording.md §10): capture the originals, write `Header`
  * and `Env`, patch the seams of §10.1, listen for input (§10.2), and
- * publish the control surface on `globalThis.__ctBoundaryShim`.
+ * publish the control surface on `globalThis.__ctBoundaryShim`. With an
+ * ingest configured the log is uploaded through `HttpBatchTransport`
+ * (§11.1); when the browser sends Do Not Track or Global Privacy Control
+ * the shim does not install at all (§11.2).
  *
  * Must run before any of the page's own code: the bootstrap `<script>` is
  * the first element of `<head>` (see the package's `injectBoundaryShim`).
  */
+
+import {
+  type ConsentCallback,
+  HttpBatchTransport,
+  privacySignal,
+  type TransportStatus,
+} from "@codetracer/runtime-browser/dist/batch-transport.js";
 
 import { CONTROL_GLOBAL, RECORDER_NAME, type ShimConfig } from "./config.js";
 import type { SeamContext, ShimWindow } from "./context.js";
@@ -46,14 +56,27 @@ export interface ShimControl {
    * The log so far as a `jsbound.log` stream. Bodies are inlined whatever
    * their size, as in an uploaded batch (§5.2), so a log carrying a body
    * over 1024 bytes is a batch rather than an assembled `jsbound.log`.
-   * Until a batched upload transport exists, this is how the log leaves the
-   * page.
+   * Without an ingest this is how the log leaves the page; with one the
+   * frames belong to the upload transport, and this throws.
    */
   log(): Uint8Array;
-  /** The frames so far without the stream prefix: an upload batch's body. */
+  /** The frames so far without the stream prefix: an upload batch's body. Throws when uploading, as `log()`. */
   frames(): Uint8Array;
-  /** End the session: a final checkpoint, then `End{reason: explicit stop}`. */
-  stop(): void;
+  /**
+   * End the session: a final checkpoint, then `End{reason: explicit stop}`.
+   * Resolves once the final batch has been answered when uploading (or
+   * the transport is off), at once otherwise.
+   */
+  stop(): Promise<void>;
+  /**
+   * Register the site's consent callback (§11.2). It is called at once,
+   * here, and again by a replay of the page at the same point; with
+   * consent required, nothing is requested until it answers yes (a
+   * boolean, or a promise of one). Without an ingest it is only called.
+   */
+  consent(callback: ConsentCallback): void;
+  /** The upload transport's state, `undefined` without an ingest. */
+  uploadStatus(): TransportStatus | undefined;
   /** The `dom-v1` hash of the document now. */
   domV1Hash(): string;
   /** Test seam: the next frame the encoder is asked for throws. */
@@ -62,25 +85,49 @@ export interface ShimControl {
 
 /**
  * Install the shim on `w` and return its control surface. A second call
- * returns the first installation's control.
+ * returns the first installation's control. When the browser sends Do Not
+ * Track or Global Privacy Control the recorder does not start (§11.2):
+ * nothing is patched or published, and this returns `undefined`.
  */
 export function installBoundaryShim(
   w: ShimWindow,
   config: ShimConfig = {},
-): ShimControl {
+): ShimControl | undefined {
   const existing = (w as unknown as Record<string, ShimControl | undefined>)[
     CONTROL_GLOBAL
   ];
   if (existing !== undefined) return existing;
+  if (privacySignal(w.navigator) !== undefined) return undefined;
 
   const orig = captureOriginals(w);
   const doc = w.document;
+  const sessionId = newSessionId(w, orig);
+  // The transport is made before the first frame is written, with the
+  // originals captured above: its requests and timers are not the page's.
+  const late: { rec?: Recorder } = {};
+  const transport =
+    config.ingest === undefined
+      ? undefined
+      : new HttpBatchTransport({
+          ingest: config.ingest,
+          sessionId,
+          buildHash: config.buildHash ?? "",
+          consentRequired: config.consentRequired === true,
+          ringBytes: config.ringBytes,
+          originals: orig,
+          window: w,
+          // No consent, or the ingest disabled recording: stop recording,
+          // since the records could go nowhere.
+          onDisabled: () => late.rec?.halt(),
+        });
   const rec = new Recorder({
     checkpointHash: () => domV1Hash(doc),
     checkpointScheme: DOM_V1,
+    sink: transport,
   });
+  late.rec = rec;
+  if (transport?.status().state === "off") rec.halt();
 
-  const sessionId = newSessionId(w, orig);
   rec.start(
     {
       vocab: 1,
@@ -121,8 +168,18 @@ export function installBoundaryShim(
   ]) {
     rec.guard(() => patch(ctx));
   }
-  rec.guard(() => listenForPageEvents(ctx, () => rec.end(EndReason.pagehide)));
+  rec.guard(() =>
+    listenForPageEvents(ctx, () => rec.end(EndReason.pagehide, true)),
+  );
 
+  const inMemory = <T>(read: () => T): T => {
+    if (transport !== undefined) {
+      throw new Error(
+        "the boundary shim uploads its log (an ingest is configured): it is not kept in the page",
+      );
+    }
+    return read();
+  };
   const control: ShimControl = {
     protocolLevel: 0,
     sessionId,
@@ -130,9 +187,24 @@ export function installBoundaryShim(
     get recording() {
       return rec.recording;
     },
-    log: () => rec.log(),
-    frames: () => rec.frameRun(),
-    stop: () => rec.end(EndReason.stop),
+    log: () => inMemory(() => rec.log()),
+    frames: () => inMemory(() => rec.frameRun()),
+    stop: () => {
+      rec.end(EndReason.stop);
+      return transport?.end() ?? orig.Promise.resolve();
+    },
+    consent: (callback) => {
+      if (transport !== undefined) {
+        transport.consent(callback);
+        return;
+      }
+      try {
+        callback();
+      } catch {
+        // Its answer, or its failure, is nobody's business without an ingest.
+      }
+    },
+    uploadStatus: () => transport?.status(),
     domV1Hash: () => domV1Hash(doc),
     injectEncoderFault: () => rec.injectEncoderFault(),
   };
