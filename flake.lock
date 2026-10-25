@@ -20,11 +20,11 @@
     "codetracer-trace-format-nim": {
       "flake": false,
       "locked": {
-        "lastModified": 1792677281,
-        "narHash": "sha256-CLlr8SZjdQQPhHkYZp0CIAv/t1AU4JV941PPQGMOSG8=",
+        "lastModified": 1792758581,
+        "narHash": "sha256-YU4WWhgdEyxqgeFOeKZwW0VeJUmvBqV0UmBmSiOb7II=",
         "owner": "metacraft-labs",
         "repo": "codetracer-trace-format-nim",
-        "rev": "ffd0554d6d779b94403bfa0fc1bf3056e06a5946",
+        "rev": "a3f76fad6613be080d156d5135ea2adaad245aa9",
         "type": "github"
       },
       "original": {
