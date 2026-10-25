@@ -390,6 +390,16 @@ describe("replay gives a page the values it read", () => {
           "navigator.geolocation.getCurrentPosition",
         ],
         ["user-media", "media-capture", "navigator.mediaDevices.getUserMedia"],
+        [
+          "display-media",
+          "media-capture",
+          "navigator.mediaDevices.getDisplayMedia",
+        ],
+        [
+          "watch-position",
+          "geolocation",
+          "navigator.geolocation.watchPosition",
+        ],
       ];
       for (const [use, feature, detail] of cases) {
         const rs = await record(`values.html?case=refused&use=${use}`);
@@ -410,6 +420,52 @@ describe("replay gives a page the values it read", () => {
           ),
         );
       }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "the_shim_listens_for_devicechange_at_the_media_devices_before_the_page",
+    async () => {
+      // A `devicechange` reaching a listener of the page is refused by the
+      // mechanism the font set's `loading` exercises above (the
+      // `fonts-event` case: the shim's own listener at the object, added
+      // before any page code, refuses a trusted event when the page listens
+      // there). Headless Chromium never dispatches `devicechange`: measured
+      // with Playwright 1.56.1's Chromium 141, neither getUserMedia()
+      // succeeding with --use-fake-device-for-media-stream (with and without
+      // --use-fake-ui-for-media-stream) nor granting and clearing the camera
+      // and microphone permissions (context.grantPermissions,
+      // clearPermissions, CDP Browser.setPermission) fired one, and CDP has
+      // no command that changes the media devices. So this checks the part
+      // that is particular to it, that the shim listens there: the media
+      // devices object carries the shim's `devicechange` listener (and the
+      // font set its `loading` one, the control) while the page added none.
+      let listeners: { type: string }[] = [];
+      let control: { type: string }[] = [];
+      await rr.recordPage("values.html?case=lifecycle", async (page) => {
+        const p = page as unknown as {
+          context(): {
+            newCDPSession(p: unknown): Promise<{
+              send(m: string, a?: object): Promise<unknown>;
+            }>;
+          };
+        };
+        const cdp = await p.context().newCDPSession(page);
+        const of = async (expression: string) => {
+          const { result } = (await cdp.send("Runtime.evaluate", {
+            expression,
+          })) as { result: { objectId: string } };
+          const got = (await cdp.send("DOMDebugger.getEventListeners", {
+            objectId: result.objectId,
+          })) as { listeners: { type: string }[] };
+          return got.listeners;
+        };
+        listeners = await of("navigator.mediaDevices");
+        control = await of("document.fonts");
+      });
+      expect(control.map((l) => l.type)).toContain("loading");
+      expect(listeners.map((l) => l.type)).toEqual(["devicechange"]);
     },
     TIMEOUT,
   );

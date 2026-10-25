@@ -1087,6 +1087,35 @@
             },
           );
         },
+        // A screen's stream: media the log cannot carry.
+        "display-media": function () {
+          navigator.mediaDevices.getDisplayMedia({ video: true }).then(
+            function () {
+              slot("media", "stream");
+              done();
+            },
+            function (e) {
+              slot("media", e.name);
+              done();
+            },
+          );
+        },
+        // The visitor's position, watched.
+        "watch-position": function () {
+          var id = navigator.geolocation.watchPosition(
+            function () {
+              navigator.geolocation.clearWatch(id);
+              slot("geolocation", "position");
+              done();
+            },
+            function (e) {
+              navigator.geolocation.clearWatch(id);
+              slot("geolocation", e.code);
+              done();
+            },
+            { timeout: 200 },
+          );
+        },
         // An event the platform dispatches at the document's font set, which
         // the page listens for.
         "fonts-event": function () {
