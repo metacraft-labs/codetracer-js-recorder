@@ -99,6 +99,17 @@ export const FLUSH_DEADLINE_MAX_MS = 2000;
  */
 export const FLUSH_TIMER_LEAD_MS = 10;
 /**
+ * The longest timer delay Chromium runs precisely. It runs a timer of 32 ms
+ * or more on a coarse wake-up: measured with headless Chromium 141, delays
+ * of 8 to 31 ms fired within 0.2 ms of their due time and delays of 32 ms to
+ * 2 s 2 to 5 ms after it, on an idle page, while a 5 ms `setInterval` stayed
+ * on its grid. That spent half of {@link FLUSH_TIMER_LEAD_MS} before the
+ * page did anything, and a page's precise short timers ran ahead of the
+ * flush. So a flush timer longer than this is armed in two steps: a coarse
+ * one that ends this far ahead of the aim, then a precise one for the rest.
+ */
+export const PRECISE_TIMER_MAX_MS = 31;
+/**
  * The largest body sent with `keepalive` (and by `sendBeacon`): the Fetch
  * standard caps a document's in-flight keepalive bodies at 64 KiB.
  */
@@ -1324,15 +1335,19 @@ export class HttpBatchTransport {
     if (oldest === undefined) return;
     const aim = this.flushDeadlineMs - FLUSH_TIMER_LEAD_MS;
     const delay = Math.max(0, aim - (this.now() - oldest));
+    // A long wait first runs a coarse timer that ends a precise timer's
+    // length ahead of the aim, and arms the precise one from there
+    // (PRECISE_TIMER_MAX_MS): only that one sends.
+    const coarse = delay > PRECISE_TIMER_MAX_MS;
     this.flushTimer = this.orig.setTimeout.call(
       globalThis,
       () =>
         this.guard(() => {
           this.flushTimer = undefined;
-          this.pump();
+          if (!coarse) this.pump();
           this.armFlushTimer();
         }),
-      delay,
+      coarse ? delay - PRECISE_TIMER_MAX_MS : delay,
     );
   }
 

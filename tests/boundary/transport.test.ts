@@ -62,6 +62,7 @@ import {
   loadBoundaryLog,
   replaySession,
 } from "../../packages/boundary-replay/src/index.js";
+import { FLUSH_TIMER_LEAD_MS } from "../../packages/runtime-browser/src/batch-transport.js";
 import {
   copyFixtures,
   FIXTURE_BUILD_HASH,
@@ -285,6 +286,8 @@ interface Send {
   t: number;
   body: number[];
   deadline: number;
+  /** When the request settled (answered or failed), in browser time. */
+  answered?: number;
 }
 
 /**
@@ -292,19 +295,26 @@ interface Send {
  * the wrapper as the original, so every batch request of the transport
  * passes through it, and it notes the browser time, the body and the flush
  * deadline the transport reports at that moment (the deadline that governed
- * the batch: the transport adapts it only after sending).
+ * the batch: the transport adapts it only after sending), and when the
+ * request settled: its reaction is registered before the transport's, so
+ * it runs just before the transport sees the answer.
  */
 const SEND_RECORDER =
-  "(() => { const real = window.fetch; " +
+  "(() => { const real = window.fetch; const then = Promise.prototype.then; " +
   "const now = performance.now.bind(performance); " +
   "window.__ctSends = []; " +
   "window.fetch = function (input, init) { " +
+  "let e; " +
   "if (String(input).endsWith('/batches') && init && init.body) { " +
   "const shim = window.__ctBoundaryShim; " +
   "const s = shim && shim.uploadStatus ? shim.uploadStatus() : undefined; " +
-  "window.__ctSends.push({ t: now(), body: Array.from(init.body), " +
-  "deadline: s ? s.flushDeadlineMs : -1 }); } " +
-  "return real.apply(this, arguments); }; })();";
+  "e = { t: now(), body: Array.from(init.body), " +
+  "deadline: s ? s.flushDeadlineMs : -1 }; " +
+  "window.__ctSends.push(e); } " +
+  "const p = real.apply(this, arguments); " +
+  "if (e) { const settled = () => { e.answered = now(); }; " +
+  "then.call(p, settled, settled); } " +
+  "return p; }; })();";
 
 async function sendsOf(page: TPage): Promise<Send[]> {
   return page.evaluate(
@@ -338,38 +348,138 @@ function deadlineSchedule(
 }
 
 /**
+ * One run of the fixture page's interval ticks, as the page reports it in
+ * `window.__ctTickRuns` (`fixtures/transport.js`): `t0` is the
+ * `performance.now()` the page read just before `setInterval`, `interval`
+ * the delay it asked for, `ticks` how many ticks it runs.
+ */
+interface TickRun {
+  t0: number;
+  interval: number;
+  ticks: number;
+}
+
+async function tickRunsOf(page: TPage): Promise<TickRun[]> {
+  return page.evaluate(
+    () =>
+      (globalThis as unknown as { __ctTickRuns?: TickRun[] }).__ctTickRuns ??
+      [],
+  );
+}
+
+/**
+ * How far the coarsened `performance.now()` may misplace a read (Chromium
+ * rounds it to 100 µs and adds jitter), for the model's own check in
+ * {@link pageRuns} only.
+ */
+const CLOCK_GRAIN_MS = 0.5;
+
+/**
+ * Each page time read (a `Clock` of `performance.now()`), sorted by when it
+ * ran, with a lower bound on when it came due.
+ *
+ * A tick of `setInterval` runs no earlier than it is due, and under load
+ * well after, so the time it ran says little about when it came due.
+ * Chromium runs a repeating timer on a fixed grid from the moment it was
+ * started, one grid point per interval: a tick that ran late moves no later
+ * tick, and the points a tick ran a whole interval or more past are skipped
+ * (Blink's `TimerBase::RunInternal`, "This computation should be drift
+ * free",
+ * https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/platform/timer.cc).
+ * The grid starts no earlier than the `t0` the page read just before it
+ * called `setInterval`, so the run's `k`-th tick is due no earlier than
+ * `t0 + k * interval`: at that grid point, or at a later one after a skip.
+ * The bound holds whatever the page's tasks cost, which a bound taken from
+ * when the tick before ran does not: the browser takes the time it
+ * schedules the next tick from before the shim and the page start their
+ * work, and a stalled renderer can stop between the two (under a 32-way CPU
+ * load such a bound put a tick 3 ms after it ran in two runs of five). After a
+ * skip the bound is low by the points skipped, which only excuses more.
+ * A read that is not one of the run's ticks (the page's `t0` itself, a
+ * read past the run's last tick, or one before any run) gets no bound:
+ * nothing says when it came due, so it never counts as due after an aim.
+ */
+function pageRuns(
+  values: number[],
+  runs: TickRun[],
+): { ran: number; due: number }[] {
+  const sorted = [...values].sort((a, b) => a - b);
+  const out: { ran: number; due: number }[] = [];
+  let phase: TickRun | undefined;
+  let k = 0;
+  for (const ran of sorted) {
+    // The run of ticks this read belongs to: the latest started by then.
+    const current = runs
+      .filter((p) => p.t0 <= ran)
+      .reduce<
+        TickRun | undefined
+      >((a, p) => (a === undefined || p.t0 > a.t0 ? p : a), undefined);
+    if (current !== phase) {
+      phase = current;
+      k = 0;
+    }
+    if (phase === undefined || ran === phase.t0 || k >= phase.ticks) {
+      out.push({ ran, due: -Infinity });
+      continue;
+    }
+    k += 1;
+    const due = phase.t0 + k * phase.interval;
+    // The model's own check: no tick runs before the bound says it came
+    // due. A browser that scheduled intervals otherwise, or a read the page
+    // made among its ticks, fails here, loudly, rather than by excusing
+    // what it should not.
+    expect(
+      due,
+      `tick ${k} of the run from ${phase.t0}, run at ${ran}`,
+    ).toBeLessThanOrEqual(ran + CLOCK_GRAIN_MS);
+    out.push({ ran, due });
+  }
+  return out;
+}
+
+/**
  * Check that no timed record waited longer than its batch's deadline.
  * The page's ticks read `performance.now()`; such a read's value is the
  * browser time it was made, so its wait is its batch's send time minus its
  * value. Returns each batch's oldest wait and how many batches were excused
  * by a stalled renderer.
  *
+ * A batch should leave at its oldest record's time plus the deadline, or at
+ * the answer to the batch before if that came later (§11.1: the bound
+ * assumes the previous batch is answered within it; the timer is not armed
+ * while a batch is in flight, and the answer sends a batch that is due at
+ * once). The transport aims its flush timer 10 ms before the deadline, and
+ * a timer due at its aim runs before every page task that came due after
+ * it. So a batch that leaves late fails when a tick that came due after the
+ * aim ran before the send (bar one within 3 ms of the send, which an
+ * overdue timer of another task queue may run first): its timer was aimed
+ * late and let the page run first. A tick due before the aim that ran
+ * after it proves nothing: under load both timers ran late, in due order.
+ * Due times are lower bounds ({@link pageRuns}), so the check never fails a
+ * tick that may have come due before the aim, and fails every tick that
+ * certainly came due after it.
+ *
  * The bound is browser time in which the page runs. When the operating
  * system does not schedule the renderer (seen under a 32-way CPU load: a
  * batch sent 64 ms after its oldest read, its window holding 9 of the
  * page's 5 ms ticks where 14 fit), nothing in the page runs, the transport
- * included, and the batch goes the moment the page runs again. So a wait
- * over the deadline passes only when the page's own ticks show that stall:
- * none ran between the flush timer's aim (10 ms before the deadline) and
- * the send (bar the one an overdue interval runs first, within 3 ms of it),
- * and the ticks either side of the aim are at least three intervals apart.
- * A transport that sends late while the page runs still fails.
- *
- * A short stall need not show in the ticks: under the same load the flush
- * timer ran 10 to 19 ms past its aim with no tick in between, on a 25 ms
- * page (no tick was due), after the page's ticks had ended, and on a 5 ms
- * page with the ticks around the aim 12 ms apart (one tick late, not
- * three). So a batch whose wait exceeds its deadline by at most
- * {@link LATE_TIMER_SLACK_MS}, with no tick run between the aim and the
- * send, also passes; it is counted in `unseen`. A longer overshoot needs
- * the stall in the ticks, and a tick run after the aim fails either way: a
- * transport whose timer is aimed late lets the page run first.
+ * included, and the batch goes the moment the page runs again. The page's
+ * ticks show such a stall: a tick due at `d` that ran at `r` waited out
+ * `[d, r]` as the flush timer did. A batch that left late passes when the
+ * part of its delay no tick shows, the time from when it should have left
+ * to the start of the stall (`d`) plus the time from the stall's end (`r`)
+ * to the send, is at most {@link LATE_TIMER_SLACK_MS}; it is counted in
+ * `stalls`. A tick that ran on time shows nothing, so on a running page the
+ * whole delay counts. A delay of at most {@link LATE_TIMER_SLACK_MS} passes
+ * with no tick showing it (under the same load the flush timer ran 10 to 19
+ * ms past its aim with no tick due in between, on a 25 ms page with no tick
+ * due, and after the page's ticks had ended), and is counted in `unseen`.
  */
 function checkWaits(
   got: ParsedBatch[],
-  sentAt: Map<number, number>,
+  sends: Map<number, { t: number; answered?: number }>,
   deadlineOf: (batch: number) => number,
-  intervalAt: (t: number) => number,
+  runs: TickRun[],
 ): {
   oldestWait: Map<number, number>;
   stalls: number;
@@ -379,7 +489,7 @@ function checkWaits(
   const bits = Buffer.alloc(8);
   const waits: { batch: number; wait: number }[] = [];
   for (const b of got) {
-    const t = sentAt.get(b.envelope.batch_seq)!;
+    const t = sends.get(b.envelope.batch_seq)!.t;
     for (const r of b.records) {
       if (r.record === "Clock" && r.src === 2) {
         bits.writeBigUInt64LE(r.bits);
@@ -390,9 +500,10 @@ function checkWaits(
       }
     }
   }
-  const ticks = waits
-    .map((w) => sentAt.get(w.batch)! - w.wait)
-    .sort((a, b) => a - b);
+  const page = pageRuns(
+    waits.map((w) => sends.get(w.batch)!.t - w.wait),
+    runs,
+  );
   const oldestWait = new Map<number, number>();
   for (const w of waits) {
     expect(w.wait, `batch ${w.batch}`).toBeGreaterThanOrEqual(0);
@@ -403,30 +514,34 @@ function checkWaits(
   for (const [batch, wait] of oldestWait) {
     const deadline = deadlineOf(batch);
     if (wait <= deadline) continue;
-    const sent = sentAt.get(batch)!;
-    const aim = sent - wait + deadline - 10;
-    const ranMeanwhile = ticks.filter((v) => v > aim && v < sent - 3);
-    const before = ticks.filter((v) => v <= aim).pop();
-    const after = ticks.find((v) => v > aim);
-    const detail = `batch ${batch}: waited ${wait} ms, deadline ${deadline} ms; ticks ${JSON.stringify(ranMeanwhile)} ran after the aim ${aim}`;
-    expect(ranMeanwhile, detail).toEqual([]);
-    expect(before, detail).toBeDefined();
-    if (wait - deadline <= LATE_TIMER_SLACK_MS) {
-      unseen += 1;
-      continue;
-    }
-    expect(after, detail).toBeDefined();
-    expect(after! - before!, detail).toBeGreaterThanOrEqual(
-      3 * intervalAt(aim),
+    const sent = sends.get(batch)!.t;
+    const answer = Math.min(sends.get(batch - 1)?.answered ?? -Infinity, sent);
+    const goal = Math.max(sent - wait + deadline, answer);
+    const aim = Math.max(sent - wait + deadline - 10, answer);
+    const dueMeanwhile = page.filter(
+      (p) => p.ran > aim && p.ran < sent - 3 && p.due > aim,
     );
-    stalls += 1;
+    // The least delay no tick shows: none at all, or the best tick's.
+    const late = sent - goal;
+    const shown = page
+      .filter((p) => Number.isFinite(p.due))
+      .map(
+        (p) =>
+          Math.max(0, p.due - goal) + Math.max(0, Math.min(late, sent - p.ran)),
+      );
+    const unshown = Math.min(late, ...shown);
+    const detail = `batch ${batch}: waited ${wait} ms, deadline ${deadline} ms, left ${late} ms late, ${unshown} ms of it shown by no tick; ticks ${JSON.stringify(dueMeanwhile)} came due after the aim ${aim} and ran before the send`;
+    expect(dueMeanwhile, detail).toEqual([]);
+    expect(unshown, detail).toBeLessThanOrEqual(LATE_TIMER_SLACK_MS);
+    if (late <= LATE_TIMER_SLACK_MS) unseen += 1;
+    else stalls += 1;
   }
   return { oldestWait, stalls, unseen, timed: waits.length };
 }
 
 /**
- * How far past its deadline a batch may leave, with no page task run in
- * between, without the ticks showing a stall (see {@link checkWaits}).
+ * How much of a batch's delay may go unexplained by the page's ticks (see
+ * {@link checkWaits}).
  */
 const LATE_TIMER_SLACK_MS = 15;
 
@@ -901,6 +1016,7 @@ describe("the batched upload transport", () => {
       const server = await site(ingest);
       const context = await browser.newContext();
       let sends: Send[];
+      let runs: TickRun[];
       try {
         const page = await context.newPage();
         // Before the shim: the shim captures this wrapper as `fetch`, so the
@@ -925,6 +1041,7 @@ describe("the batched upload transport", () => {
         );
         await until(() => status(page), idle, "the transport did not go idle");
         sends = await sendsOf(page);
+        runs = await tickRunsOf(page);
       } finally {
         await context.close();
       }
@@ -946,12 +1063,13 @@ describe("the batched upload transport", () => {
         expect(s.deadline, `batch ${seq}`).toBe(schedule.get(seq));
         if (seq < FAST_BATCHES) expect(s.deadline).toBe(DEADLINE_MS);
       }
-      const sentAt = new Map([...sent].map(([k, s]) => [k, s.t]));
+      // The page reported its one run of ticks, the due times' grid.
+      expect(runs.map((r) => r.interval)).toEqual([5]);
       const { oldestWait, stalls, unseen, timed } = checkWaits(
         got,
-        sentAt,
+        sent,
         (b) => schedule.get(b)!,
-        () => 5,
+        runs,
       );
       // Most batches met their deadline outright.
       expect(stalls + unseen, "batches excused").toBeLessThan(got.length / 2);
@@ -996,6 +1114,69 @@ describe("the batched upload transport", () => {
   );
 
   it(
+    "transport_flush_timer_fires_at_its_aim",
+    async () => {
+      // §11.1: the flush timer is aimed FLUSH_TIMER_LEAD_MS (10 ms) ahead of
+      // the deadline, the room a timer has to run late on a busy page. While
+      // a page runs a short repeating timer, Chromium runs a timer of 32 ms
+      // or more at that timer's next wake-up, after its tick: on a page
+      // ticking every 5 ms, up to 5 ms after it was due (shorter timers run
+      // on time). A transport that waited for its aim with one long timer
+      // spent half the lead there, and the page's tick due after the aim ran
+      // before the flush (under load the batch then left past its
+      // deadline). The batches of the 5 ms page are cut by the deadline (50
+      // ms, then doubling) until they reach 256 records; how late past its
+      // aim each leaves is the wait of its oldest timed record less the aim.
+      // With one long timer the median was 4 to 5 ms.
+      const ingest = await stub();
+      const server = await site(ingest);
+      const context = await browser.newContext();
+      let sends: Send[];
+      try {
+        const page = await context.newPage();
+        await page.addInitScript({ content: SEND_RECORDER });
+        await page.goto(`${server.origin}/transport.html`);
+        await until(() => status(page), idle, "the transport did not go idle");
+        await page.click("#ticks");
+        await until(
+          () => textOf(page, "ticks-done"),
+          (t) => t === "150",
+          "the ticks did not finish",
+        );
+        await until(() => status(page), idle, "the transport did not go idle");
+        sends = await sendsOf(page);
+      } finally {
+        await context.close();
+      }
+      const sent = sendTimes(sends);
+      const schedule = deadlineSchedule(ingest.batches);
+      const bits = Buffer.alloc(8);
+      const late: number[] = [];
+      for (const { parsed: b } of ingest.batches) {
+        const seq = b.envelope.batch_seq;
+        if (b.records.length >= 256 || !sent.has(seq)) continue;
+        let wait = -Infinity;
+        for (const r of b.records) {
+          if (r.record !== "Clock" || r.src !== 2) continue;
+          bits.writeBigUInt64LE(r.bits);
+          wait = Math.max(wait, sent.get(seq)!.t - bits.readDoubleLE(0));
+        }
+        if (!Number.isFinite(wait)) continue;
+        late.push(wait - (schedule.get(seq)! - FLUSH_TIMER_LEAD_MS));
+      }
+      // Vacuity: enough batches cut by the deadline, each with a timed record.
+      expect(late.length, "deadline-cut batches").toBeGreaterThanOrEqual(6);
+      late.sort((a, b) => a - b);
+      const median = late[late.length >> 1];
+      expect(
+        median,
+        `each batch's lateness past its aim, in ms: ${JSON.stringify(late)}`,
+      ).toBeLessThan(2);
+    },
+    TIMEOUT,
+  );
+
+  it(
     "transport_backs_off_its_flush_deadline_when_batches_are_cut_by_it",
     async () => {
       // A page that keeps writing a few records at a time must not make a
@@ -1009,6 +1190,7 @@ describe("the batched upload transport", () => {
       const server = await site(ingest);
       const context = await browser.newContext();
       let sends: Send[];
+      let runs: TickRun[];
       let fastFrom: number;
       try {
         const page = await context.newPage();
@@ -1046,6 +1228,7 @@ describe("the batched upload transport", () => {
           10_000,
         );
         sends = await sendsOf(page);
+        runs = await tickRunsOf(page);
       } finally {
         await context.close();
       }
@@ -1072,11 +1255,15 @@ describe("the batched upload transport", () => {
         ).toBeLessThanOrEqual(256);
       }
       const sentAt = new Map([...sent].map(([k, s]) => [k, s.t]));
+      // The page reported its two runs of ticks, the due times' grids: the
+      // 25 ms one, then the 5 ms one, started after `fastFrom`.
+      expect(runs.map((r) => r.interval)).toEqual([25, 5]);
+      expect(runs[1].t0).toBeGreaterThanOrEqual(fastFrom);
       const { oldestWait, stalls, unseen } = checkWaits(
         got,
-        sentAt,
+        sent,
         (b) => schedule.get(b)!,
-        (t) => (t < fastFrom ? 25 : 5),
+        runs,
       );
       // Most batches met their deadline outright.
       expect(stalls + unseen, "batches excused").toBeLessThan(got.length / 2);
@@ -1447,6 +1634,71 @@ describe("the batched upload transport", () => {
   );
 
   it(
+    "transport_deadline_oracle_fails_a_flush_timer_aimed_late",
+    async () => {
+      // Positive control of the oracle the flush-deadline tests rely on
+      // (checkWaits): a transport whose flush timer is aimed 20 ms late
+      // (10 ms past the deadline, so within LATE_TIMER_SLACK_MS: only the
+      // ticks that came due after the aim can tell) must fail it, on the
+      // 5 ms page and on the 25 ms one. An init script before the shim adds
+      // 20 ms to every `setTimeout`, which the shim captures as the
+      // original, so only the transport's timers are late (the page's ticks
+      // are an interval).
+      for (const c of [
+        { button: "#ticks", n: "150" },
+        { button: "#ticks-slow", n: "80" },
+      ]) {
+        const ingest = await stub();
+        const server = await site(ingest);
+        const context = await browser.newContext();
+        let sends: Send[];
+        let runs: TickRun[];
+        try {
+          const page = await context.newPage();
+          await page.addInitScript({ content: SEND_RECORDER });
+          await page.addInitScript({
+            content:
+              "(() => { const real = window.setTimeout; " +
+              "window.setTimeout = function (f, d, ...a) { " +
+              "return real.call(this, f, (Number(d) || 0) + 20, ...a); }; })();",
+          });
+          await page.goto(`${server.origin}/transport.html`);
+          await until(
+            () => status(page),
+            idle,
+            "the transport did not go idle",
+          );
+          await page.click(c.button);
+          await until(
+            () => textOf(page, "ticks-done"),
+            (t) => t === c.n,
+            "the ticks did not finish",
+          );
+          await until(
+            () => status(page),
+            idle,
+            "the transport did not go idle",
+          );
+          sends = await sendsOf(page);
+          runs = await tickRunsOf(page);
+        } finally {
+          await context.close();
+        }
+        const sent = sendTimes(sends);
+        const got = ingest.batches.map((b) => b.parsed);
+        expect(sent.size, c.button).toBe(got.length);
+        expect(runs.length, c.button).toBe(1);
+        const schedule = deadlineSchedule(ingest.batches);
+        expect(
+          () => checkWaits(got, sent, (b) => schedule.get(b)!, runs),
+          c.button,
+        ).toThrow(/came due after the aim/);
+      }
+    },
+    TIMEOUT,
+  );
+
+  it(
     "transport_waits_for_an_answer_without_spinning_its_timer",
     async () => {
       // While a batch is in flight nothing more can be sent, so the flush
@@ -1513,4 +1765,173 @@ describe("the batched upload transport", () => {
     },
     TIMEOUT,
   );
+});
+
+/**
+ * The oracle of the flush-deadline tests ({@link checkWaits}) on batches
+ * made up here, each case the shape of a run the browser can produce: the
+ * checks the browser tests rely on, held to cases that would otherwise come
+ * up once in tens of runs under load. No browser and no transport: the
+ * input is what the browser tests hand the oracle.
+ */
+describe("the flush-deadline oracle", () => {
+  /** A batch whose timed records are page reads at these times. */
+  function batchOf(seq: number, ran: number[]): ParsedBatch {
+    const bits = Buffer.alloc(8);
+    return {
+      envelope: { batch_seq: seq },
+      records: ran.map((t) => {
+        bits.writeDoubleLE(t);
+        return { record: "Clock", src: 2, bits: bits.readBigUInt64LE(0) };
+      }),
+      frames: new Uint8Array(),
+    } as unknown as ParsedBatch;
+  }
+  /** Page reads 5 ms apart, from `a` to `b`. */
+  function onTime(a: number, b: number): number[] {
+    const out: number[] = [];
+    for (let t = a; t <= b; t += 5) out.push(t);
+    return out;
+  }
+  /** Page reads 25 ms apart, from `a` to `b`. */
+  function every25(a: number, b: number): number[] {
+    return onTime(a, b).filter((t) => (t - a) % 25 === 0);
+  }
+  // A run of ticks started at 595, so its grid is the multiples of 5.
+  const RUNS = [{ t0: 595, interval: 5, ticks: 1000 }];
+  // Batch 1 holds the ticks from 630 (its oldest record) under a 200 ms
+  // deadline: the flush timer is aimed at 820.
+  const deadline = () => 200;
+
+  it("oracle_excuses_a_tick_due_before_the_aim_that_ran_after_it", () => {
+    // The issue's run: the tick due at the aim (820) ran 4.7 ms after it,
+    // and the flush timer, due at the aim too, ran after it in due order;
+    // the batch left 3.9 ms past its deadline.
+    const got = [
+      batchOf(0, onTime(600, 625)),
+      batchOf(1, [...onTime(630, 815), 824.7]),
+    ];
+    const sends = new Map([
+      [0, { t: 626, answered: 627 }],
+      [1, { t: 833.9 }],
+    ]);
+    const { unseen } = checkWaits(got, sends, deadline, RUNS);
+    expect(unseen).toBe(1);
+  });
+
+  it("oracle_fails_a_tick_due_after_the_aim_that_ran_before_the_send", () => {
+    // Positive control: the tick due at 825, after the aim, ran (on time)
+    // before the batch left: the transport's timer was aimed late.
+    const got = [
+      batchOf(0, onTime(600, 625)),
+      batchOf(1, [...onTime(630, 825)]),
+    ];
+    const sends = new Map([
+      [0, { t: 626, answered: 627 }],
+      [1, { t: 833.9 }],
+    ]);
+    expect(() => checkWaits(got, sends, deadline, RUNS)).toThrow(
+      /came due after the aim/,
+    );
+  });
+
+  it("oracle_excuses_ticks_due_while_the_batch_before_was_unanswered", () => {
+    // The batch before was answered 16 ms after this batch's aim (820), and this
+    // batch left at once: the ticks due at 825, 830 and 835 ran while nothing could be
+    // sent (§11.1: the bound assumes the previous batch is answered in time).
+    const got = [
+      batchOf(0, onTime(600, 625)),
+      batchOf(1, [...onTime(630, 835)]),
+    ];
+    const sends = new Map([
+      [0, { t: 626, answered: 836 }],
+      [1, { t: 836.5 }],
+    ]);
+    const { unseen } = checkWaits(got, sends, deadline, RUNS);
+    expect(unseen).toBe(1);
+  });
+
+  it("oracle_fails_a_tick_due_after_the_answer_that_ran_before_the_send", () => {
+    // Positive control: the answer came at 821, so the batch was due then;
+    // the tick due at 825 ran first, so the transport did not send at once.
+    const got = [
+      batchOf(0, onTime(600, 625)),
+      batchOf(1, [...onTime(630, 825)]),
+    ];
+    const sends = new Map([
+      [0, { t: 626, answered: 821 }],
+      [1, { t: 833.9 }],
+    ]);
+    expect(() => checkWaits(got, sends, deadline, RUNS)).toThrow(
+      /came due after the aim/,
+    );
+  });
+
+  it("oracle_excuses_a_delay_a_late_tick_shows_on_a_25_ms_page", () => {
+    // A stalled renderer on a 25 ms page: the tick due at 825 ran 20 ms
+    // late, at 845, and the batch, due at 825 (the aim 815), left 2.8 ms
+    // after it, 22.8 ms late. The ticks either side of the aim are only
+    // 45 ms apart: a stall shorter than three intervals still shows, in the
+    // tick that waited it out.
+    const slow = [{ t0: 475, interval: 25, ticks: 100 }];
+    const got = [
+      batchOf(0, every25(500, 600)),
+      batchOf(1, [...every25(625, 800), 845]),
+    ];
+    const sends = new Map([
+      [0, { t: 601, answered: 602 }],
+      [1, { t: 847.8 }],
+    ]);
+    const { stalls } = checkWaits(got, sends, deadline, slow);
+    expect(stalls).toBe(1);
+  });
+
+  it("oracle_fails_a_long_delay_no_tick_shows", () => {
+    // Positive control: the batch left 20 ms late (due at 830, sent at
+    // 850), and every tick ran on time: the page was running.
+    const got = [
+      batchOf(0, onTime(600, 625)),
+      batchOf(1, [...onTime(630, 815)]),
+    ];
+    const sends = new Map([
+      [0, { t: 626, answered: 627 }],
+      [1, { t: 850 }],
+    ]);
+    expect(() => checkWaits(got, sends, deadline, RUNS)).toThrow(
+      /20 ms of it shown by no tick/,
+    );
+  });
+
+  it("oracle_fails_a_delay_longer_than_the_stall_a_tick_shows", () => {
+    // Positive control: the last tick, due at 820, waited 10 ms (a stall
+    // from 820 to 830), but the batch, due at 830, left at 860: the page
+    // ran for 30 ms after the stall before the transport sent.
+    const lastAt830 = [{ t0: 595, interval: 5, ticks: 45 }];
+    const got = [
+      batchOf(0, onTime(600, 625)),
+      batchOf(1, [...onTime(630, 815), 830]),
+    ];
+    const sends = new Map([
+      [0, { t: 626, answered: 627 }],
+      [1, { t: 860 }],
+    ]);
+    expect(() => checkWaits(got, sends, deadline, lastAt830)).toThrow(
+      /30 ms of it shown by no tick/,
+    );
+  });
+
+  it("oracle_excuses_a_long_delay_the_ticks_show_as_a_stall", () => {
+    // Nothing of the page ran from 815 to 850 (seven ticks missed), and the
+    // batch went 30 ms late; the tick due at 820 ran last, at 850.
+    const got = [
+      batchOf(0, onTime(600, 625)),
+      batchOf(1, [...onTime(630, 815), 850]),
+    ];
+    const sends = new Map([
+      [0, { t: 626, answered: 627 }],
+      [1, { t: 860 }],
+    ]);
+    const { stalls } = checkWaits(got, sends, deadline, RUNS);
+    expect(stalls).toBe(1);
+  });
 });
