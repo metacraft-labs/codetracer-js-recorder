@@ -22,8 +22,11 @@ import {
   replayInput,
   replayNavigation,
 } from "./dom.js";
+import { replayMessageSeams } from "./message.js";
 import { replayNetSeams } from "./net.js";
+import { replayPlatformSeams } from "./platform.js";
 import { replayTimeSeams } from "./time.js";
+import { installTrustedEvents } from "./trusted.js";
 import { replayXhr } from "./xhr.js";
 
 /** What the shim publishes on `globalThis.__ctBoundaryShim` in replay mode. */
@@ -55,10 +58,13 @@ export function installReplayShim(
   )[CONTROL_GLOBAL];
   if (existing !== undefined) return existing;
   const ctx = newReplayContext(w, replay);
+  ctx.trusted = installTrustedEvents(ctx);
   replayTimeSeams(ctx);
   replayNetSeams(ctx);
   replayXhr(ctx);
   replayDomSeams(ctx);
+  replayPlatformSeams(ctx);
+  replayMessageSeams(ctx);
   replayNavigation(ctx);
   const injector = replayInput(ctx);
   const control: ShimReplayControl = {

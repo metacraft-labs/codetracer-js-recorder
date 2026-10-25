@@ -11,6 +11,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
@@ -129,6 +130,9 @@ const RELEASE_SETTLE_MS = 250;
  * stops the writes. `nosniff` keeps Chromium from holding the first bytes
  * back to sniff a MIME type.
  *
+ * `/api/sse` takes `event=<name>` (every event named so) and `id=1` (each
+ * event with an id, 1, 2, …).
+ *
  * `length=1` sends a `content-length` (a finite stream only), so the
  * response's progress events are length-computable. `hold=<id>` keeps the
  * response open after its `n` chunks until `/api/release?id=<id>` (see
@@ -145,7 +149,14 @@ function serveStream(
   const n = forever ? Infinity : Number(url.searchParams.get("n") ?? "3");
   const interval = Number(url.searchParams.get("interval") ?? "100");
   const hold = url.searchParams.get("hold");
-  const chunk = (i: number) => (sse ? `data: e${i}\n\n` : `c${i}\n`);
+  // `event=<name>` names every server-sent event and `id=1` gives each an
+  // id (`event:` and `id:` fields, HTML "Server-sent events").
+  const event = url.searchParams.get("event");
+  const ids = url.searchParams.get("id") === "1";
+  const chunk = (i: number) =>
+    sse
+      ? `${event === null ? "" : `event: ${event}\n`}${ids ? `id: ${i + 1}\n` : ""}data: e${i}\n\n`
+      : `c${i}\n`;
   const headers: http.OutgoingHttpHeaders = {
     "content-type": sse ? "text/event-stream" : "text/plain; charset=utf-8",
     "cache-control": "no-store",
@@ -301,6 +312,7 @@ export async function startFixtureServer(
       serveFile(res, file, new URL(url, "http://x").searchParams);
     });
   });
+  server.on("upgrade", (req, socket) => serveWebSocket(req, socket, requests));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as { port: number }).port;
   return {
@@ -313,6 +325,84 @@ export async function startFixtureServer(
         server.close(() => resolve());
       }),
   };
+}
+
+/** The GUID a WebSocket handshake's accept key is derived with (RFC 6455 §1.3). */
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/** One unmasked server-to-client frame (RFC 6455 §5.2). */
+function wsFrame(opcode: number, payload: Buffer): Buffer {
+  const head =
+    payload.length < 126
+      ? Buffer.from([0x80 | opcode, payload.length])
+      : Buffer.from([
+          0x80 | opcode,
+          126,
+          payload.length >> 8,
+          payload.length & 0xff,
+        ]);
+  return Buffer.concat([head, payload]);
+}
+
+/**
+ * `/api/ws`: a WebSocket endpoint (RFC 6455), written here because the dev
+ * shell has no WebSocket server package. It accepts the first subprotocol the
+ * client offers, then sends a text message `hello` and a binary message
+ * whose bytes (`bin`) are valid UTF-8, so a replay that guessed the frame
+ * type from the bytes would deliver it as text. It answers a close frame with
+ * a close frame and ends the connection. Every other client frame is
+ * ignored.
+ */
+function serveWebSocket(
+  req: http.IncomingMessage,
+  socket: import("node:stream").Duplex,
+  requests: ServedRequest[],
+): void {
+  const url = new URL(req.url ?? "/", "http://x");
+  requests.push({ method: "GET", url: req.url ?? "/", body: "" });
+  const key = req.headers["sec-websocket-key"];
+  if (url.pathname !== "/api/ws" || typeof key !== "string") {
+    socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
+    return;
+  }
+  const accept = crypto
+    .createHash("sha1")
+    .update(key + WS_GUID)
+    .digest("base64");
+  const offered = String(req.headers["sec-websocket-protocol"] ?? "")
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => p !== "");
+  socket.write(
+    [
+      "HTTP/1.1 101 Switching Protocols",
+      "Upgrade: websocket",
+      "Connection: Upgrade",
+      `Sec-WebSocket-Accept: ${accept}`,
+      ...(offered.length > 0 ? [`Sec-WebSocket-Protocol: ${offered[0]}`] : []),
+      "",
+      "",
+    ].join("\r\n"),
+  );
+  socket.write(wsFrame(0x1, Buffer.from("hello")));
+  socket.write(wsFrame(0x2, Buffer.from("bin")));
+  let buffered = Buffer.alloc(0);
+  socket.on("data", (d: Buffer) => {
+    buffered = Buffer.concat([buffered, d]);
+    // A client frame is masked: 2 header bytes (short lengths only here),
+    // the 4-byte mask, then the payload.
+    while (buffered.length >= 6) {
+      const opcode = buffered[0] & 0x0f;
+      const len = buffered[1] & 0x7f;
+      if (len >= 126 || buffered.length < 6 + len) break;
+      buffered = buffered.subarray(6 + len);
+      if (opcode === 0x8) {
+        socket.end(wsFrame(0x8, Buffer.from([0x03, 0xe8])));
+        return;
+      }
+    }
+  });
+  socket.on("error", () => socket.destroy());
 }
 
 // ── Installing the shim ─────────────────────────────────────────────────

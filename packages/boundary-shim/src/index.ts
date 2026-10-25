@@ -37,6 +37,11 @@ export {
 } from "./browser/seams-net.js";
 export { RECORDER_FAULT } from "./browser/recorder.js";
 export { UNRECORDABLE_TIMER_HANDLER } from "./browser/seams-time.js";
+export {
+  FILE_CONTENT,
+  UNRECORDABLE_PLATFORM_TASK,
+} from "./browser/seams-platform.js";
+export { FOREIGN_MESSAGE } from "./browser/seams-message.js";
 export { SHAPE_READ } from "./browser/seams-storage.js";
 export {
   DIVERGENCE_KINDS,

@@ -12,6 +12,7 @@
 
 import type { ShimOriginals } from "../originals.js";
 import type { CtReplay } from "../replay-api.js";
+import type { TrustedEvents } from "./trusted.js";
 
 export interface ReplayContext {
   w: Window & typeof globalThis;
@@ -27,6 +28,12 @@ export interface ReplayContext {
    * that registered a different number of tasks before it diverges here.
    */
   claimTaskId(logged: bigint): void;
+  /**
+   * Dispatches the events replay fires in the platform's place, so the
+   * page's listeners see them as trusted (`trusted.ts`). Set by the
+   * installer, before any seam.
+   */
+  trusted: TrustedEvents;
 }
 
 export function newReplayContext(
@@ -51,6 +58,11 @@ export function newReplayContext(
         );
       }
       nextTask++;
+    },
+    trusted: {
+      dispatch() {
+        throw new Error("the replay shim's trusted dispatch is not installed");
+      },
     },
   };
 }

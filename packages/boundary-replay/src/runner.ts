@@ -342,6 +342,16 @@ function majorOf(version: string): number | undefined {
   return m === null ? undefined : Number(m[1]);
 }
 
+/**
+ * The trace's `program` (§12): `Env.url` without its query and fragment,
+ * as the boundary recording's `meta.dat` has it (§5.1). `Env.url` itself
+ * keeps both, since the page reads them and is loaded at that URL (§7.4).
+ */
+export function programOf(url: string): string {
+  const cut = url.search(/[?#]/);
+  return cut < 0 ? url : url.slice(0, cut);
+}
+
 /** Replay `options.log` and report (see the module comment). */
 export async function replaySession(
   options: ReplayOptions,
@@ -583,7 +593,7 @@ export async function replaySession(
     if (host !== undefined) {
       preamble +=
         `globalThis.__codetracer_endpoint=${JSON.stringify(host.endpoint)};` +
-        `globalThis.__codetracer_program=${JSON.stringify(env.url)};` +
+        `globalThis.__codetracer_program=${JSON.stringify(programOf(env.url))};` +
         `globalThis.__codetracer_args=${JSON.stringify(report.traceArgs)};`;
     }
     // Init scripts run in every document of the context, the page's first

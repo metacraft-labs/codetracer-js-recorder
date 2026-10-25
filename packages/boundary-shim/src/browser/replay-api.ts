@@ -149,10 +149,15 @@ export interface CtReplay {
   /**
    * Run `run` for every due `Task` of `kind` that no `TaskReg` registered:
    * the tasks the browser dispatches and the recorder mints an id for when
-   * it runs (navigation, 12; a framework's hydration start, 11). Input
-   * tasks (5) are not claimed this way: the runner injects their `Input`.
+   * it runs (navigation, 12; a framework's hydration start, 11; at level 0
+   * also a message the page posted to its own window, 6, and a storage
+   * event, 9). Input tasks (5) are not claimed this way: the runner injects
+   * their `Input`. Like `onTask`'s, the handler may return a promise.
    */
-  onUnregisteredTask(kind: number, run: (task: TaskRecord) => void): void;
+  onUnregisteredTask(
+    kind: number,
+    run: (task: TaskRecord) => void | PromiseLike<void>,
+  ): void;
   /** Whether the record at the cursor is a `Checkpoint`. */
   checkpointDue(): boolean;
   /**

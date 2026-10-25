@@ -43,6 +43,12 @@ export const TaskKind = {
   observer: 10,
   hydrationStart: 11,
   navigation: 12,
+  /**
+   * A promise the platform settles in a task of its own, outside any
+   * request: a whole-body read of a `Blob`, a `Request` or a `Response` the
+   * page made, and `crypto.subtle.digest` (§6, §10.1).
+   */
+  platform: 13,
 } as const;
 
 /** `Clock.src` (§5.2). */
@@ -52,6 +58,10 @@ export const ClockSrc = {
   newDate: 3,
   animationFrame: 4,
   eventTimeStamp: 5,
+  /** `IdleDeadline.timeRemaining()`. */
+  idleTimeRemaining: 6,
+  /** `performance.timeOrigin`. */
+  timeOrigin: 7,
 } as const;
 
 /**

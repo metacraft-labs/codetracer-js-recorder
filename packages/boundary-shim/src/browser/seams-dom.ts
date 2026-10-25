@@ -379,7 +379,7 @@ function domEffects(ctx: SeamContext, ev: Event): [number, unknown][] {
       if (tag === "input" && c.type === "file") {
         const files = [];
         for (const f of Array.from(c.files ?? [])) {
-          files.push({ name: f.name, size: f.size, type: f.type });
+          files.push(fileJson(f));
         }
         out.push([Effect.files, files]);
       } else {
@@ -390,6 +390,29 @@ function domEffects(ctx: SeamContext, ev: Event): [number, unknown][] {
     }
   }
   return out;
+}
+
+/**
+ * What a page can read of a file a user chose without reading its contents
+ * (File API: `name`, `size`, `type`, `lastModified`; File and Directory
+ * Entries API: `webkitRelativePath`), the `files` effect's element (§10.2).
+ * Replay hands the page files of exactly this shape; their contents are not
+ * recorded (seams-platform.ts).
+ */
+export function fileJson(f: File): {
+  name: string;
+  size: number;
+  type: string;
+  lastModified: number;
+  webkitRelativePath: string;
+} {
+  return {
+    name: f.name,
+    size: f.size,
+    type: f.type,
+    lastModified: f.lastModified,
+    webkitRelativePath: f.webkitRelativePath ?? "",
+  };
 }
 
 /** The selection range of a text control, or `null` for one without. */

@@ -346,11 +346,12 @@ export function replayNavigation(ctx: ReplayContext): void {
     if (r.kind === 3) {
       const state = states.get(r.url) ?? null;
       orig.replaceState.call(w.history, state, "", r.url);
-      w.dispatchEvent(new w.PopStateEvent("popstate", { state }));
+      ctx.trusted.dispatch(w, new w.PopStateEvent("popstate", { state }));
     } else if (r.kind === 4) {
       const oldURL = w.location.href;
       orig.replaceState.call(w.history, w.history.state, "", r.url);
-      w.dispatchEvent(
+      ctx.trusted.dispatch(
+        w,
         new w.HashChangeEvent("hashchange", { oldURL, newURL: r.url }),
       );
     } else {
@@ -474,6 +475,10 @@ export function replayInput(ctx: ReplayContext): ReplayInjector {
   const { w } = ctx;
   const doc = w.document;
   const dispatch = w.EventTarget.prototype.dispatchEvent;
+  // Captured before any page code, which may replace them.
+  const OrigFile = w.File;
+  const OrigBlob = w.Blob;
+  const OrigDataTransfer = w.DataTransfer;
   let injecting: Event | undefined;
 
   for (const type of INPUT_EVENT_TYPES) {
@@ -531,10 +536,82 @@ export function replayInput(ctx: ReplayContext): ReplayInjector {
         if (t instanceof w.HTMLElement || t instanceof w.SVGElement) t.focus();
         return undefined;
       case Effect.files:
-        return "the files of a file input cannot be replayed";
+        return setFiles(el, v);
       default:
         return `unknown DomEffect ${e.effect}`;
     }
+  };
+
+  /**
+   * Give a file input the files the user chose, in the recorded shape
+   * (`fileJson`, seams-dom.ts): name, size, type, modification time and
+   * relative path. Their contents were not recorded: on record, a read of
+   * them was refused (`file-content`), and that refusal ends the replay
+   * where the page reads them, so these bytes are never what it computes on.
+   */
+  const setFiles = (el: HTMLInputElement, v: unknown): string | undefined => {
+    if (!(el instanceof w.HTMLInputElement) || el.type !== "file") {
+      return "a files effect names an element that is not a file input";
+    }
+    if (OrigDataTransfer === undefined || OrigFile === undefined) {
+      return "this browser cannot set a file input's files";
+    }
+    // The same choice, effect after effect (an `input` and its `change`),
+    // is the same `FileList` of the same files, as on record.
+    const json = JSON.stringify(v);
+    const last = chosen.get(el);
+    if (last?.json === json) {
+      if (el.files !== last.files) el.files = last.files;
+      return undefined;
+    }
+    const dt = new OrigDataTransfer();
+    for (const f of Array.isArray(v) ? v : []) {
+      const j = f as {
+        name: string;
+        size: number;
+        type: string;
+        lastModified: number;
+        webkitRelativePath?: string;
+      };
+      if (!Number.isSafeInteger(j.size) || j.size < 0) {
+        return `a files effect has a file of size ${JSON.stringify(j.size)}`;
+      }
+      const file = new OrigFile(zeroParts(j.size), j.name, {
+        type: j.type,
+        lastModified: j.lastModified,
+      });
+      if (j.webkitRelativePath) {
+        Object.defineProperty(file, "webkitRelativePath", {
+          value: j.webkitRelativePath,
+          enumerable: true,
+        });
+      }
+      dt.items.add(file);
+    }
+    el.files = dt.files;
+    chosen.set(el, { json, files: dt.files });
+    return undefined;
+  };
+  const chosen = new WeakMap<object, { json: string; files: FileList }>();
+
+  /**
+   * The parts of a file of `size` zero bytes, without holding `size` bytes:
+   * a user may choose a file of gigabytes, which one array could not hold.
+   * A `Blob` part is kept by reference (File API, "process blob parts": a
+   * `Blob` element contributes its bytes, which Chromium shares rather than
+   * copies; https://w3c.github.io/FileAPI/#process-blob-parts), so the file
+   * is made of references to one 1 MiB zero blob and a slice of it.
+   */
+  const ZERO_CHUNK = 1 << 20;
+  let zeroChunk: Blob | undefined;
+  const zeroParts = (size: number): BlobPart[] => {
+    if (size <= ZERO_CHUNK) return [new Uint8Array(size)];
+    zeroChunk ??= new OrigBlob([new Uint8Array(ZERO_CHUNK)]);
+    const parts: BlobPart[] = [];
+    let left = size;
+    for (; left >= ZERO_CHUNK; left -= ZERO_CHUNK) parts.push(zeroChunk);
+    if (left > 0) parts.push(zeroChunk.slice(0, left));
+    return parts;
   };
 
   return {

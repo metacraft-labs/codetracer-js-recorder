@@ -10,10 +10,18 @@
  * delay has no effect except through its `Task` record).
  */
 
+import { PLATFORM_VALUE_SRC } from "@codetracer/boundary-format";
+
 import { REPLAY_GATE_MARKER } from "../document-progress.js";
 import { asConstructor, replaceAccessor, replaceValue } from "../context.js";
 import { ClockSrc, TaskKind } from "../recorder.js";
-import { UNRECORDABLE_TIMER_HANDLER } from "../seams-time.js";
+import {
+  OBSERVERS,
+  UNRECORDABLE_TIMER_HANDLER,
+  observedJson,
+} from "../seams-time.js";
+import { resolveTarget, targetOf } from "../targets.js";
+import { performanceEntriesOf } from "./platform.js";
 import { type ReplayContext, bitsToNumber, utf8Text } from "./context.js";
 
 /** Replace every seam this module owns. */
@@ -191,6 +199,38 @@ function replayTimers(ctx: ReplayContext): void {
     );
   }
 
+  // Each replayed deadline -> its idle callback's task id. `timeRemaining()`
+  // is a clock read (`Clock` src 6) and `didTimeout` a `PlatformValue`
+  // (src 6) of that task, as on record (seams-time.ts).
+  const deadlines = new WeakMap<object, bigint>();
+  const IdleDeadlineProto = (
+    w as unknown as { IdleDeadline?: { prototype: Record<string, unknown> } }
+  ).IdleDeadline?.prototype;
+  if (IdleDeadlineProto !== undefined) {
+    replaceValue(IdleDeadlineProto, "timeRemaining", function timeRemaining() {
+      return bitsToNumber(
+        replay.next("Clock", { src: ClockSrc.idleTimeRemaining }).bits,
+      );
+    });
+    const d = Object.getOwnPropertyDescriptor(IdleDeadlineProto, "didTimeout");
+    if (d?.get !== undefined) {
+      replaceAccessor(
+        IdleDeadlineProto,
+        "didTimeout",
+        function (this: unknown) {
+          return JSON.parse(
+            replay.next("PlatformValue", {
+              src: PLATFORM_VALUE_SRC.idleDeadline,
+              task_id: deadlines.get(this as object) ?? 0n,
+              query: "didTimeout",
+            }).value,
+          ) as boolean;
+        },
+        d.set,
+      );
+    }
+  }
+
   if (ctx.orig.requestIdleCallback !== undefined) {
     replaceValue(
       w,
@@ -205,9 +245,12 @@ function replayTimers(ctx: ReplayContext): void {
         taskOf.set(handle, id);
         replay.onTask(id, () => {
           cancel(handle);
-          // The deadline is not logged (§10.1 lists no read of it): an idle
-          // period of zero is the value no recording contradicts.
-          cb.call(w, { didTimeout: false, timeRemaining: () => 0 });
+          // An IdleDeadline whose reads answer from the log (below).
+          const deadline = Object.create(
+            IdleDeadlineProto ?? Object.prototype,
+          ) as IdleDeadline;
+          deadlines.set(deadline, id);
+          cb.call(w, deadline);
         });
         return handle;
       },
@@ -245,15 +288,55 @@ function withoutGates(entries: unknown[]): unknown[] {
 
 /**
  * Observer callbacks are tasks (`TaskReg{kind 10}` at construction, a
- * `Task` per callback, §10.1). The platform observer is real, so
- * `observe` and `takeRecords` behave as they do; its own callback only
- * collects entries, and the page's runs when the scheduler releases its
- * `Task`, with what was collected (the entries' values are not logged).
+ * `Task` per callback, §10.1), and what each hands the page is the
+ * `PlatformValue` after its `Task` (seams-time.ts). The platform observer
+ * is real, so `observe` checks its arguments and the observed elements are
+ * known; its own callback only collects. The page's runs when the scheduler
+ * releases its `Task`, with the logged entries of an
+ * `IntersectionObserver`, a `ResizeObserver` or a `PerformanceObserver`
+ * rebuilt as objects of their interfaces, and with the replay browser's own
+ * records of a `MutationObserver` once they are shown to equal the logged
+ * ones (the page's DOM changes are replayed, so are its records; a
+ * difference is an `ArgumentMismatch`). `takeRecords()` likewise.
  */
 function replayObservers(ctx: ReplayContext): void {
   const { w, replay, orig } = ctx;
-  const observer = (name: string, Orig: Function | undefined): void => {
-    if (Orig === undefined) return;
+  for (const { name, src, takeRecords } of OBSERVERS) {
+    const Orig = orig[name] as Function | undefined;
+    if (Orig === undefined) continue;
+    const proto = (Orig as { prototype: Record<string, unknown> }).prototype;
+    const origTake = proto.takeRecords as
+      | ((this: object) => unknown[])
+      | undefined;
+    const origObserve = proto.observe as (
+      this: object,
+      ...a: unknown[]
+    ) => unknown;
+    const tasks = new WeakMap<object, bigint>();
+    // The elements each observer was asked to observe: what a logged
+    // entry's target names.
+    const observed = new WeakMap<object, Set<Element>>();
+    /** The logged value of the observer's callback or `takeRecords()`. */
+    const logged = (id: bigint, query: string, actual?: string) =>
+      replay.next("PlatformValue", {
+        src,
+        task_id: id,
+        query,
+        ...(actual === undefined ? {} : { value: actual }),
+      });
+    /** The real records of a MutationObserver, without the runner's gates. */
+    const realRecords = (o: object, collected: unknown[]) => {
+      const all = [...collected, ...(origTake?.call(o) ?? [])];
+      return withoutGates(all);
+    };
+    /** Rebuild logged entries of an IntersectionObserver or a ResizeObserver. */
+    const entriesOf = (o: object, json: unknown): unknown[] =>
+      (Array.isArray(json) ? json : []).map((j) =>
+        observerEntryOf(ctx, name, j as Record<string, unknown>, (t) =>
+          targetElement(ctx, observed.get(o), t),
+        ),
+      );
+
     const Patched = function (
       this: unknown,
       callback: Function,
@@ -272,31 +355,183 @@ function replayObservers(ctx: ReplayContext): void {
       const collected: unknown[] = [];
       const o = Reflect.construct(
         Orig,
-        [(entries: unknown[]) => collected.push(...entries), ...rest],
+        [
+          (entries: unknown) => {
+            if (name === "MutationObserver") {
+              collected.push(...(entries as unknown[]));
+            }
+          },
+          ...rest,
+        ],
         new.target,
-      ) as { takeRecords?: () => unknown[] };
-      replay.registerTask(id, 10, 0);
+      ) as object;
+      tasks.set(o, id);
+      observed.set(o, new Set());
+      replay.registerTask(id, TaskKind.observer, 0);
       replay.onTask(id, () => {
-        const entries = collected.splice(0);
         if (name === "MutationObserver") {
-          entries.push(
-            ...(orig.MutationObserver!.prototype.takeRecords.call(
-              o as MutationObserver,
-            ) as unknown[]),
-          );
+          const records = realRecords(o, collected.splice(0));
+          logged(id, "callback", observedJson(name, records));
+          callback.call(o, records, o);
+          return;
         }
-        callback.call(
-          o,
-          name === "MutationObserver" ? withoutGates(entries) : entries,
-          o,
-        );
+        const v = JSON.parse(logged(id, "callback").value) as unknown;
+        if (name === "PerformanceObserver") {
+          const pv = v as { entries?: unknown; droppedEntriesCount?: number };
+          const list = performanceListOf(
+            ctx,
+            performanceEntriesOf(ctx, pv.entries),
+          );
+          if (pv.droppedEntriesCount === undefined) callback.call(o, list, o);
+          else
+            callback.call(o, list, o, {
+              droppedEntriesCount: pv.droppedEntriesCount,
+            });
+          return;
+        }
+        callback.call(o, entriesOf(o, v), o);
       });
       return o;
     };
     asConstructor(Patched, Orig);
     replaceValue(w, name, Patched);
+    if (typeof origObserve === "function" && name !== "PerformanceObserver") {
+      replaceValue(
+        proto,
+        "observe",
+        function observe(this: object, ...args: unknown[]) {
+          const r = origObserve.apply(this, args);
+          if (args[0] instanceof w.Element) observed.get(this)?.add(args[0]);
+          return r;
+        },
+      );
+    }
+    if (!takeRecords || typeof origTake !== "function") continue;
+    replaceValue(proto, "takeRecords", function takeRecords(this: object) {
+      const id = tasks.get(this);
+      if (id === undefined) return origTake.call(this);
+      if (name === "MutationObserver") {
+        const records = realRecords(this, []);
+        logged(id, "takeRecords", observedJson(name, records));
+        return records;
+      }
+      origTake.call(this);
+      const v = JSON.parse(logged(id, "takeRecords").value) as unknown;
+      if (name === "PerformanceObserver") {
+        return performanceEntriesOf(ctx, (v as { entries?: unknown }).entries);
+      }
+      return entriesOf(this, v);
+    });
+  }
+}
+
+/**
+ * The element a logged entry's target names: among the elements the observer
+ * observes (an element removed from the document is still observed there),
+ * the one whose target string it is; else the document's (§10.2).
+ */
+function targetElement(
+  ctx: ReplayContext,
+  observed: Set<Element> | undefined,
+  target: string,
+): Element | null {
+  const matches = [...(observed ?? [])].filter((e) => targetOf(e) === target);
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) {
+    ctx.replay.fail(
+      "ArgumentMismatch",
+      `an observer entry's target ${target} names ${matches.length} observed elements`,
+    );
+  }
+  const r = resolveTarget(target, ctx.w.document);
+  return r instanceof ctx.w.Element ? r : null;
+}
+
+/** A logged IntersectionObserver or ResizeObserver entry, rebuilt. */
+function observerEntryOf(
+  ctx: ReplayContext,
+  name: string,
+  j: Record<string, unknown>,
+  element: (target: string) => Element | null,
+): object {
+  const { w } = ctx;
+  const g = w as unknown as Record<string, { prototype?: object } | undefined>;
+  const rect = (r: unknown) => {
+    if (r === null || r === undefined) return null;
+    const v = r as { x: number; y: number; width: number; height: number };
+    return w.DOMRectReadOnly.fromRect(v);
   };
-  observer("IntersectionObserver", orig.IntersectionObserver);
-  observer("ResizeObserver", orig.ResizeObserver);
-  observer("MutationObserver", orig.MutationObserver);
+  const sizes = (list: unknown) =>
+    Object.freeze(
+      (Array.isArray(list) ? list : []).map((s: Record<string, unknown>) => {
+        const o = Object.create(
+          g.ResizeObserverSize?.prototype ?? Object.prototype,
+        ) as object;
+        Object.defineProperties(o, {
+          inlineSize: { value: s.inlineSize, enumerable: true },
+          blockSize: { value: s.blockSize, enumerable: true },
+        });
+        return o;
+      }),
+    );
+  const iface =
+    name === "IntersectionObserver"
+      ? "IntersectionObserverEntry"
+      : "ResizeObserverEntry";
+  const e = Object.create(g[iface]?.prototype ?? Object.prototype) as object;
+  const props: Record<string, unknown> =
+    name === "IntersectionObserver"
+      ? {
+          target: element(String(j.target)),
+          time: j.time,
+          rootBounds: rect(j.rootBounds),
+          boundingClientRect: rect(j.boundingClientRect),
+          intersectionRect: rect(j.intersectionRect),
+          isIntersecting: j.isIntersecting,
+          intersectionRatio: j.intersectionRatio,
+          ...("isVisible" in j ? { isVisible: j.isVisible } : {}),
+        }
+      : {
+          target: element(String(j.target)),
+          contentRect: rect(j.contentRect),
+          borderBoxSize: sizes(j.borderBoxSize),
+          contentBoxSize: sizes(j.contentBoxSize),
+          devicePixelContentBoxSize: sizes(j.devicePixelContentBoxSize),
+        };
+  for (const [k, v] of Object.entries(props)) {
+    Object.defineProperty(e, k, { value: v, enumerable: true });
+  }
+  return e;
+}
+
+/**
+ * A `PerformanceObserverEntryList` of `entries` (Performance Timeline,
+ * "PerformanceObserverEntryList interface"): its three methods, filtering
+ * as the platform's do, as own methods of an object of that interface.
+ */
+function performanceListOf(ctx: ReplayContext, entries: object[]): object {
+  const g = ctx.w as unknown as Record<
+    string,
+    { prototype?: object } | undefined
+  >;
+  const list = Object.create(
+    g.PerformanceObserverEntryList?.prototype ?? Object.prototype,
+  ) as object;
+  const field = (e: object, k: string) => (e as Record<string, unknown>)[k];
+  Object.defineProperties(list, {
+    getEntries: { value: () => [...entries] },
+    getEntriesByType: {
+      value: (type: unknown) =>
+        entries.filter((e) => field(e, "entryType") === String(type)),
+    },
+    getEntriesByName: {
+      value: (name: unknown, type?: unknown) =>
+        entries.filter(
+          (e) =>
+            field(e, "name") === String(name) &&
+            (type === undefined || field(e, "entryType") === String(type)),
+        ),
+    },
+  });
+  return list;
 }

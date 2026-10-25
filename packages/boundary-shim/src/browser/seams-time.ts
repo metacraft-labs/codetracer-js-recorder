@@ -17,6 +17,14 @@ import {
   replaceValue,
   utf8Bytes,
 } from "./context.js";
+import { PLATFORM_VALUE_SRC } from "@codetracer/boundary-format";
+
+import {
+  intersectionEntryJson,
+  mutationRecordJson,
+  performanceEntriesJson,
+  resizeEntryJson,
+} from "./entries.js";
 import { ClockSrc, TaskKind, numberToBits } from "./recorder.js";
 
 /**
@@ -138,6 +146,56 @@ function patchRandom({ w, rec, orig }: SeamContext): void {
   }
 }
 
+/**
+ * An idle callback's deadline (HTML, "IdleDeadline"): `timeRemaining()` is a
+ * clock read (`Clock` src 6), each call, and `didTimeout` a
+ * `PlatformValue` (src 6, the callback's task id): both depend on how busy
+ * the machine was.
+ */
+function patchIdleDeadline(
+  { w, rec }: SeamContext,
+  deadlines: WeakMap<object, bigint>,
+): void {
+  const proto = (
+    w as unknown as { IdleDeadline?: { prototype: Record<string, unknown> } }
+  ).IdleDeadline?.prototype;
+  if (proto === undefined) return;
+  const origRemaining = proto.timeRemaining as (() => number) | undefined;
+  if (typeof origRemaining === "function") {
+    replaceValue(proto, "timeRemaining", function timeRemaining(this: object) {
+      const v = origRemaining.call(this);
+      rec.guard(() =>
+        rec.emit("Clock", {
+          src: ClockSrc.idleTimeRemaining,
+          bits: numberToBits(v),
+        }),
+      );
+      return v;
+    });
+  }
+  const d = Object.getOwnPropertyDescriptor(proto, "didTimeout");
+  if (d?.get !== undefined) {
+    const get = d.get;
+    replaceAccessor(
+      proto,
+      "didTimeout",
+      function (this: unknown) {
+        const v = get.call(this) as boolean;
+        rec.guard(() =>
+          rec.emit("PlatformValue", {
+            src: PLATFORM_VALUE_SRC.idleDeadline,
+            task_id: deadlines.get(this as object) ?? 0n,
+            query: "didTimeout",
+            value: JSON.stringify(v),
+          }),
+        );
+        return v;
+      },
+      d.set,
+    );
+  }
+}
+
 function delayOf(timeout: unknown): number {
   const d = Number(timeout);
   return Number.isFinite(d) ? d : 0;
@@ -252,6 +310,10 @@ function patchTimers(ctx: SeamContext): void {
   }
 
   const origIdle = orig.requestIdleCallback;
+  // Each idle callback's deadline -> the callback's task id (§5.2:
+  // `PlatformValue` src 6 names the task whose deadline was read).
+  const deadlines = new WeakMap<object, bigint>();
+  patchIdleDeadline(ctx, deadlines);
   if (origIdle !== undefined) {
     replaceValue(
       w,
@@ -263,6 +325,7 @@ function patchTimers(ctx: SeamContext): void {
         if (!rec.recording) return origIdle.call(w, cb, options);
         const taskId = rec.nextTaskId();
         const run = function (this: unknown, deadline: IdleDeadline): void {
+          deadlines.set(deadline, taskId);
           rec.guard(() => rec.task(taskId, TaskKind.idle));
           return cb.call(this, deadline);
         };
@@ -284,9 +347,89 @@ function patchTimers(ctx: SeamContext): void {
   // is fixed (§6). Replay mode owns them.
 }
 
+/**
+ * How each observer's callback arguments are written (§5.2
+ * `PlatformValue`): its `src`, the JSON of the list it hands the page, and
+ * whether it has a `takeRecords()` that hands the page the same kind of
+ * list.
+ */
+export const OBSERVERS: readonly {
+  name:
+    | "IntersectionObserver"
+    | "ResizeObserver"
+    | "MutationObserver"
+    | "PerformanceObserver";
+  src: number;
+  takeRecords: boolean;
+}[] = [
+  {
+    name: "IntersectionObserver",
+    src: PLATFORM_VALUE_SRC.intersectionObserver,
+    takeRecords: true,
+  },
+  {
+    name: "ResizeObserver",
+    src: PLATFORM_VALUE_SRC.resizeObserver,
+    takeRecords: false,
+  },
+  {
+    name: "MutationObserver",
+    src: PLATFORM_VALUE_SRC.mutationObserver,
+    takeRecords: true,
+  },
+  {
+    name: "PerformanceObserver",
+    src: PLATFORM_VALUE_SRC.performanceObserver,
+    takeRecords: true,
+  },
+];
+
+/**
+ * The JSON of what observer `name` hands the page: its callback's
+ * arguments (`args`) or the list `takeRecords()` returned (`list`).
+ * A `PerformanceObserver` callback's value also carries the
+ * `droppedEntriesCount` of its third argument, when it has one.
+ */
+export function observedJson(name: string, list: unknown, third?: unknown) {
+  if (name === "PerformanceObserver") {
+    const entries = Array.isArray(list)
+      ? (list as PerformanceEntry[])
+      : (list as PerformanceObserverEntryList).getEntries();
+    const out: Record<string, unknown> = {
+      entries: performanceEntriesJson(entries),
+    };
+    const dropped = (third as { droppedEntriesCount?: unknown } | undefined)
+      ?.droppedEntriesCount;
+    if (typeof dropped === "number") out.droppedEntriesCount = dropped;
+    return JSON.stringify(out);
+  }
+  const items = Array.from(list as ArrayLike<unknown>);
+  const json =
+    name === "IntersectionObserver"
+      ? items.map((e) => intersectionEntryJson(e as IntersectionObserverEntry))
+      : name === "ResizeObserver"
+        ? items.map((e) => resizeEntryJson(e as ResizeObserverEntry))
+        : items.map((e) => mutationRecordJson(e as MutationRecord));
+  return JSON.stringify(json);
+}
+
+/**
+ * Observer callbacks are tasks (`TaskReg{kind 10}` at construction, a
+ * `Task` per callback, §10.1), and what each hands the page is a
+ * `PlatformValue` after its `Task`: the entries of an
+ * `IntersectionObserver`, a `ResizeObserver` or a `PerformanceObserver`
+ * (their layout and timing values depend on the machine), the records of a
+ * `MutationObserver` (which replay compares with its own). A
+ * `takeRecords()` call is a `PlatformValue` of its own (query
+ * `takeRecords`).
+ */
 function patchObservers({ w, rec, orig }: SeamContext): void {
-  const observer = (name: string, Orig: Function | undefined): void => {
-    if (Orig === undefined) return;
+  for (const { name, src, takeRecords } of OBSERVERS) {
+    const Orig = orig[name] as Function | undefined;
+    if (Orig === undefined) continue;
+    const tasks = new WeakMap<object, bigint>();
+    const value = (taskId: bigint, query: string, json: string) =>
+      rec.emit("PlatformValue", { src, task_id: taskId, query, value: json });
     const Patched = function (
       this: unknown,
       callback: Function,
@@ -304,10 +447,14 @@ function patchObservers({ w, rec, orig }: SeamContext): void {
       }
       const taskId = rec.nextTaskId();
       const run = function (this: unknown, ...a: unknown[]): unknown {
-        rec.guard(() => rec.task(taskId, TaskKind.observer));
+        rec.guard(() => {
+          rec.task(taskId, TaskKind.observer);
+          value(taskId, "callback", observedJson(name, a[0], a[2]));
+        });
         return callback.apply(this, a);
       };
-      const o = Reflect.construct(Orig, [run, ...rest], new.target);
+      const o = Reflect.construct(Orig, [run, ...rest], new.target) as object;
+      tasks.set(o, taskId);
       rec.guard(() =>
         rec.emit("TaskReg", {
           task_id: taskId,
@@ -319,8 +466,17 @@ function patchObservers({ w, rec, orig }: SeamContext): void {
     };
     asConstructor(Patched, Orig);
     replaceValue(w, name, Patched);
-  };
-  observer("IntersectionObserver", orig.IntersectionObserver);
-  observer("ResizeObserver", orig.ResizeObserver);
-  observer("MutationObserver", orig.MutationObserver);
+    if (!takeRecords) continue;
+    const proto = (Orig as { prototype: Record<string, unknown> }).prototype;
+    const origTake = proto.takeRecords as (() => unknown[]) | undefined;
+    if (typeof origTake !== "function") continue;
+    replaceValue(proto, "takeRecords", function takeRecords(this: object) {
+      const list = origTake.call(this);
+      const taskId = tasks.get(this);
+      if (taskId !== undefined) {
+        rec.guard(() => value(taskId, "takeRecords", observedJson(name, list)));
+      }
+      return list;
+    });
+  }
 }

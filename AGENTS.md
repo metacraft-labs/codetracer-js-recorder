@@ -134,7 +134,14 @@ This is a monorepo managed with npm workspaces:
   generic shim's replay mode is `packages/boundary-shim/src/browser/replay/`
   (its own bundle, `dist/boundary-shim-replay.iife.js`, so recorded pages never
   carry it), a client of `__ctReplay`; so is the reference framework's replay
-  mode. A `.ct` is read through the native addon's `readCtfsMember` (the
+  mode. Every value a page reads is answered from the log or was refused on
+  record: the events replay dispatches in the platform's place reach the
+  page's listeners through `replay/trusted.ts` (a view whose `isTrusted` is
+  `true`), and the values of observers, the performance timeline and idle
+  deadlines are `PlatformValue` records (`entries.ts`, one JSON form for both
+  sides); each such value is pinned by `tests/boundary/replay-values.test.ts`,
+  which records a fixture case, replays it to `End`, and replays it again with
+  the value edited, which must diverge. A `.ct` is read through the native addon's `readCtfsMember` (the
   canonical CTFS reader), never a second container decoder. The conformance
   suite's replay leg (`ct-boundary-conformance replay`,
   `packages/boundary-conformance/src/replay-leg.ts`) runs it. Pinned by

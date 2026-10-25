@@ -30,15 +30,19 @@ import {
   replaceValue,
   utf8Bytes,
 } from "./context.js";
-import { XHR_EVENT } from "@codetracer/boundary-format";
+import { WS_FRAME, XHR_EVENT } from "@codetracer/boundary-format";
 
 import { TaskKind } from "./recorder.js";
+import { markPageResponse } from "./seams-platform.js";
 import { sha256Hex } from "./sha256.js";
 import {
   Dir,
+  NOT_A_MESSAGE,
+  NO_RESPONSE_META,
   Outcome,
   emitBodyEnd,
   failureOutcome,
+  fetchResponseMeta,
   patchResponses,
 } from "./stream-body.js";
 
@@ -160,6 +164,8 @@ function patchFetch(ctx: SeamContext): void {
           // platform's promise. The page gets its response now; its body is
           // recorded piece by piece as the page reads it (stream-body.ts).
           let page = resp;
+          // Passed to the page as it came unless rebuilt below.
+          markPageResponse(resp);
           rec.guard(() => {
             const headers = headersJson(Array.from(resp.headers));
             rec.task(ids.taskId, TaskKind.networkCompletion);
@@ -181,6 +187,7 @@ function patchFetch(ctx: SeamContext): void {
               req_id: ids.reqId,
               outcome,
               status: resp.status,
+              ...fetchResponseMeta(resp),
               headers,
               body: inline(EMPTY),
             });
@@ -198,6 +205,7 @@ function patchFetch(ctx: SeamContext): void {
               req_id: ids.reqId,
               outcome,
               status: 0,
+              ...NO_RESPONSE_META,
               headers: "[]",
               body: inline(EMPTY),
             });
@@ -211,6 +219,22 @@ function patchFetch(ctx: SeamContext): void {
 
 /** `XMLHttpRequest.readyState` values (XHR standard). */
 const ReadyState = { opened: 1, headersReceived: 2, loading: 3, done: 4 };
+
+/**
+ * The `NetResponse` fields of what a page can read of an XMLHttpRequest's
+ * response besides its status and headers (§5.2): `statusText` and the final
+ * URL after any redirect, `responseURL`. An XMLHttpRequest exposes neither
+ * whether it was redirected nor a response type (XHR standard), so those are
+ * 0.
+ */
+function xhrResponseMeta(x: XMLHttpRequest) {
+  return {
+    status_text: x.statusText,
+    url: x.responseURL,
+    redirected: 0,
+    response_type: 0,
+  };
+}
 
 /**
  * The `XhrEvent.event` of each `ProgressEvent` type an XMLHttpRequest and
@@ -330,6 +354,7 @@ function patchXhr(ctx: SeamContext): void {
         req_id: s.reqId!,
         outcome,
         status: 0,
+        ...NO_RESPONSE_META,
         headers: "[]",
         body: inline(EMPTY),
       });
@@ -341,6 +366,7 @@ function patchXhr(ctx: SeamContext): void {
       req_id: s.reqId!,
       outcome: Outcome.head,
       status: x.status,
+      ...xhrResponseMeta(x),
       headers: responseHeaders(x),
       body: inline(EMPTY),
     });
@@ -349,6 +375,7 @@ function patchXhr(ctx: SeamContext): void {
     rec.emit("WsMessage", {
       req_id: s.reqId!,
       dir: Dir.in,
+      ...NOT_A_MESSAGE,
       data: inline(bytes),
     });
 
@@ -401,6 +428,7 @@ function patchXhr(ctx: SeamContext): void {
         req_id: s.reqId!,
         outcome,
         status: x.status,
+        ...xhrResponseMeta(x),
         headers: responseHeaders(x),
         body: inline(body),
       });
@@ -794,6 +822,7 @@ function patchBeacon(ctx: SeamContext): void {
             req_id: reqId,
             outcome: queued ? Outcome.response : Outcome.networkError,
             status: 0,
+            ...NO_RESPONSE_META,
             headers: "[]",
             body: inline(EMPTY),
           }),
@@ -813,36 +842,71 @@ export function messageBytes(data: unknown): Uint8Array | null {
   return null;
 }
 
+/** The binary or text frame of a message's data (§5.2 `WsMessage.frame`). */
+export function frameOf(data: unknown): number {
+  return typeof data === "string" ? WS_FRAME.text : WS_FRAME.binary;
+}
+
+/**
+ * The handshake response headers a page can read of an open WebSocket
+ * (WebSocket standard: `protocol` is the server's
+ * `Sec-WebSocket-Protocol`, `extensions` its `Sec-WebSocket-Extensions`;
+ * https://websockets.spec.whatwg.org/#feedback-from-the-protocol), written as
+ * the open's `NetResponse.headers` (§10.4).
+ */
+export const WS_PROTOCOL_HEADER = "sec-websocket-protocol";
+export const WS_EXTENSIONS_HEADER = "sec-websocket-extensions";
+
 /**
  * Register the shim's listeners on a streaming connection, first, so its
  * records precede the page's handlers. `open` logs the connection's
- * response (`NetResponse` with `openStatus`), an `error` before `open` a
- * network-error response, `close` a `WsMessage{dir: close}` carrying the
- * close code, reason and cleanliness as JSON, and every other event type a
- * `WsMessage{dir: in}` with its data.
+ * response (`NetResponse`, status 101 for a socket with the handshake's
+ * protocol and extensions as its headers, 200 for an event stream), an
+ * `error` before `open` a network-error response, `close` a
+ * `WsMessage{dir: close}` carrying the close code, reason and cleanliness
+ * as JSON, and every other event type a `WsMessage{dir: in}` with its data,
+ * whether it was a text or a binary message, and for an event stream its
+ * event type and last event id (§5.2).
  */
 function listenStream(
   ctx: SeamContext,
-  target: EventTarget,
+  target: WebSocket | EventSource,
   reqId: bigint,
   taskId: bigint,
   taskKind: number,
   types: readonly string[],
-  openStatus: number,
+  api: "webSocket" | "eventSource",
 ): void {
   const { rec, orig } = ctx;
   let opened = false;
+  // An event stream's messages come from the origin of its (final) URL; the
+  // log keeps the request's, so a stream the server redirected to another
+  // origin is refused rather than replayed with a wrong `origin`.
+  let origin = "";
+  try {
+    origin = new URL(target.url).origin;
+  } catch {
+    origin = "";
+  }
   const handler = (ev: Event) => {
     rec.guard(() => {
       if (!rec.recording) return;
       rec.task(taskId, taskKind);
       if (ev.type === "open") {
         opened = true;
+        const ws = target as WebSocket;
         rec.emit("NetResponse", {
           req_id: reqId,
           outcome: Outcome.response,
-          status: openStatus,
-          headers: "[]",
+          status: api === "webSocket" ? 101 : 200,
+          ...NO_RESPONSE_META,
+          headers:
+            api === "webSocket"
+              ? headersJson([
+                  [WS_PROTOCOL_HEADER, ws.protocol],
+                  [WS_EXTENSIONS_HEADER, ws.extensions],
+                ])
+              : "[]",
           body: inline(EMPTY),
         });
       } else if (ev.type === "error") {
@@ -851,6 +915,7 @@ function listenStream(
             req_id: reqId,
             outcome: Outcome.networkError,
             status: 0,
+            ...NO_RESPONSE_META,
             headers: "[]",
             body: inline(EMPTY),
           });
@@ -860,6 +925,7 @@ function listenStream(
         rec.emit("WsMessage", {
           req_id: reqId,
           dir: Dir.close,
+          ...NOT_A_MESSAGE,
           data: inline(
             utf8Bytes(
               JSON.stringify({
@@ -871,17 +937,27 @@ function listenStream(
           ),
         });
       } else {
-        let bytes = messageBytes((ev as MessageEvent).data);
+        const m = ev as MessageEvent;
+        let bytes = messageBytes(m.data);
         if (bytes === null) {
           ctx.refuseOnce(
             UNRECORDABLE_MESSAGE,
-            `${ev.type} data ${typeName((ev as MessageEvent).data)}`,
+            `${ev.type} data ${typeName(m.data)}`,
           );
           bytes = EMPTY;
+        }
+        if (api === "eventSource" && m.origin !== origin) {
+          ctx.refuseOnce(
+            UNRECORDABLE_MESSAGE,
+            `an event stream message from ${m.origin}, not ${origin}`,
+          );
         }
         rec.emit("WsMessage", {
           req_id: reqId,
           dir: Dir.in,
+          frame: frameOf(m.data),
+          event: api === "eventSource" ? ev.type : "",
+          last_event_id: api === "eventSource" ? m.lastEventId : "",
           data: inline(bytes),
         });
       }
@@ -940,7 +1016,7 @@ function patchWebSocket(ctx: SeamContext): void {
           taskId,
           TaskKind.webSocket,
           ["open", "message", "error", "close"],
-          101,
+          "webSocket",
         );
       });
     }
@@ -973,6 +1049,9 @@ function patchWebSocket(ctx: SeamContext): void {
           rec.emit("WsMessage", {
             req_id: reqId,
             dir: Dir.out,
+            frame: frameOf(data),
+            event: "",
+            last_event_id: "",
             data: inline(bytes),
           });
         });
@@ -1024,12 +1103,28 @@ function patchEventSource(ctx: SeamContext): void {
           delay_ms: 0,
         });
         const types = new Set(["open", "message", "error"]);
-        listenStream(ctx, es, reqId, taskId, TaskKind.message, [...types], 200);
+        listenStream(
+          ctx,
+          es,
+          reqId,
+          taskId,
+          TaskKind.message,
+          [...types],
+          "eventSource",
+        );
         listening.set(es, {
           types,
           add: (t) => {
             types.add(t);
-            listenStream(ctx, es, reqId, taskId, TaskKind.message, [t], 200);
+            listenStream(
+              ctx,
+              es,
+              reqId,
+              taskId,
+              TaskKind.message,
+              [t],
+              "eventSource",
+            );
           },
         });
       });

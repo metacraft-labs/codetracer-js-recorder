@@ -25,7 +25,10 @@ import { recordDocumentProgress } from "./document-progress.js";
 import { captureOriginals, type ShimOriginals } from "./originals.js";
 import { Recorder } from "./recorder.js";
 import { listenForPageEvents, patchDomSeams } from "./seams-dom.js";
+import { listenForStorageEvents, patchMessageSeams } from "./seams-message.js";
 import { patchNetSeams } from "./seams-net.js";
+import { patchPerformance } from "./seams-perf.js";
+import { patchPlatformSeams } from "./seams-platform.js";
 import { patchRefusals } from "./seams-refusals.js";
 import { patchTimeSeams } from "./seams-time.js";
 
@@ -164,10 +167,14 @@ export function installBoundaryShim(
     patchTimeSeams,
     patchNetSeams,
     patchDomSeams,
+    patchPlatformSeams,
+    patchPerformance,
+    patchMessageSeams,
     patchRefusals,
   ]) {
     rec.guard(() => patch(ctx));
   }
+  rec.guard(() => listenForStorageEvents(ctx, storageAreaNamer(w, orig)));
   rec.guard(() =>
     listenForPageEvents(ctx, () => rec.end(EndReason.pagehide, true)),
   );
@@ -215,6 +222,29 @@ export function installBoundaryShim(
     writable: false,
   });
   return control;
+}
+
+/**
+ * The name a storage event's `Input` gives its area (§10.4): the real
+ * `localStorage` and `sessionStorage` objects, read through the captured
+ * getters (a document denied storage has neither).
+ */
+function storageAreaNamer(
+  w: ShimWindow,
+  orig: ShimOriginals,
+): (s: Storage | null) => "localStorage" | "sessionStorage" | null {
+  const real = new Map<Storage, "localStorage" | "sessionStorage">();
+  for (const name of ["localStorage", "sessionStorage"] as const) {
+    try {
+      const s = orig.storageAreas.get(name)?.descriptor.get!.call(w) as
+        | Storage
+        | undefined;
+      if (s !== undefined) real.set(s, name);
+    } catch {
+      // Storage denied to this document.
+    }
+  }
+  return (s) => (s === null ? null : (real.get(s) ?? null));
 }
 
 /** A client-minted 128-bit random session id, lowercase hex (§5.2). */
@@ -282,7 +312,10 @@ export function readEnvironment(w: ShimWindow, orig: ShimOriginals) {
         : 0,
     reduced_motion: media("(prefers-reduced-motion: reduce)") ? 1 : 0,
     arms: "{}",
-    url: w.location.origin + w.location.pathname,
+    // The whole URL, query and fragment included: the page reads them
+    // (`location.search`, `location.hash`), and replay loads the page at
+    // this URL (§5.2, §7.4). `meta.dat`'s `program` leaves them out (§5.1).
+    url: w.location.href,
     referrer_origin: referrerOrigin,
     traceparent: "",
   };

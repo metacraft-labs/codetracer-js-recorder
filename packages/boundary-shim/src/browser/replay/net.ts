@@ -14,17 +14,22 @@
  */
 
 import type { RecordOf } from "@codetracer/boundary-format";
+import { RESPONSE_TYPE, WS_FRAME } from "@codetracer/boundary-format";
 
 import { asConstructor, replaceAccessor, replaceValue } from "../context.js";
 import { TaskKind } from "../recorder.js";
 import {
+  WS_EXTENSIONS_HEADER,
+  WS_PROTOCOL_HEADER,
   absoluteUrl,
   bodyDigest,
+  frameOf,
   messageBytes,
   normaliseMethod,
 } from "../seams-net.js";
 import { BODY_CONSUMERS, Dir, Outcome } from "../stream-body.js";
 import { type ReplayContext, blobBytes } from "./context.js";
+import { replayPlatformTask } from "./platform.js";
 
 /** `NetRequest.api` (§5.2). */
 const Api = { fetch: 1, xhr: 2, beacon: 3, webSocket: 4, eventSource: 5 };
@@ -36,6 +41,13 @@ export function replayNetSeams(ctx: ReplayContext): void {
   replayWebSocket(ctx);
   replayEventSource(ctx);
 }
+
+/** `NetResponse.response_type` -> the `Response.type` it names (§5.2). */
+const RESPONSE_TYPE_NAMES = new Map<number, string>(
+  Object.entries(RESPONSE_TYPE)
+    .filter(([, n]) => n !== RESPONSE_TYPE.none)
+    .map(([name, n]) => [n, name]),
+);
 
 /** Statuses whose response has no body (Fetch standard, "null body status"). */
 const NULL_BODY = new Set([101, 103, 204, 205, 304]);
@@ -90,9 +102,23 @@ function replayFetch(ctx: ReplayContext): void {
   // A constructed Response cannot be given what only the platform sets on
   // one: the Response accessors answer those from `meta` for a replayed
   // response, and `clone()` carries them over (as stream-body.ts does on
-  // record). The log keeps neither the final URL of a redirect nor the
-  // status text (§10.4): the request's URL and "" stand in for them.
+  // record). The log holds each of them (`NetResponse` `status_text`,
+  // `url`, `redirected`, `response_type`; §5.2).
   const meta = new WeakMap<object, Record<string, unknown>>();
+  // A replayed response's headers (and its clones') -> headers the platform
+  // made immutable (a `Response.error()`'s, guard "immutable"; Fetch,
+  // "Headers class"): the mutators run on those and throw exactly as they
+  // do on a fetched response's headers.
+  const frozen = new WeakMap<object, Headers>();
+  const immutableHeaders = (): Headers => OrigResponse.error().headers;
+  for (const [name, f] of orig.headersMutators) {
+    const patched = function (this: unknown): unknown {
+      const platform = frozen.get(this as object);
+      return f.apply(platform ?? this, Array.from(arguments));
+    };
+    Object.defineProperty(patched, "name", { value: name });
+    replaceValue(w.Headers.prototype, name, patched);
+  }
   for (const [name, g] of orig.responseGetters) {
     const get = g.descriptor.get!;
     replaceAccessor(
@@ -105,6 +131,14 @@ function replayFetch(ctx: ReplayContext): void {
       g.descriptor.set,
     );
   }
+  // Whether this platform's response bodies are byte streams.
+  let byteBodies = false;
+  try {
+    new OrigResponse("").body!.getReader({ mode: "byob" }).releaseLock();
+    byteBodies = true;
+  } catch {
+    byteBodies = false;
+  }
   // A streamed response (and its clones) -> the whole-body reads made of
   // it, waiting for the tasks the recorder wrote when they settled.
   const consuming = new WeakMap<object, BodyRead[]>();
@@ -116,7 +150,10 @@ function replayFetch(ctx: ReplayContext): void {
       function clone(this: Response) {
         const c = origClone.call(this);
         const m = meta.get(this);
-        if (m !== undefined) meta.set(c, m);
+        if (m !== undefined) {
+          meta.set(c, m);
+          frozen.set(c.headers, immutableHeaders());
+        }
         const q = consuming.get(this);
         if (q !== undefined) consuming.set(c, q);
         return c;
@@ -141,7 +178,9 @@ function replayFetch(ctx: ReplayContext): void {
         Array.from(arguments),
       );
       const q = consuming.get(this);
-      if (q === undefined) return settled;
+      // A response no fetch of the page produced (or one with no body):
+      // its read settles in a platform task of its own (§6, Task kind 13).
+      if (q === undefined) return replayPlatformTask(ctx, settled);
       const r: BodyRead = { released: false };
       q.push(r);
       return new OrigPromise((resolve, reject) => {
@@ -164,39 +203,48 @@ function replayFetch(ctx: ReplayContext): void {
   /** The page's response for a logged head or whole response. */
   const responseOf = (
     r: RecordOf<"NetResponse">,
-    url: string,
     body: BodyInit | null,
     reads?: BodyRead[],
   ): Response => {
     const headers = JSON.parse(r.headers) as [string, string][];
     const status = r.status;
-    let sameOrigin = false;
-    try {
-      sameOrigin = new URL(url).origin === w.location.origin;
-    } catch {
-      sameOrigin = false;
+    const type = RESPONSE_TYPE_NAMES.get(r.response_type);
+    if (type === undefined) {
+      replay.fail(
+        "ArgumentMismatch",
+        `a fetch response's NetResponse.response_type is ${r.response_type}, which names no response type`,
+      );
     }
     const m: Record<string, unknown> = {
-      url,
-      redirected: false,
-      type: sameOrigin ? "basic" : "cors",
-      statusText: "",
+      url: r.url,
+      redirected: r.redirected === 1,
+      type,
+      statusText: r.status_text,
     };
+    const init = (statusText: boolean): ResponseInit => ({
+      status,
+      headers,
+      ...(statusText ? { statusText: r.status_text } : {}),
+    });
+    const content = NULL_BODY.has(status) ? null : body;
     let resp: Response;
     try {
-      resp = new OrigResponse(NULL_BODY.has(status) ? null : body, {
-        status,
-        headers,
-      });
+      try {
+        resp = new OrigResponse(content, init(true));
+      } catch {
+        // A reason phrase the constructor refuses: the accessor answers
+        // it from the log anyway.
+        resp = new OrigResponse(content, init(false));
+      }
       if (reads !== undefined && body !== null) consuming.set(resp, reads);
     } catch {
       // A status the constructor refuses (an opaque response's 0).
       resp = new OrigResponse(null, { headers });
-      m.type = "opaque";
       Object.defineProperty(resp, "status", { value: status });
       Object.defineProperty(resp, "ok", { value: false });
     }
     meta.set(resp, m);
+    frozen.set(resp.headers, immutableHeaders());
     return resp;
   };
 
@@ -234,7 +282,7 @@ function replayFetch(ctx: ReplayContext): void {
 
       return new OrigPromise<Response>((resolve, reject) => {
         let phase: "head" | "body" | "done" = "head";
-        let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+        let controller: ReadableStreamController<Uint8Array> | undefined;
         let waiting: (() => void) | undefined;
         let cancelled = false;
         /** The whole-body reads of the response, in the order made. */
@@ -250,12 +298,21 @@ function replayFetch(ctx: ReplayContext): void {
         const deliver = () => {
           const m = replay.next("WsMessage", { req_id: reqId });
           if (m.dir === Dir.in) {
-            controller!.enqueue(blobBytes(replay, m.data));
+            // A copy: a byte stream transfers the chunk's buffer, which is
+            // the decoded log's.
+            controller!.enqueue(blobBytes(replay, m.data).slice());
           } else if (m.dir === Dir.end) {
             const outcome = endOutcome(ctx, m);
             finish();
-            if (outcome === Outcome.response) controller!.close();
-            else controller!.error(failureError(w, outcome, signal));
+            if (outcome === Outcome.response) {
+              controller!.close();
+              // A BYOB read waiting for the end is answered with it.
+              (controller as ReadableByteStreamController).byobRequest?.respond(
+                0,
+              );
+            } else {
+              controller!.error(failureError(w, outcome, signal));
+            }
           } else {
             replay.fail(
               "ArgumentMismatch",
@@ -273,7 +330,11 @@ function replayFetch(ctx: ReplayContext): void {
 
         const stream = new OrigStream<Uint8Array>(
           {
-            start(c) {
+            // A byte stream exactly when the platform's response bodies are
+            // (Fetch: "with byte reading support"), so a BYOB reader works or
+            // fails as it did on record (stream-body.ts).
+            type: byteBodies ? "bytes" : undefined,
+            start(c: ReadableStreamController<Uint8Array>) {
               controller = c;
             },
             pull() {
@@ -301,12 +362,10 @@ function replayFetch(ctx: ReplayContext): void {
             const r = replay.next("NetResponse", { req_id: reqId });
             if (r.outcome === Outcome.head) {
               phase = "body";
-              resolve(responseOf(r, url, stream, reads));
+              resolve(responseOf(r, stream, reads));
             } else if (r.outcome === Outcome.response) {
               finish();
-              resolve(
-                responseOf(r, url, blobBytes(replay, r.body) as BodyInit),
-              );
+              resolve(responseOf(r, blobBytes(replay, r.body) as BodyInit));
             } else {
               finish();
               reject(failureError(w, r.outcome, signal));
@@ -398,9 +457,12 @@ interface Conn {
   reqId: bigint;
   taskId: bigint;
   binaryType: BinaryType;
+  /** A socket's negotiated subprotocol and extensions (its open's headers). */
+  protocol: string;
+  extensions: string;
+  /** An event stream's `withCredentials`, as the page asked for it. */
+  withCredentials: boolean;
   handlers: Map<string, EventListener>;
-  /** Event types the page listens for (an event stream's named events). */
-  types: Set<string>;
 }
 
 /**
@@ -484,22 +546,33 @@ function newConnObject(w: Window & typeof globalThis, Ctor: Function): object {
 }
 
 /**
- * The data of an inbound message: text when the bytes are UTF-8 (a socket's
- * text frame), otherwise binary in the page's `binaryType`. The log keeps
- * the bytes only (§10.4), so a binary frame that happens to be valid UTF-8
- * is delivered as text.
+ * The data of an inbound message as the logged frame says it came (§5.2
+ * `WsMessage.frame`): a string for a text message, the bytes in the page's
+ * `binaryType` for a binary one.
  */
 function messageData(
-  w: Window & typeof globalThis,
+  ctx: ReplayContext,
+  m: RecordOf<"WsMessage">,
   bytes: Uint8Array,
   binaryType: BinaryType,
 ): unknown {
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch {
-    const copy = bytes.slice().buffer;
-    return binaryType === "arraybuffer" ? copy : new w.Blob([copy]);
+  if (m.frame === WS_FRAME.text) return new TextDecoder().decode(bytes);
+  if (m.frame !== WS_FRAME.binary) {
+    ctx.replay.fail(
+      "ArgumentMismatch",
+      `an inbound message's WsMessage.frame is ${m.frame}, neither text (1) nor binary (2)`,
+    );
   }
+  const copy = bytes.slice().buffer;
+  return binaryType === "arraybuffer" ? copy : new ctx.w.Blob([copy]);
+}
+
+/** The value of header `name` in a logged `NetResponse.headers`, or "". */
+function headerOf(r: RecordOf<"NetResponse">, name: string): string {
+  const pair = (JSON.parse(r.headers) as [string, string][]).find(
+    ([n]) => n.toLowerCase() === name,
+  );
+  return pair === undefined ? "" : pair[1];
 }
 
 function replayWebSocket(ctx: ReplayContext): void {
@@ -509,7 +582,7 @@ function replayWebSocket(ctx: ReplayContext): void {
   const conns = new WeakMap<object, Conn>();
   const origSend = OrigWs.prototype.send;
   const origClose = OrigWs.prototype.close;
-  const dispatch = w.EventTarget.prototype.dispatchEvent;
+  const dispatch = (t: EventTarget, ev: Event) => ctx.trusted.dispatch(t, ev);
 
   const PatchedWs = function WebSocket(
     this: unknown,
@@ -528,8 +601,10 @@ function replayWebSocket(ctx: ReplayContext): void {
       reqId,
       taskId,
       binaryType: "blob",
+      protocol: "",
+      extensions: "",
+      withCredentials: false,
       handlers: new Map(),
-      types: new Set(),
     };
     conns.set(ws, c);
     replay.next("NetRequest", {
@@ -548,16 +623,18 @@ function replayWebSocket(ctx: ReplayContext): void {
         v.record.req_id === reqId;
       if (!mine) {
         // An error after the socket opened: a task with no record (§10.4).
-        dispatch.call(ws, new w.Event("error"));
+        dispatch(ws, new w.Event("error"));
         return;
       }
       if (v.record!.record === "NetResponse") {
         const r = replay.next("NetResponse", { req_id: reqId });
         if (r.outcome === Outcome.response) {
           c.readyState = 1;
-          dispatch.call(ws, new w.Event("open"));
+          c.protocol = headerOf(r, WS_PROTOCOL_HEADER);
+          c.extensions = headerOf(r, WS_EXTENSIONS_HEADER);
+          dispatch(ws, new w.Event("open"));
         } else {
-          dispatch.call(ws, new w.Event("error"));
+          dispatch(ws, new w.Event("error"));
         }
         return;
       }
@@ -571,12 +648,12 @@ function replayWebSocket(ctx: ReplayContext): void {
         };
         c.readyState = 3;
         replay.offTask(taskId);
-        dispatch.call(ws, new w.CloseEvent("close", close));
+        dispatch(ws, new w.CloseEvent("close", close));
       } else if (m.dir === Dir.in) {
-        dispatch.call(
+        dispatch(
           ws,
           new w.MessageEvent("message", {
-            data: messageData(w, bytes, c.binaryType),
+            data: messageData(ctx, m, bytes, c.binaryType),
             origin: new URL(href).origin,
           }),
         );
@@ -600,8 +677,8 @@ function replayWebSocket(ctx: ReplayContext): void {
       url: (c) => c.url,
       readyState: (c) => c.readyState,
       bufferedAmount: () => 0,
-      extensions: () => "",
-      protocol: () => "",
+      extensions: (c) => c.extensions,
+      protocol: (c) => c.protocol,
       binaryType: (c) => c.binaryType,
     },
     ["open", "message", "error", "close"],
@@ -615,7 +692,11 @@ function replayWebSocket(ctx: ReplayContext): void {
     ): void {
       const c = conns.get(this);
       if (c === undefined) return origSend.call(this, data);
-      const m = replay.next("WsMessage", { req_id: c.reqId, dir: Dir.out });
+      const m = replay.next("WsMessage", {
+        req_id: c.reqId,
+        dir: Dir.out,
+        frame: frameOf(data),
+      });
       const sent = messageBytes(data);
       const logged = blobBytes(replay, m.data);
       if (sent !== null && !sameBytes(sent, logged)) {
@@ -650,16 +731,16 @@ function replayEventSource(ctx: ReplayContext): void {
   const OrigEs = orig.EventSource;
   if (OrigEs === undefined) return;
   const conns = new WeakMap<object, Conn>();
-  const dispatch = w.EventTarget.prototype.dispatchEvent;
-  const origAdd = w.EventTarget.prototype.addEventListener;
+  const dispatch = (t: EventTarget, ev: Event) => ctx.trusted.dispatch(t, ev);
   const origEsClose = OrigEs.prototype.close;
 
   const PatchedEs = function EventSource(
     this: unknown,
     url: string | URL,
+    init?: EventSourceInit,
   ): EventSource {
     if (new.target === undefined) {
-      return (OrigEs as unknown as (...a: unknown[]) => EventSource)(url);
+      return (OrigEs as unknown as (...a: unknown[]) => EventSource)(url, init);
     }
     const es = newConnObject(w, new.target) as EventSource;
     const reqId = ctx.nextReqId();
@@ -671,8 +752,10 @@ function replayEventSource(ctx: ReplayContext): void {
       reqId,
       taskId,
       binaryType: "blob",
+      protocol: "",
+      extensions: "",
+      withCredentials: init?.withCredentials === true,
       handlers: new Map(),
-      types: new Set(),
     };
     conns.set(es, c);
     replay.next("NetRequest", {
@@ -690,35 +773,28 @@ function replayEventSource(ctx: ReplayContext): void {
           v.record?.record === "WsMessage") &&
         v.record.req_id === reqId;
       if (!mine) {
-        dispatch.call(es, new w.Event("error"));
+        dispatch(es, new w.Event("error"));
         return;
       }
       if (v.record!.record === "NetResponse") {
         const r = replay.next("NetResponse", { req_id: reqId });
         c.readyState = r.outcome === Outcome.response ? 1 : 2;
-        dispatch.call(
+        dispatch(
           es,
           new w.Event(r.outcome === Outcome.response ? "open" : "error"),
         );
         return;
       }
       const m = replay.next("WsMessage", { req_id: reqId, dir: Dir.in });
-      // The log keeps a message's data but not its event type (§10.4), so
-      // a page that listens for named events cannot be replayed exactly.
-      const named = [...c.types].filter(
-        (t) => t !== "open" && t !== "message" && t !== "error",
-      );
-      if (named.length > 0) {
-        replay.fail(
-          "NonReplayable",
-          `the page listens for named event-stream events (${named.join(", ")}), whose type the log does not keep`,
-        );
-      }
-      dispatch.call(
+      // The event's type is the stream's `event:` field (`message` when it
+      // has none) and its `lastEventId` the last `id:` (HTML, "Server-sent
+      // events"), both logged (§5.2).
+      dispatch(
         es,
-        new w.MessageEvent("message", {
-          data: new TextDecoder().decode(blobBytes(replay, m.data)),
+        new w.MessageEvent(m.event === "" ? "message" : m.event, {
+          data: messageData(ctx, m, blobBytes(replay, m.data), "blob"),
           origin: new URL(href).origin,
+          lastEventId: m.last_event_id,
         }),
       );
     });
@@ -734,21 +810,9 @@ function replayEventSource(ctx: ReplayContext): void {
     {
       url: (c) => c.url,
       readyState: (c) => c.readyState,
-      withCredentials: () => false,
+      withCredentials: (c) => c.withCredentials,
     },
     ["open", "message", "error"],
-  );
-  replaceValue(
-    OrigEs.prototype,
-    "addEventListener",
-    function addEventListener(
-      this: EventSource,
-      type: string,
-      ...rest: unknown[]
-    ): void {
-      conns.get(this)?.types.add(String(type));
-      return (origAdd as (...a: unknown[]) => void).call(this, type, ...rest);
-    },
   );
   replaceValue(OrigEs.prototype, "close", function close(this: EventSource) {
     const c = conns.get(this);

@@ -40,6 +40,11 @@ import {
 import { domV1Hash } from "@codetracer/boundary-shim/dist/browser/dom-v1.js";
 import { recordDocumentProgress } from "@codetracer/boundary-shim/dist/browser/document-progress.js";
 import { readEnvironment } from "@codetracer/boundary-shim/dist/browser/install.js";
+import {
+  NO_RESPONSE_META,
+  type NetResponseMeta,
+  fetchResponseMeta,
+} from "@codetracer/boundary-shim/dist/browser/stream-body.js";
 import { captureOriginals } from "@codetracer/boundary-shim/dist/browser/originals.js";
 import {
   Recorder,
@@ -407,6 +412,7 @@ function fetchText(
   const complete = (
     outcome: number,
     status: number,
+    meta: NetResponseMeta,
     headers: [string, string][],
     text: string,
   ) =>
@@ -422,6 +428,7 @@ function fetchText(
             req_id: reqId,
             outcome,
             status,
+            ...meta,
             headers: JSON.stringify(headers),
             body: { kind: "inline", bytes: utf8.encode(text) },
           });
@@ -442,11 +449,11 @@ function fetchText(
         const text = await res.text();
         const headers: [string, string][] = [];
         res.headers.forEach((v, k) => headers.push([k, v]));
-        await complete(1, res.status, headers, text);
+        await complete(1, res.status, fetchResponseMeta(res), headers, text);
         return text;
       },
       async (e: unknown) => {
-        await complete(2, 0, [], "");
+        await complete(2, 0, NO_RESPONSE_META, [], "");
         throw e;
       },
     );

@@ -71,6 +71,7 @@ export interface ShimOriginals {
   IntersectionObserver: typeof IntersectionObserver | undefined;
   ResizeObserver: typeof ResizeObserver | undefined;
   MutationObserver: typeof MutationObserver | undefined;
+  PerformanceObserver: typeof PerformanceObserver | undefined;
   pushState: History["pushState"];
   replaceState: History["replaceState"];
   addEventListener: EventTarget["addEventListener"];
@@ -186,6 +187,7 @@ export function captureOriginals(w: Window & typeof globalThis): ShimOriginals {
     IntersectionObserver: w.IntersectionObserver,
     ResizeObserver: w.ResizeObserver,
     MutationObserver: w.MutationObserver,
+    PerformanceObserver: w.PerformanceObserver,
     pushState: w.History.prototype.pushState,
     replaceState: w.History.prototype.replaceState,
     addEventListener: w.EventTarget.prototype.addEventListener,

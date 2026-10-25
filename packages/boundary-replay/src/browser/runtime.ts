@@ -213,7 +213,10 @@ export function installReplayRuntime(
    * until it settles.
    */
   let taskUnderway: PromiseLike<void> | undefined;
-  const unregistered = new Map<number, (task: TaskRecord) => void>();
+  const unregistered = new Map<
+    number,
+    (task: TaskRecord) => void | PromiseLike<void>
+  >();
   let pendingEffects: RecordOf<"DomEffect">[] = [];
 
   const status: ReplayStatus = {

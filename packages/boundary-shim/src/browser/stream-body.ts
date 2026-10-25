@@ -38,19 +38,6 @@
  * ({@link BODY_CONSUMERS}; §6, as amended 2026-10-23).
  */
 
-/**
- * The methods that read a whole body and settle in a task of their own
- * (Fetch, "consume body"), as `Response.prototype` has them.
- */
-export const BODY_CONSUMERS: readonly string[] = [
-  "arrayBuffer",
-  "blob",
-  "bytes",
-  "formData",
-  "json",
-  "text",
-];
-
 import {
   type SeamContext,
   inline,
@@ -58,8 +45,24 @@ import {
   replaceValue,
   utf8Bytes,
 } from "./context.js";
+import { RESPONSE_TYPE, WS_FRAME } from "@codetracer/boundary-format";
+
 import { HEADERS_MUTATORS, RESPONSE_GETTERS } from "./originals.js";
 import { type Recorder, TaskKind } from "./recorder.js";
+import {
+  BODY_READS,
+  FILE_CONTENT,
+  isPageResponse,
+  isUserContent,
+  markPageResponse,
+  recordPlatformTask,
+} from "./seams-platform.js";
+
+/**
+ * The methods that read a whole body and settle in a task of their own
+ * (Fetch, "consume body"), as `Response.prototype` has them.
+ */
+export const BODY_CONSUMERS: readonly string[] = BODY_READS;
 
 /** `NetResponse.outcome` (§5.2). */
 export const Outcome = {
@@ -101,8 +104,64 @@ export function emitBodyEnd(
   rec.emit("WsMessage", {
     req_id: reqId,
     dir: Dir.end,
+    ...NOT_A_MESSAGE,
     data: inline(utf8Bytes(JSON.stringify({ outcome }))),
   });
+}
+
+/**
+ * The `WsMessage` fields of a record that is not a message (§5.2): a piece or
+ * the end of a streamed body, a close.
+ */
+export const NOT_A_MESSAGE = {
+  frame: WS_FRAME.none,
+  event: "",
+  last_event_id: "",
+} as const;
+
+/**
+ * The `NetResponse` fields only a `fetch` or XMLHttpRequest response has
+ * (§5.2), for a record that is neither: a failure, a beacon, a socket's or an
+ * event stream's open.
+ */
+export const NO_RESPONSE_META = {
+  status_text: "",
+  url: "",
+  redirected: 0,
+  response_type: RESPONSE_TYPE.none,
+} as const;
+
+/** The `NetResponse` fields of what a page can read of a response. */
+export interface NetResponseMeta {
+  status_text: string;
+  url: string;
+  redirected: number;
+  response_type: number;
+}
+
+/**
+ * The `NetResponse` fields of a `fetch` response as the page can read them:
+ * its `statusText`, its final `url` (after any redirect), `redirected` and
+ * `type` (§5.2, §10.4).
+ */
+export function fetchResponseMeta(r: {
+  statusText: string;
+  url: string;
+  redirected: boolean;
+  type: string;
+}): NetResponseMeta {
+  const type = (RESPONSE_TYPE as Record<string, number>)[r.type];
+  if (type === undefined || type === RESPONSE_TYPE.none) {
+    // A type the Fetch standard does not define: a recorder fault, never a
+    // value replay would get wrong.
+    throw new Error(`unknown Response.type ${JSON.stringify(r.type)}`);
+  }
+  return {
+    status_text: r.statusText,
+    url: r.url,
+    redirected: r.redirected ? 1 : 0,
+    response_type: type,
+  };
 }
 
 /** What the platform's response says that a constructed one cannot. */
@@ -181,6 +240,7 @@ export function patchResponses(
       }
       const t = tasks.get(this);
       if (t !== undefined) tasks.set(c, t);
+      if (isPageResponse(this)) markPageResponse(c);
       return c;
     },
   );
@@ -190,12 +250,23 @@ export function patchResponses(
     ];
     if (typeof read !== "function") continue;
     replaceValue(OrigResponse.prototype, name, function (this: Response) {
+      if (isUserContent(this)) {
+        ctx.refuseOnce(FILE_CONTENT, `Response.${name} of a user's file`);
+      }
       const settled = (read as (...a: unknown[]) => Promise<unknown>).apply(
         this,
         Array.from(arguments),
       );
       const taskId = tasks.get(this);
-      if (taskId === undefined) return settled;
+      if (taskId === undefined) {
+        // A response the page holds that no `fetch` streamed (one it made,
+        // or a null-body response passed through as it came): its read
+        // settles in a platform task of its own (§6, Task kind 13). Any other
+        // (the upload transport's own) is not the page's.
+        return isPageResponse(this)
+          ? recordPlatformTask(ctx, settled)
+          : settled;
+      }
       // The page's continuation follows the record of the task it runs in.
       const task = () =>
         rec.guard(() => rec.task(taskId, TaskKind.networkCompletion));
@@ -296,6 +367,7 @@ export function patchResponses(
                   rec.emit("WsMessage", {
                     req_id: reqId,
                     dir: Dir.in,
+                    ...NOT_A_MESSAGE,
                     data: inline(res.value),
                   }),
                 );

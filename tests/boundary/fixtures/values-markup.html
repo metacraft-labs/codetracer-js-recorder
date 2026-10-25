@@ -1,0 +1,11 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>a window handler set by markup</title>
+  </head>
+  <body onmessage="window.__markupSaw = event.isTrusted">
+    <ul id="out"></ul>
+    <script src="values.js"></script>
+  </body>
+</html>

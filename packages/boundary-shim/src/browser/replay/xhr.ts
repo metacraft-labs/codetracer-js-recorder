@@ -58,6 +58,9 @@ interface XState {
   taskId?: bigint;
   readyState: number;
   status: number;
+  /** `statusText` and `responseURL` as the log has them (§5.2). */
+  statusText: string;
+  responseURL: string;
   headers: [string, string][];
   text: string;
   bytes: Uint8Array[];
@@ -77,7 +80,11 @@ export function replayXhr(ctx: ReplayContext): void {
   const origAbort = proto.abort;
   const origGetAll = proto.getAllResponseHeaders;
   const origGetHeader = proto.getResponseHeader;
-  const dispatch = w.EventTarget.prototype.dispatchEvent;
+  // Every event is the platform's on record: the page's listeners see it
+  // as trusted (`trusted.ts`).
+  const dispatch = {
+    call: (t: EventTarget, ev: Event) => ctx.trusted.dispatch(t, ev),
+  };
   const states = new WeakMap<XMLHttpRequest, XState>();
 
   /** The replay state of a request that has been sent. */
@@ -111,6 +118,8 @@ export function replayXhr(ctx: ReplayContext): void {
     if (r.record === "NetResponse") {
       if (r.outcome === Outcome.head || r.outcome === Outcome.response) {
         s.status = r.status;
+        s.statusText = r.status_text;
+        s.responseURL = r.url;
         s.headers = JSON.parse(r.headers) as [string, string][];
       }
       if (r.outcome === Outcome.head) {
@@ -120,7 +129,7 @@ export function replayXhr(ctx: ReplayContext): void {
       if (r.outcome === Outcome.response) {
         addBody(s, blobBytes(replay, r.body));
       } else {
-        s.status = 0;
+        failed(s);
       }
       finish(s);
       return;
@@ -129,7 +138,7 @@ export function replayXhr(ctx: ReplayContext): void {
       addBody(s, blobBytes(replay, r.data));
       s.readyState = ReadyState.loading;
     } else if (r.dir === Dir.end) {
-      if (endOutcome(ctx, r) !== Outcome.response) s.status = 0;
+      if (endOutcome(ctx, r) !== Outcome.response) failed(s);
       finish(s);
     } else {
       replay.fail(
@@ -137,6 +146,12 @@ export function replayXhr(ctx: ReplayContext): void {
         `an XHR response record has dir ${r.dir}`,
       );
     }
+  };
+  /** A failed request shows the network error's status, text and URL. */
+  const failed = (s: XState) => {
+    s.status = 0;
+    s.statusText = "";
+    s.responseURL = "";
   };
   const addBody = (s: XState, bytes: Uint8Array) => {
     s.bytes.push(bytes);
@@ -218,7 +233,7 @@ export function replayXhr(ctx: ReplayContext): void {
     if (responseNext(s) === undefined && eventNext(s) === undefined) {
       if (failsNext(s)) {
         s.readyState = ReadyState.done;
-        s.status = 0;
+        failed(s);
         readyStateChange(x);
         const r = responseNext(s);
         if (r === undefined) {
@@ -280,6 +295,8 @@ export function replayXhr(ctx: ReplayContext): void {
         sent: false,
         readyState: ReadyState.opened,
         status: 0,
+        statusText: "",
+        responseURL: "",
         headers: [],
         text: "",
         bytes: [],
@@ -352,7 +369,7 @@ export function replayXhr(ctx: ReplayContext): void {
     // Inside abort(): DONE with the abort logged first (the record side
     // writes it from DONE's readystatechange), then the events.
     s.readyState = ReadyState.done;
-    s.status = 0;
+    failed(s);
     const r = responseNext(s);
     if (r !== undefined) {
       replay.next(r.record, { req_id: s.reqId! });
@@ -390,10 +407,13 @@ export function replayXhr(ctx: ReplayContext): void {
   getter("status", (s) =>
     s.readyState >= ReadyState.headersReceived ? s.status : 0,
   );
-  // Not logged (§10.4): the empty text HTTP/2 responses have.
-  getter("statusText", () => "");
+  // Logged with the head (§5.2): the reason phrase (empty over HTTP/2) and
+  // the final URL after any redirect.
+  getter("statusText", (s) =>
+    s.readyState >= ReadyState.headersReceived ? s.statusText : "",
+  );
   getter("responseURL", (s) =>
-    s.readyState >= ReadyState.headersReceived ? s.url : "",
+    s.readyState >= ReadyState.headersReceived ? s.responseURL : "",
   );
   getter("responseText", (s, x) => {
     if (!isText(x)) {

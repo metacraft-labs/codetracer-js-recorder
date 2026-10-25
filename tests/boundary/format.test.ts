@@ -172,7 +172,7 @@ describe("@codetracer/boundary-format", () => {
       )
       .sort();
     expect(sets).toEqual(u8Fields);
-    expect(u8Fields).toHaveLength(23);
+    expect(u8Fields).toHaveLength(27);
     // The shared vectors step past both ends of every set: the refusal
     // vectors name each field.
     const refusals = loadVectors()
@@ -323,6 +323,9 @@ describe("@codetracer/boundary-format", () => {
         seq: 1n,
         req_id: 1n,
         dir: 1,
+        frame: 0,
+        event: "",
+        last_event_id: "",
         data: { kind: "ref", sha256: new Uint8Array(31), len: 1n },
       }),
     ).toThrow(TypeError);

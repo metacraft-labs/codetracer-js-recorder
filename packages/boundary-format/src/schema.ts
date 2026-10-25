@@ -146,6 +146,10 @@ export const RECORD_SCHEMA = [
       ["req_id", "u64"],
       ["outcome", "u8"],
       ["status", "u16"],
+      ["status_text", "str"],
+      ["url", "str"],
+      ["redirected", "u8"],
+      ["response_type", "u8"],
       ["headers", "str"],
       ["body", "blob"],
     ],
@@ -157,6 +161,9 @@ export const RECORD_SCHEMA = [
       ["seq", "u64"],
       ["req_id", "u64"],
       ["dir", "u8"],
+      ["frame", "u8"],
+      ["event", "str"],
+      ["last_event_id", "str"],
       ["data", "blob"],
     ],
   },
@@ -303,6 +310,17 @@ export const RECORD_SCHEMA = [
     ],
   },
   {
+    tag: 0x59,
+    name: "PlatformValue",
+    fields: [
+      ["seq", "u64"],
+      ["src", "u8"],
+      ["task_id", "u64"],
+      ["query", "str"],
+      ["value", "str"],
+    ],
+  },
+  {
     tag: 0x5f,
     name: "End",
     fields: [
@@ -331,13 +349,21 @@ export const ENUM_VALUE_SETS: Readonly<
   Header: { protocol_level: [0, 1] },
   // §10.4: 0 no preference, 1 light, 2 dark; 1 when reduced motion.
   Env: { color_scheme: [0, 2], reduced_motion: [0, 1] },
-  Task: { kind: [1, 12] },
-  TaskReg: { kind: [1, 12] },
-  Clock: { src: [1, 5] },
+  // 13 a platform task: a promise the platform settles in a task of its own
+  // (a whole-body read of a `Blob`, a `Request` or a `Response` the page
+  // made; `crypto.subtle.digest`).
+  Task: { kind: [1, 13] },
+  TaskReg: { kind: [1, 13] },
+  // 6 `IdleDeadline.timeRemaining()`, 7 `performance.timeOrigin`.
+  Clock: { src: [1, 7] },
   Random: { src: [1, 3] },
   NetRequest: { api: [1, 5] },
-  NetResponse: { outcome: [1, 5] },
-  WsMessage: { dir: [1, 4] },
+  // `redirected` a boolean; `response_type` 0 (not a `fetch` response), then
+  // the Fetch standard's types (RESPONSE_TYPE).
+  NetResponse: { outcome: [1, 5], redirected: [0, 1], response_type: [0, 6] },
+  // `frame` 0 not a message (a body piece, a close, a body's end), 1 text,
+  // 2 binary (WS_FRAME).
+  WsMessage: { dir: [1, 4], frame: [0, 2] },
   StorageRead: { area: [1, 3], present: [0, 2] },
   DomEffect: { effect: [1, 6] },
   Navigation: { kind: [1, 5] },
@@ -354,6 +380,8 @@ export const ENUM_VALUE_SETS: Readonly<
   // 1 a script runs, 2 DOMContentLoaded, 3 load, 4 a script ran that wrote no
   // record while it ran (DOC_TASK).
   DocTask: { kind: [1, 4] },
+  // What produced the value (PLATFORM_VALUE_SRC).
+  PlatformValue: { src: [1, 6] },
 };
 
 /**
@@ -397,6 +425,48 @@ export const DOC_TASK = {
    * first boundary read was in a microtask): written when it settled.
    */
   scriptSettled: 4,
+} as const;
+
+/**
+ * `NetResponse.response_type` values (spec §5.2): 0 for a response that is
+ * not a `fetch` one, otherwise the response's `type` (Fetch standard,
+ * "response type", https://fetch.spec.whatwg.org/#concept-response-type).
+ */
+export const RESPONSE_TYPE = {
+  none: 0,
+  basic: 1,
+  cors: 2,
+  default: 3,
+  error: 4,
+  opaque: 5,
+  opaqueredirect: 6,
+} as const;
+
+/**
+ * `WsMessage.frame` values (spec §5.2): whether an inbound or outbound
+ * message was a text or a binary one (WebSocket standard, "message type";
+ * an `EventSource` message is always text). 0 for the records that are not
+ * messages: a piece or the end of a streamed body, and a close.
+ */
+export const WS_FRAME = { none: 0, text: 1, binary: 2 } as const;
+
+/**
+ * `PlatformValue.src` values (spec §5.2): which platform object handed the
+ * page the value.
+ */
+export const PLATFORM_VALUE_SRC = {
+  /** `IntersectionObserverEntry` list (callback or `takeRecords()`). */
+  intersectionObserver: 1,
+  /** `ResizeObserverEntry` list (callback). */
+  resizeObserver: 2,
+  /** `MutationRecord` list (callback or `takeRecords()`); compared. */
+  mutationObserver: 3,
+  /** `PerformanceObserver` entry list (callback or `takeRecords()`). */
+  performanceObserver: 4,
+  /** A read of the performance timeline (`performance.getEntries*()`, …). */
+  performance: 5,
+  /** `IdleDeadline.didTimeout`. */
+  idleDeadline: 6,
 } as const;
 
 type Schema = (typeof RECORD_SCHEMA)[number];
