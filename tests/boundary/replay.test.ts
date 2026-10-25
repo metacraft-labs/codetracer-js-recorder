@@ -549,6 +549,64 @@ describe("boundary replay runner", () => {
   );
 
   it(
+    "replay_writes_the_same_trace_from_any_working_directory",
+    async () => {
+      // §12, "Identity": nothing that differs between two runs reaches the
+      // trace, the directory the runner runs in included. The CLI is run
+      // from two different directories over the same log and build, as a
+      // worker and a developer would run it; `record-web` would otherwise
+      // record its own working directory and resolve the build's relative
+      // source paths against it.
+      const cli = path.join(REPO_ROOT, "packages/boundary-replay/dist/cli.js");
+      const run = (cwd: string): string => {
+        const out = path.join(tmp("ct-replay-cwd-out-"), "trace.ct");
+        const r = spawnSync(
+          process.execPath,
+          [
+            cli,
+            "--log",
+            recorded.ct,
+            "--build",
+            recorded.build,
+            "--out",
+            out,
+            "--session-manager",
+            SESSION_MANAGER,
+            "--timeout-ms",
+            "60000",
+          ],
+          { cwd, encoding: "utf-8", timeout: 240_000 },
+        );
+        expect(r.status, r.stderr).toBe(0);
+        return out;
+      };
+      const here = tmp("ct-replay-cwd-a-");
+      const there = path.join(tmp("ct-replay-cwd-b-"), "nested", "deeper");
+      fs.mkdirSync(there, { recursive: true });
+      const a = run(here);
+      const b = run(there);
+      const decoded = ctPrintFull(a);
+      const steps = decoded.events.filter(
+        (e) => e.kind === "step" && e.path.endsWith("replay.js"),
+      );
+      // Vacuity guard: the trace has steps in the fixture's script, so the
+      // paths compared below are real.
+      expect(steps.length).toBeGreaterThan(0);
+      // The source is named by its path in the build, relative to the
+      // trace's working directory (`/`, the recorded origin's root, so a
+      // reader resolves it to the path it was served at), never by either
+      // directory the runner ran in.
+      expect(new Set(steps.map((e) => e.path))).toEqual(new Set(["replay.js"]));
+      const bytes = fs.readFileSync(a);
+      for (const dir of [here, there]) {
+        expect(bytes.includes(Buffer.from(dir))).toBe(false);
+      }
+      expect(bytes.equals(fs.readFileSync(b))).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  it(
     "replay_reports_chromium_major_mismatch",
     async () => {
       const rs = recorded.records;

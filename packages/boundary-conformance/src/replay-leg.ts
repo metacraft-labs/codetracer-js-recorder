@@ -23,6 +23,7 @@ import { type BoundaryRecord, decodeLog } from "@codetracer/boundary-format";
 import {
   logBytes,
   isPageRead,
+  launchReplayBrowser,
   replaySession,
   type ReplayReport,
   seqAt,
@@ -37,7 +38,6 @@ import {
   runRecordLeg,
   SUITE_VERSION,
 } from "./harness.js";
-import { loadPlaywright } from "./playwright.js";
 import {
   type CheckStatus,
   PROTOCOL_VERSION,
@@ -290,9 +290,9 @@ export async function runReplayLeg(options: ReplayLegOptions): Promise<{
   replays: FixtureReplay[];
 }> {
   const build = path.resolve(options.build);
-  const browser =
-    options.browser ??
-    (await loadPlaywright().chromium.launch({ headless: true }));
+  // The replay browser (WebRTC kept to the context's proxy, §7.4); the
+  // record leg runs in it too, and no fixture uses WebRTC.
+  const browser = options.browser ?? (await launchReplayBrowser());
   const work = fs.mkdtempSync(path.join(os.tmpdir(), "ct-conformance-replay-"));
   try {
     const recorded = await runRecordLeg({ ...options, browser });

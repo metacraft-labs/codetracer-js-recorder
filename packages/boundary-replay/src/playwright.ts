@@ -15,7 +15,9 @@ import * as path from "node:path";
 
 /** The slice of playwright-core's API the runner and the harness use. */
 export interface Playwright {
-  chromium: { launch(options?: { headless?: boolean }): Promise<Browser> };
+  chromium: {
+    launch(options?: { headless?: boolean; args?: string[] }): Promise<Browser>;
+  };
 }
 export interface Browser {
   newContext(options?: ContextOptions): Promise<BrowserContext>;
@@ -30,6 +32,12 @@ export interface ContextOptions {
   colorScheme?: "light" | "dark" | "no-preference";
   reducedMotion?: "reduce" | "no-preference";
   serviceWorkers?: "allow" | "block";
+  /**
+   * The context's proxy: every connection the browser makes goes to
+   * `server` unless `bypass` (Chromium's proxy bypass rules, comma
+   * separated) names its host.
+   */
+  proxy?: { server: string; bypass?: string };
 }
 export interface BrowserContext {
   newPage(): Promise<Page>;

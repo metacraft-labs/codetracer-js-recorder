@@ -142,7 +142,25 @@ This is a monorepo managed with npm workspaces:
   as a typed error and, with `--out`, instruments the build itself and writes
   the materialised trace through codetracer's `session-manager record-web`,
   passing it the trace's recording id (`materialisedRecordingId`, derived from
-  the session, so a trace written again is byte-identical). `--seq-from` and
+  the session, so a trace written again is byte-identical). The replay reaches
+  no network: the runner's routing answers every HTTP request, and the
+  context's proxy is a listener of the runner's that refuses every connection
+  the routing never sees (a WebSocket of a realm the shim does not patch, such
+  as a same-origin frame's own `WebSocket`); only the trace stream's own
+  `record-web` host bypasses it (`proxyBypass`), and the report counts the
+  refused connections (`refusedConnections`). WebRTC's STUN and media go
+  over UDP, which no proxy carries, so the browser the runner launches
+  (`launchReplayBrowser`, `REPLAY_BROWSER_ARGS`) keeps WebRTC to proxied
+  connections; a browser handed to `replaySession` must be launched the
+  same way. `record-web` is started with `--workdir /` (`TRACE_WORKDIR`),
+  so the trace names the build's files relative to the recorded origin's
+  root and the same session gives the same bytes from any working
+  directory (`replay_writes_the_same_trace_from_any_working_directory` in
+  `tests/boundary/replay.test.ts`). Playwright's `routeWebSocket`
+  must not be used for this: it installs a wrapper in the page's own world
+  that the replayed page observes (its socket ids are `crypto.getRandomValues`
+  reads the log does not have). Pinned by `tests/boundary/replay-resources.test.ts`
+  `replay_lets_no_request_of_an_unpatched_realm_reach_the_network`. `--seq-from` and
   `--seq-to` materialise a range: the replay runs from the start with `__ct`
   emission off until the last checkpoint at or before the range's start and
   stops at the first checkpoint at or after its end, both found in the

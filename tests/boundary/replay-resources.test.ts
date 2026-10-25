@@ -25,6 +25,7 @@
  * No mocks: the browser, the servers and the runner are real.
  */
 
+import * as dgram from "node:dgram";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -318,6 +319,86 @@ describe("replay runs the document's resource tasks in recorded order", () => {
       const r = await rr.replay(cross.records);
       expectDiverged(r, "NonReplayable");
       expect(r.divergence?.detail).toContain("another origin");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "replay_lets_no_request_of_an_unpatched_realm_reach_the_network",
+    async () => {
+      // §7.4: replay reaches no network. A same-origin frame's own globals
+      // are a realm the shim never patches, so nothing the frame does is a
+      // boundary read the log holds: its fetch, XHR, EventSource and
+      // WebSocket, a dedicated worker's fetch and WebSocket, and a peer
+      // connection's STUN query. The runner's request routing answers the
+      // HTTP requests it sees (another origin than the recorded page's:
+      // aborted), but Playwright's request routing never sees a WebSocket
+      // (https://playwright.dev/docs/api/class-browsercontext#browser-context-route),
+      // so a socket is stopped by the context's proxy, which refuses every
+      // connection the routing does not answer. A STUN query is UDP, which
+      // no proxy carries: the browser the runner launches keeps WebRTC to
+      // proxied connections (`REPLAY_BROWSER_ARGS`), so it sends none.
+      const pathOf = (url: string) => new URL(url, "http://x").pathname;
+      const reached = (from: number) =>
+        other.requests.slice(from).map((r) => pathOf(r.url));
+      const onRecord = [
+        "/realm-events",
+        "/realm-fetch",
+        "/realm-socket",
+        "/realm-worker-fetch",
+        "/realm-worker-socket",
+        "/realm-xhr",
+      ];
+      const stun = dgram.createSocket("udp4");
+      let stunQueries = 0;
+      stun.on("message", () => stunQueries++);
+      await new Promise<void>((r) => stun.bind(0, "127.0.0.1", () => r()));
+      try {
+        const before = other.requests.length;
+        const { records: rs, slots } = await rr.recordPage(
+          `realm.html?second=${encodeURIComponent(other.origin)}&stun=127.0.0.1:${stun.address().port}`,
+        );
+        expect(slots).toEqual([
+          "fetch",
+          "socket",
+          "xhr",
+          "events",
+          "worker",
+          "rtc",
+        ]);
+        // Vacuity guard: on record every request reached the second origin
+        // and the STUN query reached its server, so the replay below is one
+        // in which they would.
+        const deadline = Date.now() + 10_000;
+        while (
+          (new Set(reached(before)).size < onRecord.length ||
+            stunQueries === 0) &&
+          Date.now() < deadline
+        ) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        expect([...new Set(reached(before))].sort()).toEqual(onRecord);
+        expect(stunQueries).toBeGreaterThan(0);
+
+        const atReplay = other.requests.length;
+        const stunAtReplay = stunQueries;
+        // The runner launches its own browser (`browser: undefined`), as the
+        // command and the materialisation worker do: the WebRTC policy is a
+        // launch argument, which a browser handed in from outside lacks.
+        const report = await rr.replay(rs, { browser: undefined });
+        expectReplayed(report, rs);
+        // A request, handshake or query that got through would have arrived
+        // by now: on record all arrived within the page's 300 ms timer.
+        await new Promise((r) => setTimeout(r, 1500));
+        expect(reached(atReplay)).toEqual([]);
+        expect(stunQueries - stunAtReplay).toBe(0);
+        // The proxy is what stopped the sockets: their connections were
+        // refused there (the HTTP requests never reached it: the routing
+        // aborted them).
+        expect(report.refusedConnections).toBeGreaterThanOrEqual(1);
+      } finally {
+        stun.close();
+      }
     },
     TIMEOUT,
   );

@@ -253,6 +253,12 @@ export interface ReplayReport {
   /** Level 1: DOM events dispatched while the framework's `inject` ran. */
   dispatchedDuringInject: string[];
   pageErrors: string[];
+  /**
+   * Connections the replay context made that the runner's routing did not
+   * answer and its proxy refused (§7.4): a page reaching for the network
+   * past the boundary, such as a socket of a realm the shim does not patch.
+   */
+  refusedConnections?: number;
   /** The materialised trace, when one was written. */
   output?: string;
   /** The `meta.dat` args the trace carries (its replay provenance). */
@@ -378,6 +384,77 @@ async function freePort(): Promise<number> {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * The replay context's proxy (§7.4): a loopback listener that refuses every
+ * connection, closing it unread, so whatever the routing does not answer
+ * reaches no network, and counts them.
+ */
+interface Refuser {
+  port: number;
+  /** Connections refused so far. */
+  refused(): number;
+  close(): Promise<void>;
+}
+
+async function startRefuser(): Promise<Refuser> {
+  let refused = 0;
+  const server = net.createServer((socket) => {
+    refused++;
+    socket.destroy();
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  return {
+    port: (server.address() as net.AddressInfo).port,
+    refused: () => refused,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+/**
+ * The proxy bypass rules of the replay context (Chromium's syntax,
+ * https://chromium.googlesource.com/chromium/src/+/HEAD/net/docs/proxy.md#proxy-bypass-rules):
+ * `<-loopback>` takes away the browser's implicit bypass of loopback
+ * addresses, which would otherwise let a page reach any local service, and
+ * the trace stream's `host:port`, when there is one, is the only host that
+ * bypasses the proxy.
+ */
+export function proxyBypass(traceEndpoint: string | undefined): string {
+  return traceEndpoint === undefined
+    ? "<-loopback>"
+    : `<-loopback>,${new URL(traceEndpoint).host}`;
+}
+
+/**
+ * The command-line switches of the browser a replay runs in (§7.4, no
+ * network). The context's proxy stops every connection the routing does not
+ * answer, but WebRTC sends its STUN and media over UDP, which no proxy
+ * carries: `disable_non_proxied_udp` keeps WebRTC to proxied connections
+ * (https://source.chromium.org/chromium/chromium/src/+/main:content/public/common/content_switches.cc,
+ * `kForceWebRtcIPHandlingPolicy`), which the proxy then refuses. A browser
+ * handed to `replaySession` from outside must be launched with them
+ * (`launchReplayBrowser`).
+ */
+export const REPLAY_BROWSER_ARGS: readonly string[] = [
+  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+];
+
+/** A headless Chromium launched for replay, with `REPLAY_BROWSER_ARGS`. */
+export function launchReplayBrowser(): Promise<Browser> {
+  return loadPlaywright().chromium.launch({
+    headless: true,
+    args: [...REPLAY_BROWSER_ARGS],
+  });
+}
+
+/**
+ * The working directory a materialised trace records (§12, "Identity"): the
+ * root of the recorded origin, the same for every run.
+ */
+export const TRACE_WORKDIR = "/";
+
 /** A running `record-web` host (codetracer `session-manager record-web`). */
 interface TraceHost {
   endpoint: string;
@@ -407,6 +484,14 @@ async function startTraceHost(
       // the session, so materialising it again writes the same bytes.
       "--recording-id",
       recordingId,
+      // §12, "Identity": the trace names its sources relative to this
+      // directory, which `record-web` otherwise takes from its own working
+      // directory, so the same session replayed from two places gave two
+      // traces. `/` is the recorded origin's root, where the replay serves
+      // the build: a source is named by the URL path it was served at
+      // (`/app.js`), whatever directory the runner ran in.
+      "--workdir",
+      TRACE_WORKDIR,
     ],
     { stdio: ["ignore", "ignore", "pipe"] },
   );
@@ -715,10 +800,9 @@ async function replayOnce(
   let instrumented: string | undefined;
   let stub = "";
   const timeoutMs = options.timeoutMs ?? 60000;
-  const browser =
-    options.browser ??
-    (await loadPlaywright().chromium.launch({ headless: true }));
+  const browser = options.browser ?? (await launchReplayBrowser());
   let context: BrowserContext | undefined;
+  let refuser: Refuser | undefined;
   try {
     report.metadata.chromium = browser.version();
     report.metadata.replayUaMajor = majorOf(browser.version());
@@ -781,7 +865,22 @@ async function replayOnce(
       report.traceArgs = args;
     }
 
-    context = await browser.newContext(contextOptionsOf(env));
+    // §7.4: no network. The routing below answers every request the page
+    // makes over HTTP, but Playwright's routing never sees a WebSocket, so a
+    // socket the replay seams do not answer (one made from a realm the shim
+    // does not patch, such as a same-origin frame's own `WebSocket`) would
+    // reach the network. So the context's proxy is a listener of the
+    // runner's that refuses every connection, and only the trace stream's
+    // own host (`record-web`, the trace, not a read) bypasses it. It changes
+    // nothing the page can observe of a request the routing answers.
+    refuser = await startRefuser();
+    context = await browser.newContext({
+      ...contextOptionsOf(env),
+      proxy: {
+        server: `http://127.0.0.1:${refuser.port}`,
+        bypass: proxyBypass(host?.endpoint),
+      },
+    });
     // §6, "The document's own tasks": what the replay holds of the
     // document's loading until the log says it ran (`gates.ts`).
     const plan = documentPlan(loaded.records);
@@ -1158,6 +1257,10 @@ async function replayOnce(
     if (options.browser === undefined)
       await browser.close().catch(() => undefined);
     if (host !== undefined) await stopTraceHost(host);
+    if (refuser !== undefined) {
+      report.refusedConnections = refuser.refused();
+      await refuser.close();
+    }
     fs.rmSync(work, { recursive: true, force: true });
   }
 }
