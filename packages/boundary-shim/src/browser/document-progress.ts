@@ -16,7 +16,10 @@
  *   held scripts, `packages/boundary-replay`).
  * - **`DocTask`**, for each external script's execution, for
  *   `DOMContentLoaded` and for `load`: replay lets the document run that
- *   task (it holds them until then) at that point of the log.
+ *   task (it holds them until then) at that point of the log; and for each
+ *   event of a resource element (an image's, a style sheet's, a frame's
+ *   `load` or `error`, a media element's events; `resource-events.ts`),
+ *   which replay holds back, with the resource's request, until then.
  *
  * One implementation of the position serves both sides, so a recording and
  * its replay measure the same thing: the recorders (the generic shim, and
@@ -26,16 +29,16 @@
 
 import { DOC_TASK, LOADING_PHASE } from "@codetracer/boundary-format";
 
-import { BOOTSTRAP_MARKER } from "./config.js";
+import { REPLAY_GATE_MARKER, isOwnElement } from "./own-elements.js";
 import type { Recorder } from "./recorder.js";
+import {
+  type ResourceEvent,
+  resourceEventOf,
+  RESOURCE_EVENT_TYPES,
+  watchResourceListeners,
+} from "./resource-events.js";
 
-/**
- * The attribute of the elements the replay runner adds to a replayed page
- * (its parser gates, `packages/boundary-replay/src/gates.ts`). Like the
- * record bootstrap ({@link BOOTSTRAP_MARKER}), they are CodeTracer's, not
- * the page's, and are never counted.
- */
-export const REPLAY_GATE_MARKER = "data-ct-replay-gate";
+export { REPLAY_GATE_MARKER };
 
 /**
  * Where the document is in its own loading (the fields of `Loading`, §5.2):
@@ -157,9 +160,7 @@ export class DocumentProgress {
 
   /** Whether `el` is one of CodeTracer's own scripts, never counted. */
   static isOwn(el: Element): boolean {
-    return (
-      el.hasAttribute(BOOTSTRAP_MARKER) || el.hasAttribute(REPLAY_GATE_MARKER)
-    );
+    return isOwnElement(el);
   }
 
   /** The URL an external script was fetched from, without its fragment. */
@@ -237,8 +238,8 @@ export class DocumentProgress {
         if (!DocumentProgress.isOwn(t) && t.hasAttribute("src")) {
           on.scriptSettled(t);
         }
-      } else if (ev.type === "error" && t instanceof this.w.HTMLLinkElement) {
-        this.failedSheets.add(t);
+      } else {
+        this.noteElementEvent(ev);
       }
     };
     // An element's `load` never reaches the window (DOM, "get the parent"
@@ -263,6 +264,22 @@ export class DocumentProgress {
     add(this.w, "DOMContentLoaded", (ev) => {
       if (ev.isTrusted && ev.target === this.doc) on.domContentLoaded();
     });
+  }
+
+  /**
+   * Note what an element's trusted event changes about the position: a
+   * style sheet's `error` (a failed style sheet no longer blocks scripts).
+   * The replay runtime calls it for an event it holds back before the
+   * capture listener of {@link listen} sees it.
+   */
+  noteElementEvent(ev: Event): void {
+    if (
+      ev.isTrusted &&
+      ev.type === "error" &&
+      ev.target instanceof this.w.HTMLLinkElement
+    ) {
+      this.failedSheets.add(ev.target);
+    }
   }
 
   /**
@@ -379,7 +396,12 @@ export function recordDocumentProgress(
   const announce = (script: Element, kind: number) => {
     announced.add(script);
     loading();
-    rec.emit("DocTask", { kind, src: progress.srcOf(script) });
+    rec.emit("DocTask", {
+      kind,
+      src: progress.srcOf(script),
+      target: "",
+      event: "",
+    });
   };
   rec.attachProgress({
     macrotask: loading,
@@ -403,7 +425,12 @@ export function recordDocumentProgress(
       rec.guard(() => {
         if (!rec.recording) return;
         loading();
-        rec.emit("DocTask", { kind: DOC_TASK.domContentLoaded, src: "" });
+        rec.emit("DocTask", {
+          kind: DOC_TASK.domContentLoaded,
+          src: "",
+          target: "",
+          event: "",
+        });
       });
       progress.markDomContentLoaded();
     },
@@ -411,10 +438,73 @@ export function recordDocumentProgress(
       rec.guard(() => {
         if (!rec.recording) return;
         loading();
-        rec.emit("DocTask", { kind: DOC_TASK.load, src: "" });
+        rec.emit("DocTask", {
+          kind: DOC_TASK.load,
+          src: "",
+          target: "",
+          event: "",
+        });
       });
       progress.markLoad();
     },
   });
+  recordResourceEvents(w, rec, addEventListener, loading);
   return progress;
+}
+
+/**
+ * The capture listeners {@link recordResourceEvents} and the replay runtime
+ * put where a resource element's event reaches first (`resource-events.ts`):
+ * on the window for every type, since a page's capture listener there runs
+ * before one on the document, and on the document for `load`, which never
+ * reaches the window (DOM, "get the parent" of a Document:
+ * https://dom.spec.whatwg.org/#ref-for-get-the-parent%E2%91%A6); and on an
+ * element just before the page adds its first listener for one, for an
+ * element that is not in the document.
+ */
+export function listenForResourceEvents(
+  w: Window & typeof globalThis,
+  addEventListener: typeof EventTarget.prototype.addEventListener,
+  listener: (ev: Event) => void,
+  onWatched?: (el: Element) => void,
+): void {
+  const add = (at: EventTarget, type: string) =>
+    addEventListener.call(at, type, listener, { capture: true });
+  for (const type of RESOURCE_EVENT_TYPES) add(w, type);
+  add(w.document, "load");
+  watchResourceListeners(w, (el) => {
+    for (const type of RESOURCE_EVENT_TYPES) add(el, type);
+    onWatched?.(el);
+  });
+}
+
+/**
+ * Record each resource element's event (`DocTask` kind 5, §6): where the
+ * document was (`Loading`, while it loads), then the event, before any
+ * listener of the page runs. Each event is written once, however many of the
+ * capture listeners see it.
+ */
+function recordResourceEvents(
+  w: Window & typeof globalThis,
+  rec: Recorder,
+  addEventListener: typeof EventTarget.prototype.addEventListener,
+  loading: () => void,
+): void {
+  const recorded = new WeakSet<Event>();
+  listenForResourceEvents(w, addEventListener, (ev) => {
+    if (recorded.has(ev)) return;
+    rec.guard(() => {
+      const r: ResourceEvent | undefined = resourceEventOf(w, ev);
+      if (r === undefined) return;
+      recorded.add(ev);
+      if (!rec.recording) return;
+      loading();
+      rec.emit("DocTask", {
+        kind: DOC_TASK.resourceEvent,
+        src: r.src,
+        target: r.target,
+        event: r.event,
+      });
+    });
+  });
 }

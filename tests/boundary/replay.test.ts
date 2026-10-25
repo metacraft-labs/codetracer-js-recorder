@@ -775,7 +775,9 @@ describe("tasks recorded while the document loaded", () => {
       const docTasks = new Set(
         records.flatMap((r) => (r.record === "DocTask" ? [r.kind] : [])),
       );
-      expect([...docTasks].sort()).toEqual([1, 2, 3]);
+      // Scripts (1), DOMContentLoaded (2), load (3), and the style sheet's
+      // and the image's load (5), each come late.
+      expect([...docTasks].sort()).toEqual([1, 2, 3, 5]);
       const last = records[records.length - 2];
       expect(last.record, "the session ends with a checkpoint").toBe(
         "Checkpoint",

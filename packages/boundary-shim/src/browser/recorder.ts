@@ -212,6 +212,35 @@ export class Recorder {
   }
 
   /**
+   * A task's page code is about to run where no checkpoint may be taken,
+   * since page code of the same platform task already ran: a dynamic
+   * `import()` settles after its module evaluated in that task (§6). Writes
+   * where the document is (`Loading`, while it loads), then the `Task`.
+   */
+  taskWithoutCheckpoint(taskId: bigint, kind: number): void {
+    if (this.state !== "recording") return;
+    this.microtask();
+    this.emit("Task", { task_id: taskId, kind });
+  }
+
+  /**
+   * The platform is about to run page code in a microtask of its own that
+   * the log orders by its position rather than by a `Task`: a
+   * `MutationObserver` callback (DOM, "notify mutation observers", a
+   * microtask), which follows the page's own DOM changes deterministically
+   * but, for the elements the parser inserts, runs at whatever microtask
+   * checkpoint comes next (§6, "The document's own tasks"). Writes a
+   * script's `DocTask` if it is the first record of the running script,
+   * then where the document is (`Loading`, while it loads). Never a
+   * checkpoint: this is not a quiescent point.
+   */
+  microtask(): void {
+    if (this.state !== "recording") return;
+    this.progress?.beforeRecord();
+    this.progress?.macrotask();
+  }
+
+  /**
    * A macrotask starts (a quiescent point, §7.3): where the document is in
    * its loading (`Loading`, while it loads), then a checkpoint if one is
    * due. A recorder that writes a task's records itself (an input's

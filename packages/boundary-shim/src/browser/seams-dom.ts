@@ -174,6 +174,14 @@ export function listenForPageEvents(
   ] as const) {
     add(type, (ev) => {
       if (!ev.isTrusted || !rec.recording) return;
+      // A fragment navigation the page's code makes (`location.hash = …`)
+      // fires `popstate` synchronously, inside that call (HTML, "navigate to
+      // a fragment" → "update document for history step application"): it
+      // runs inside a task the log already has, and the replayed code fires
+      // it again there. Every other `popstate` (a traversal's, or a link the
+      // user activated, after the click's listeners) and every `hashchange`
+      // (which is queued) is a task of its own.
+      if (type === "popstate" && dispatchedFromScript()) return;
       rec.guard(() => {
         // Dispatched by the browser, not registered by the page: the task
         // id is minted here, and no TaskReg precedes it.
@@ -188,6 +196,40 @@ export function listenForPageEvents(
     rec.guard(() => rec.emit("Navigation", { kind: 5, url: w.location.href }));
     onPageHide();
   });
+}
+
+/**
+ * Whether the event whose capture listener calls this (directly, as its
+ * first frame) was dispatched synchronously from script: a JavaScript frame
+ * lies below the listener's (the page's `location.hash = …`, an injected
+ * click's activation), rather than the listener being called from a task
+ * of the platform's. Read from V8's structured stack (`prepareStackTrace`,
+ * https://v8.dev/docs/stack-trace-api), set only for this one capture and
+ * restored, with the text of the stack as the fallback of another engine.
+ */
+export function dispatchedFromScript(): boolean {
+  const E = Error as ErrorConstructor & {
+    stackTraceLimit?: number;
+    prepareStackTrace?: (e: Error, frames: unknown[]) => unknown;
+  };
+  const limit = E.stackTraceLimit;
+  const prepare = E.prepareStackTrace;
+  try {
+    E.stackTraceLimit = 4;
+    E.prepareStackTrace = (_e, frames) => frames.length;
+    const stack = new Error().stack as unknown;
+    // This function's frame, the listener's, then whatever dispatched.
+    if (typeof stack === "number") return stack > 2;
+    const lines = String(stack ?? "")
+      .split("\n")
+      .filter((l) => /\S/.test(l) && !/^Error\b/.test(l));
+    return lines.length > 2;
+  } catch {
+    return false;
+  } finally {
+    E.prepareStackTrace = prepare;
+    E.stackTraceLimit = limit;
+  }
 }
 
 /** The DOM events §10.2 captures, by group. */

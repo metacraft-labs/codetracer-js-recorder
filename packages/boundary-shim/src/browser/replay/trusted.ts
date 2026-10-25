@@ -18,17 +18,26 @@
  * reach its listeners unchanged, untrusted as on record.
  *
  * What no setter sees is a handler set by markup: an `on<event>` content
- * attribute of `<body>` (`<body onmessage="…">`) is the window's handler,
- * compiled by the platform. Before a stand-in reaches the window, replay
- * checks that no such handler is set for its type; one that is would read
- * the event's real `isTrusted`, so the replay diverges (`NonReplayable`)
- * rather than run it with another value. Injected input events (§10.3) are
- * not stand-ins: their handlers may be set by markup on any element, so they
- * keep the level-0 limitation §10.3 states.
+ * attribute (`<body onmessage="…">`, which is the window's handler, or
+ * `<img onload="…">`) is compiled by the platform into the handler's value
+ * when it is first read or the event first dispatched (HTML, "getting the
+ * current value of the event handler":
+ * https://html.spec.whatwg.org/multipage/webappapis.html#getting-the-current-value-of-the-event-handler).
+ * Just before a stand-in is dispatched at a target, replay reads the
+ * target's handler for its type through the platform's getter (compiling a
+ * markup handler, as the dispatch would), and when that value is a function
+ * replay did not wrap, sets in its place, through the platform's setter, a
+ * wrapper that calls it with the view. Setting an event handler's value
+ * keeps the handler's place among the target's listeners (HTML, "event
+ * handler IDL attributes", the setter's steps), and the platform's getter
+ * still answers the compiled function, so the page sees the handler it had,
+ * run at its place, with the event as on record. Injected input events
+ * (§10.3) are not stand-ins: they keep the level-0 limitation §10.3 states.
  */
 
 import { getterOnChain } from "../originals.js";
 import { replaceAccessor, replaceValue } from "../context.js";
+import { RESOURCE_EVENT_TYPES } from "../resource-events.js";
 import type { ReplayContext } from "./context.js";
 
 export interface TrustedEvents {
@@ -42,7 +51,11 @@ export interface TrustedEvents {
 /** The window's event handlers a stand-in can reach. */
 const WINDOW_HANDLERS = ["message", "storage", "popstate", "hashchange"];
 
-/** The `on<event>` handlers of the objects replay dispatches stand-ins at. */
+/**
+ * The `on<event>` handlers of the objects replay dispatches stand-ins at:
+ * an XMLHttpRequest and its upload object, a `MessagePort`, and the
+ * elements whose resource events the runner dispatches (§6).
+ */
 const HANDLERS: readonly (readonly [string, readonly string[]])[] = [
   [
     "XMLHttpRequestEventTarget",
@@ -50,6 +63,8 @@ const HANDLERS: readonly (readonly [string, readonly string[]])[] = [
   ],
   ["XMLHttpRequest", ["readystatechange"]],
   ["MessagePort", ["message", "messageerror"]],
+  ["HTMLElement", [...RESOURCE_EVENT_TYPES]],
+  ["SVGElement", [...RESOURCE_EVENT_TYPES]],
 ];
 
 export function installTrustedEvents(ctx: ReplayContext): TrustedEvents {
@@ -138,19 +153,44 @@ export function installTrustedEvents(ctx: ReplayContext): TrustedEvents {
   );
 
   /**
-   * Make the `on<type>` handler of `owner` call the page's handler with the
-   * view. Returns the platform's getter, which answers the function the
+   * The platform's accessors of each `on<type>` handler patched below, by
+   * the object that defines it: they answer and set the function the
    * platform holds (the wrapper, or a handler compiled from markup).
    */
-  const patchHandler = (
-    owner: object,
-    type: string,
-  ): ((this: unknown) => unknown) | undefined => {
+  const platformHandlers = new Map<
+    object,
+    Map<
+      string,
+      {
+        get: (this: unknown) => unknown;
+        set: (this: unknown, v: unknown) => void;
+      }
+    >
+  >();
+  /** A wrapper that calls `handler` with the view of a stand-in. */
+  const handlerWrapper = (handler: Function): Function => {
+    const wrapper = function (this: unknown, ev: Event): unknown {
+      return handler.call(this, seen(ev));
+    };
+    handlerOf.set(wrapper, handler);
+    return wrapper;
+  };
+  /**
+   * Make the `on<type>` handler of `owner` call the page's handler with the
+   * view, keeping the platform's accessors for {@link wrapMarkupHandler}.
+   */
+  const patchHandler = (owner: object, type: string): void => {
     const name = `on${type}`;
     const d = Object.getOwnPropertyDescriptor(owner, name);
-    if (d?.get === undefined || d.set === undefined) return undefined;
+    if (d?.get === undefined || d.set === undefined) return;
     const get = d.get;
     const set = d.set;
+    let byType = platformHandlers.get(owner);
+    if (byType === undefined) {
+      byType = new Map();
+      platformHandlers.set(owner, byType);
+    }
+    byType.set(type, { get, set });
     replaceAccessor(
       owner,
       name,
@@ -163,15 +203,9 @@ export function installTrustedEvents(ctx: ReplayContext): TrustedEvents {
           set.call(this, v);
           return;
         }
-        const handler = v as Function;
-        const wrapper = function (this: unknown, ev: Event): unknown {
-          return handler.call(this, seen(ev));
-        };
-        handlerOf.set(wrapper, handler);
-        set.call(this, wrapper);
+        set.call(this, handlerWrapper(v as Function));
       },
     );
-    return get;
   };
   for (const [ctor, types] of HANDLERS) {
     const proto = (w as unknown as Record<string, { prototype?: object }>)[ctor]
@@ -179,11 +213,9 @@ export function installTrustedEvents(ctx: ReplayContext): TrustedEvents {
     if (proto === undefined) continue;
     for (const type of types) patchHandler(proto, type);
   }
-  const windowHandlers = new Map<string, (this: unknown) => unknown>();
   for (const type of WINDOW_HANDLERS) {
     const g = getterOnChain(w, `on${type}`);
-    const get = g === undefined ? undefined : patchHandler(g.owner, type);
-    if (get !== undefined) windowHandlers.set(type, get);
+    if (g !== undefined) patchHandler(g.owner, type);
     // `<body>` and `<frameset>` reflect the window's handlers (HTML,
     // WindowEventHandlers: https://html.spec.whatwg.org/multipage/webappapis.html#windoweventhandlers),
     // so `document.body.onmessage = f` sets the window's handler from
@@ -196,18 +228,45 @@ export function installTrustedEvents(ctx: ReplayContext): TrustedEvents {
     }
   }
 
+  /**
+   * Before a stand-in of type `type` reaches `target`: when the target's
+   * `on<type>` handler holds a function replay did not wrap (one compiled
+   * from a content attribute; see the module comment), put a wrapper in its
+   * place, at its place among the target's listeners.
+   */
+  const wrapMarkupHandler = (target: EventTarget, type: string): void => {
+    for (
+      let o: object | null = target;
+      o !== null;
+      o = Object.getPrototypeOf(o) as object | null
+    ) {
+      const accessors = platformHandlers.get(o)?.get(type);
+      if (accessors === undefined) {
+        // A handler of the same name defined here (not one replay patched)
+        // is the target's: `<body>`'s `onload` is the window's.
+        if (Object.getOwnPropertyDescriptor(o, `on${type}`) !== undefined) {
+          return;
+        }
+        continue;
+      }
+      const h = accessors.get.call(target);
+      if (typeof h !== "function" || handlerOf.has(h)) return;
+      try {
+        accessors.set.call(target, handlerWrapper(h));
+      } catch (e) {
+        ctx.replay.fail(
+          "NonReplayable",
+          `the ${type} handler set by markup could not be given the replayed event as trusted (${String(e)})`,
+        );
+      }
+      return;
+    }
+  };
+
   const dispatch = w.EventTarget.prototype.dispatchEvent;
   return {
     dispatch(target, ev) {
-      if (target === w && WINDOW_HANDLERS.includes(ev.type)) {
-        const h = windowHandlers.get(ev.type)?.call(w);
-        if (typeof h === "function" && !handlerOf.has(h)) {
-          ctx.replay.fail(
-            "NonReplayable",
-            `the window's on${ev.type} handler was set by markup, and would see the replayed ${ev.type} event as untrusted`,
-          );
-        }
-      }
+      wrapMarkupHandler(target, ev.type);
       standIns.add(ev);
       return dispatch.call(target, ev);
     },

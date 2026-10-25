@@ -16,16 +16,25 @@ import * as path from "node:path";
 
 import { sortedFilesUnder } from "@codetracer/instrumenter";
 
+import { rewriteDynamicImports, rewriteHtmlImports } from "./import-seam.js";
 import { bootstrapPosition, withoutBootstraps } from "./placement.js";
 
 import {
   BOOTSTRAP_MARKER,
   CONFIG_GLOBAL,
   CONTROL_GLOBAL,
+  IMPORT_SEAM_CAPABILITY,
   type ShimConfig,
+  sessionHasImportSeam,
 } from "./browser/config.js";
 
-export { BOOTSTRAP_MARKER, CONFIG_GLOBAL, CONTROL_GLOBAL };
+export {
+  BOOTSTRAP_MARKER,
+  CONFIG_GLOBAL,
+  CONTROL_GLOBAL,
+  IMPORT_SEAM_CAPABILITY,
+  sessionHasImportSeam,
+};
 export type { ShimConfig };
 export type { ShimControl } from "./browser/install.js";
 export { SHIM_VERSION, DOM_V1 } from "./browser/install.js";
@@ -182,6 +191,19 @@ export function htmlFilesUnder(root: string): string[] {
 }
 
 /**
+ * The JavaScript files under `root` (`.js`, `.mjs`), sorted by path, whose
+ * dynamic `import()` calls the deploy step rewrites (`import-seam.ts`);
+ * none when `root` is a file.
+ */
+export function scriptFilesUnder(root: string): string[] {
+  const stat = fs.statSync(root);
+  if (!stat.isDirectory()) return [];
+  return sortedFilesUnder(root, (rel) => /\.m?js$/i.test(rel)).map((rel) =>
+    path.join(root, rel),
+  );
+}
+
+/**
  * The text of the page `file`, which must be UTF-8: the bootstrap is UTF-8,
  * and a page in another encoding (UTF-16 with its byte order mark, or bytes
  * that are not UTF-8) would be written back with every byte that is not
@@ -202,25 +224,63 @@ function readUtf8Page(file: string): string {
 }
 
 /**
- * Inject the bootstrap into each file, in place. Returns the files changed.
- * Throws {@link BoundaryShimInjectionError} for a page it cannot install the
- * shim in, before it writes any file.
+ * Install the shim into a built site, in place: the bootstrap into each page
+ * of `files`, and, when `config.importSeam` asks for it (§8.1), the dynamic
+ * `import()` seam (`import-seam.ts`) into the inline scripts of those pages
+ * and into each of `scripts`, which are not read otherwise. Returns the
+ * files changed. Throws {@link BoundaryShimInjectionError} for a page it
+ * cannot install the shim in, and `ImportSeamError` for a script whose calls
+ * it cannot find, before it writes any file.
  */
 export function injectBoundaryShimIntoFiles(
   files: readonly string[],
   config: ShimConfig = {},
   options: InjectOptions = {},
+  scripts: readonly string[] = [],
 ): string[] {
   const bundleSource = options.bundleSource ?? boundaryShimBundle();
   const writes: [string, string][] = [];
   for (const f of files) {
     const before = readUtf8Page(f);
-    const after = injectBoundaryShim(before, config, { bundleSource });
+    const page =
+      config.importSeam === true
+        ? rewriteHtmlImports(withoutBootstraps(before), f)
+        : before;
+    const after = injectBoundaryShim(page, config, { bundleSource });
+    if (after !== before) writes.push([f, after]);
+  }
+  for (const f of config.importSeam === true ? scripts : []) {
+    const before = readUtf8Script(f);
+    const after = rewriteDynamicImports(before, f);
     if (after !== before) writes.push([f, after]);
   }
   for (const [f, after] of writes) fs.writeFileSync(f, after, "utf-8");
   return writes.map(([f]) => f);
 }
+
+/** The text of the script `file`, which must be UTF-8 (as a page must). */
+function readUtf8Script(file: string): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+      fs.readFileSync(file),
+    );
+  } catch {
+    throw new BoundaryShimInjectionError(
+      `${file}: the script is not UTF-8, so the dynamic import() seam ` +
+        "cannot be inserted without changing the rest of it",
+    );
+  }
+}
+
+export {
+  ImportSeamError,
+  rewriteDynamicImports,
+  rewriteHtmlImports,
+  rewriteWithEdits,
+  shiftMappings,
+  stripImportSeam,
+} from "./import-seam.js";
+export type { SeamEdit } from "./import-seam.js";
 
 export {
   BUNDLE_MANIFEST_FILE,
@@ -228,6 +288,7 @@ export {
   BUNDLE_EXTENSIONS,
   isBundleAsset,
   stripBoundaryShim,
+  stripImportSeamBytes,
   hashedBytes,
   canonicalJson,
   canonicalBundleManifestBytes,

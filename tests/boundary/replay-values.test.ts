@@ -25,185 +25,54 @@
  * No mocks: the browser, the server and the runner are real.
  */
 
-import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
-  type BoundaryRecord,
   type RecordOf,
   PLATFORM_VALUE_SRC,
   WS_FRAME,
-  decodeLog,
 } from "../../packages/boundary-format/src/index.js";
 import {
-  type Browser,
-  type ReplayReport,
-  loadPlaywright,
-  logBytes,
-  replaySession,
   seqAt,
   withRecordReplaced,
   withRecordsSwapped,
 } from "../../packages/boundary-replay/src/index.js";
-import { FIXTURES, type FixtureServer, startFixtureServer } from "./harness.js";
+import {
+  type Context,
+  type Page,
+  type RecordReplay,
+  expectDiverged,
+  expectReplayed,
+  indexWhere,
+  isReady,
+  lastCheckpoint,
+  replaced,
+  startRecordReplay,
+  until,
+  utf8,
+} from "./record-replay.js";
 
-const REPO_ROOT = path.resolve(__dirname, "..", "..");
-const RECORDER_CLI = path.join(REPO_ROOT, "packages/cli/dist/index.js");
 const TIMEOUT = 120_000;
 
-/** The slice of Playwright's page these tests drive. */
-interface Page {
-  goto(url: string): Promise<unknown>;
-  evaluate<T>(fn: () => T): Promise<T>;
-  setInputFiles(selector: string, files: string): Promise<void>;
-}
-interface Context {
-  newPage(): Promise<Page>;
-  close(): Promise<void>;
-}
-
-let browser: Browser;
-let build: string;
-let server: FixtureServer;
-const tmpDirs: string[] = [];
-
-function tmp(prefix: string): string {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  tmpDirs.push(d);
-  return d;
-}
+let rr: RecordReplay;
 
 beforeAll(async () => {
-  browser = await loadPlaywright().chromium.launch({ headless: true });
-  build = path.join(tmp("ct-values-build-"), "site");
-  fs.mkdirSync(build);
-  for (const f of fs.readdirSync(FIXTURES)) {
-    fs.copyFileSync(path.join(FIXTURES, f), path.join(build, f));
-  }
-  const hash = execFileSync(
-    process.execPath,
-    [RECORDER_CLI, "bundle-manifest", build],
-    { encoding: "utf-8" },
-  ).trim();
-  execFileSync(
-    process.execPath,
-    [RECORDER_CLI, "boundary-shim", build, "--build-hash", hash],
-    { stdio: "pipe" },
-  );
-  server = await startFixtureServer(build);
+  rr = await startRecordReplay();
 }, TIMEOUT);
 
 afterAll(async () => {
-  await server?.close();
-  await browser?.close();
-  for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
+  await rr?.close();
 });
 
-/** Poll `probe` from Node (an in-page poll would be recorded as the page's). */
-async function until(page: Page, probe: () => boolean, what: string) {
-  const deadline = Date.now() + 20_000;
-  for (;;) {
-    if (await page.evaluate(probe)) return;
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-    await new Promise((r) => setTimeout(r, 20));
-  }
-}
-
-const isDone = () => document.body?.getAttribute("data-done") === "1";
-const isReady = () => document.body?.getAttribute("data-ready") === "1";
-
-/**
- * Record `page` (a path under the fixture server) until it is done; `drive`
- * acts on it first (user input, a second page). Returns the decoded log.
- */
-async function record(
+const record = (
   pagePath: string,
   drive?: (page: Page, context: Context) => Promise<void>,
-): Promise<BoundaryRecord[]> {
-  const context = (await browser.newContext()) as unknown as Context;
-  try {
-    const page = await context.newPage();
-    await page.goto(`${server.origin}/${pagePath}`);
-    if (drive !== undefined) await drive(page, context);
-    await until(page, isDone, `${pagePath} to finish`);
-    const bytes = await page.evaluate(() => {
-      const shim = (globalThis as unknown as Record<string, unknown>)
-        .__ctBoundaryShim as { stop(): void; log(): Uint8Array };
-      shim.stop();
-      return Array.from(shim.log());
-    });
-    return decodeLog(Uint8Array.from(bytes), { inlineBodies: "batch" }).records;
-  } finally {
-    await context.close();
-  }
-}
-
-/** Replay `records` against the build (verification only, no trace). */
-async function replay(records: BoundaryRecord[]): Promise<ReplayReport> {
-  const file = path.join(tmp("ct-values-log-"), "jsbound.log");
-  fs.writeFileSync(file, logBytes(records));
-  return replaySession({ log: file, build, browser, timeoutMs: 60_000 });
-}
-
-/** The replay reached `End` and compared every checkpoint of the log. */
-function expectReplayed(r: ReplayReport, records: BoundaryRecord[]): void {
-  expect(r.error, r.error).toBeUndefined();
-  expect(
-    r.divergence,
-    `${r.divergence?.kind} at ${r.divergence?.seq}: ${r.divergence?.detail}`,
-  ).toBeUndefined();
-  expect(r.status).toBe("replayed");
-  const checkpoints = records.filter((x) => x.record === "Checkpoint").length;
-  // Vacuity guard: there is a checkpoint after the page wrote its values.
-  expect(checkpoints).toBeGreaterThanOrEqual(1);
-  expect(r.checkpoints).toBe(checkpoints);
-}
-
-/** The replay diverged with `kind` at `seq`. */
-function expectDiverged(r: ReplayReport, kind: string, seq?: string): void {
-  expect(r.status, r.error).toBe("diverged");
-  expect(
-    `${r.divergence?.kind} at ${r.divergence?.seq}`,
-    r.divergence?.detail,
-  ).toBe(`${kind} at ${seq ?? r.divergence?.seq}`);
-}
-
-/** The seq of the last checkpoint (where the page's values are compared). */
-function lastCheckpoint(records: BoundaryRecord[]): string {
-  const i = records.map((r) => r.record).lastIndexOf("Checkpoint");
-  return seqAt(records, i);
-}
-
-function indexWhere<K extends BoundaryRecord["record"]>(
-  records: BoundaryRecord[],
-  kind: K,
-  pred: (r: RecordOf<K>) => boolean = () => true,
-  nth = 0,
-): number {
-  let seen = 0;
-  for (let i = 0; i < records.length; i++) {
-    const r = records[i];
-    if (r.record === kind && pred(r as RecordOf<K>) && seen++ === nth) return i;
-  }
-  throw new Error(`no ${kind} record matches`);
-}
-
-function replaced<K extends BoundaryRecord["record"]>(
-  records: BoundaryRecord[],
-  at: number,
-  change: Partial<RecordOf<K>>,
-): BoundaryRecord[] {
-  return withRecordReplaced(records, at, {
-    ...(records[at] as RecordOf<K>),
-    ...change,
-  } as BoundaryRecord);
-}
-
-const utf8 = (b: { kind: string; bytes?: Uint8Array }) =>
-  new TextDecoder().decode(b.bytes);
+) => rr.record(pagePath, drive);
+const replay: RecordReplay["replay"] = (records, options) =>
+  rr.replay(records, options);
+const tmp = (prefix: string) => rr.tmp(prefix);
 
 describe("replay gives a page the values it read", () => {
   it(
@@ -212,7 +81,7 @@ describe("replay gives a page the values it read", () => {
       const rs = await record("values.html?case=fetch-meta");
       const at = indexWhere(rs, "NetResponse", (r) => r.outcome === 5);
       const head = rs[at] as RecordOf<"NetResponse">;
-      expect(head.url).toBe(`${server.origin}/api/data?redirected=1`);
+      expect(head.url).toBe(`${rr.server.origin}/api/data?redirected=1`);
       expect([head.redirected, head.status_text, head.response_type]).toEqual([
         1,
         "OK",
@@ -222,7 +91,7 @@ describe("replay gives a page the values it read", () => {
       // What replay answered before the log held them: the request's URL,
       // not redirected, an empty status text.
       const before = replaced<"NetResponse">(rs, at, {
-        url: `${server.origin}/api/redirect`,
+        url: `${rr.server.origin}/api/redirect`,
         redirected: 0,
         status_text: "",
       });
@@ -253,12 +122,12 @@ describe("replay gives a page the values it read", () => {
       const at = indexWhere(rs, "NetResponse", (r) => r.outcome === 5);
       const head = rs[at] as RecordOf<"NetResponse">;
       expect([head.url, head.status_text]).toEqual([
-        `${server.origin}/api/data?redirected=1`,
+        `${rr.server.origin}/api/data?redirected=1`,
         "OK",
       ]);
       expectReplayed(await replay(rs), rs);
       const before = replaced<"NetResponse">(rs, at, {
-        url: `${server.origin}/api/redirect`,
+        url: `${rr.server.origin}/api/redirect`,
         status_text: "",
       });
       expectDiverged(
@@ -340,8 +209,15 @@ describe("replay gives a page the values it read", () => {
         (v) => v.src === PLATFORM_VALUE_SRC.idleDeadline,
       );
       expectReplayed(await replay(rs), rs);
-      // Before: timeRemaining() answered 0.
-      const zero = replaced<"Clock">(rs, remaining, { bits: 0n });
+      // Before: timeRemaining() answered 0. The edit must change the value:
+      // a loaded recording's deadline can itself have run out (0), and is
+      // then edited to 12.5 ms.
+      const recorded = (rs[remaining] as RecordOf<"Clock">).bits;
+      const edited = new DataView(new ArrayBuffer(8));
+      edited.setFloat64(0, 12.5);
+      const zero = replaced<"Clock">(rs, remaining, {
+        bits: recorded === 0n ? edited.getBigUint64(0) : 0n,
+      });
       expectDiverged(
         await replay(zero),
         "CheckpointMismatch",
@@ -525,7 +401,7 @@ describe("replay gives a page the values it read", () => {
     async () => {
       const rs = await record("values.html?case=url&x=7#frag");
       const env = rs[1] as RecordOf<"Env">;
-      expect(env.url).toBe(`${server.origin}/values.html?case=url&x=7#frag`);
+      expect(env.url).toBe(`${rr.server.origin}/values.html?case=url&x=7#frag`);
       expectReplayed(await replay(rs), rs);
       const other = withRecordReplaced(rs, 1, {
         ...env,
@@ -641,7 +517,7 @@ describe("replay gives a page the values it read", () => {
         async (page, context) => {
           await until(page, isReady, "the storage listener");
           const other = await context.newPage();
-          await other.goto(`${server.origin}/values.html?case=url`);
+          await other.goto(`${rr.server.origin}/values.html?case=url`);
           await other.evaluate(() => localStorage.setItem("k", "v"));
         },
       );
@@ -668,12 +544,27 @@ describe("replay gives a page the values it read", () => {
   );
 
   it(
-    "replay_refuses_a_window_handler_set_by_markup",
+    "replay_gives_window_handlers_set_by_markup_the_trusted_view",
     async () => {
-      const rs = await record("values-markup.html?case=markup");
-      const r = await replay(rs);
-      expectDiverged(r, "NonReplayable");
-      expect(r.divergence?.detail).toContain("set by markup");
+      // `<body onmessage>`, `<body onpopstate>` and `<body onhashchange>`
+      // are the window's handlers, compiled by the platform from the
+      // attributes (values-markup.html). Each sees the replayed event as
+      // trusted, as on record, at its place among the window's listeners, and
+      // the replay reaches End.
+      const cases: [string, string][] = [
+        ["markup", "markup=true"],
+        // Run once: the replay browser's own popstate is held back.
+        ["markup-popstate", "popstate=true:null:1"],
+        ["markup-hashchange", "hashchange=true:#moved"],
+      ];
+      for (const [c, saw] of cases) {
+        const { records, slots } = await rr.recordPage(
+          `values-markup.html?case=${c}`,
+        );
+        // Vacuity guard: on record the handler ran, and saw a trusted event.
+        expect(slots, c).toContain(saw);
+        expectReplayed(await replay(records), records);
+      }
     },
     TIMEOUT,
   );
@@ -691,5 +582,114 @@ describe("replay gives a page the values it read", () => {
       expectReplayed(await replay(rs), rs);
     },
     TIMEOUT,
+  );
+
+  it(
+    "a_script_that_wrote_no_record_replays_from_its_loading_position",
+    async () => {
+      // The `url` case run while values.js runs, at the end of the body: the
+      // script inserts three result slots and makes no boundary read, so its
+      // execution is a DocTask 4 written when it settled, after the Loading
+      // of that moment, which counts the slots it inserted.
+      const rs = await record("values.html?case=url&at=loading");
+      const task = indexWhere(
+        rs,
+        "DocTask",
+        (d) => d.kind === 4 && d.src.endsWith("/values.js"),
+      );
+      const loading = rs[task - 1] as RecordOf<"Loading">;
+      expect(loading.record).toBe("Loading");
+      expect(loading.phase).toBe(1);
+      // Vacuity guard: no record of the script's own between them.
+      expect(
+        rs.slice(0, task).some((r) => r.record === "DocTask" && r.kind === 1),
+      ).toBe(false);
+      expectReplayed(await replay(rs), rs);
+      // A position the script does not bring the document to is refused at
+      // the Loading, never replayed elsewhere.
+      const off = replaced<"Loading">(rs, task - 1, {
+        elements: loading.elements + 1,
+      });
+      expectDiverged(
+        await replay(off),
+        "TaskOrderMismatch",
+        seqAt(rs, task - 1),
+      );
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a_mutation_observer_callback_while_loading_replays_at_its_position",
+    async () => {
+      // The `observers` case run while the document loads: the
+      // MutationObserver's callback is a microtask of the platform's, right
+      // after the script that changed the list, so its records follow the
+      // Loading of that moment and no Task.
+      const rs = await record("values.html?case=observers&at=loading");
+      const mo = indexWhere(
+        rs,
+        "PlatformValue",
+        (v) =>
+          v.src === PLATFORM_VALUE_SRC.mutationObserver &&
+          v.query === "callback",
+      );
+      expect(rs[mo - 1].record).toBe("Loading");
+      expect((rs[mo - 1] as RecordOf<"Loading">).phase).toBe(1);
+      const id = (rs[mo] as RecordOf<"PlatformValue">).task_id;
+      expect(
+        rs.some((r) => r.record === "Task" && r.task_id === id),
+        "a MutationObserver callback has no Task",
+      ).toBe(false);
+      expectReplayed(await replay(rs), rs);
+      // The records are still the replay's own, compared with the log's.
+      expectDiverged(
+        await replay(replaced<"PlatformValue">(rs, mo, { value: "[]" })),
+        "ArgumentMismatch",
+        seqAt(rs, mo),
+      );
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "values_cases_replay_to_end_when_run_while_the_document_loads",
+    async () => {
+      // The cases above start at `load`; run while the document loads, their
+      // records interleave with the document's own tasks, and still replay
+      // to End.
+      const cases = [
+        "url",
+        "observers",
+        "fetch-meta",
+        "xhr-meta",
+        "ws-frames",
+        "sse-named",
+        "idle",
+        "platform",
+        "perf",
+        "messages",
+        "body-handler",
+      ];
+      for (const c of cases) {
+        const rs = await record(`values.html?case=${c}&at=loading`);
+        // Vacuity guard: the session has records written while it parsed,
+        // and the case's own records before the document's load.
+        const load = indexWhere(rs, "DocTask", (d) => d.kind === 3);
+        expect(
+          rs
+            .slice(0, load)
+            .some((r) => r.record === "Loading" && r.phase === 1),
+          c,
+        ).toBe(true);
+        const r = await replay(rs);
+        expect(
+          `${c}: ${r.divergence?.kind ?? r.error ?? "replayed"}`,
+          r.divergence?.detail,
+        ).toBe(`${c}: replayed`);
+        expectReplayed(r, rs);
+      }
+    },
+    TIMEOUT * 2,
   );
 });

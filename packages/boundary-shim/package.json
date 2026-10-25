@@ -12,7 +12,8 @@
   "dependencies": {
     "@codetracer/boundary-format": "*",
     "@codetracer/instrumenter": "*",
-    "@codetracer/runtime-browser": "*"
+    "@codetracer/runtime-browser": "*",
+    "@swc/core": "^1.10.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

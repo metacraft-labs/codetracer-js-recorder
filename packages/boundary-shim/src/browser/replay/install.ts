@@ -22,6 +22,8 @@ import {
   replayInput,
   replayNavigation,
 } from "./dom.js";
+import { replayImportSeam } from "./imports.js";
+import { replayMediaSeams } from "./media.js";
 import { replayMessageSeams } from "./message.js";
 import { replayNetSeams } from "./net.js";
 import { replayPlatformSeams } from "./platform.js";
@@ -59,7 +61,14 @@ export function installReplayShim(
   if (existing !== undefined) return existing;
   const ctx = newReplayContext(w, replay);
   ctx.trusted = installTrustedEvents(ctx);
+  // The resource elements' events the runner dispatches in the platform's
+  // place reach the page's listeners as trusted, as on record (§6, §10.5).
+  replay.useStandIns((target, ev) => {
+    ctx.trusted.dispatch(target, ev);
+  });
   replayTimeSeams(ctx);
+  replayMediaSeams(ctx);
+  replayImportSeam(ctx);
   replayNetSeams(ctx);
   replayXhr(ctx);
   replayDomSeams(ctx);

@@ -8,7 +8,7 @@
  * |---------------|--------|--------------|
  * | `interaction` | 0, 1   | the build ran the scripted interaction: every step succeeded, the page threw nothing, and the named elements show the fixture's final text |
  * | `decode`      | 0, 1   | the log decodes strictly (§5.3) and ends with `End` |
- * | `header`      | 0, 1   | `Header` names the level, the build's hash and a session id; at level 0 no framework or capabilities; `Env.url` is the page |
+ * | `header`      | 0, 1   | `Header` names the level, the build's hash and a session id; at level 0 no framework, and no capability but `import-seam`; `Env.url` is the page |
  * | `declaration` | 1      | `__ctBoundaryProtocol` declares protocol 1, a framework and the four required capabilities, has the record hooks, and `Header` copies it |
  * | `inputs`      | 0, 1   | every handler invocation produced one `Input` (exactly one at level 1, at least one at level 0) whose target resolves to the element; each `Input` follows its own `Task`; the declared `DomEffect`s; labels when declared |
  * | `targets`     | 1      | every target is a stable id, `ord:`, `doc` or `win`, and the targets are the same in the perturbed page |
@@ -24,6 +24,8 @@ import {
   decodeLog,
 } from "@codetracer/boundary-format";
 
+import { IMPORT_SEAM_CAPABILITY } from "@codetracer/boundary-shim";
+
 import { checkpointCadence } from "./cadence.js";
 import type { EnvelopeResult } from "./envelope.js";
 import type { Fixture } from "./fixtures.js";
@@ -35,6 +37,12 @@ import {
   type RecordCheckName,
   REQUIRED_CAPABILITIES,
 } from "./protocol.js";
+
+/**
+ * The one `Header.capabilities` a level-0 recorder may write besides `[]`:
+ * the generic shim installed with the dynamic `import()` seam (§8.1).
+ */
+const LEVEL0_IMPORT_SEAM = JSON.stringify([IMPORT_SEAM_CAPABILITY]);
 
 /** What a target string resolved to in the page at the end of the run. */
 export interface TargetResolution {
@@ -237,7 +245,9 @@ const header: Check = (run, decoded) => {
       problems.push(
         `Header.framework is ${JSON.stringify(h.framework)} at level 0`,
       );
-    if (h.capabilities !== "[]")
+    // The generic shim declares one capability, and only when the deploy
+    // step was asked to install the dynamic import() seam (§8.1).
+    if (h.capabilities !== "[]" && h.capabilities !== LEVEL0_IMPORT_SEAM)
       problems.push(`Header.capabilities is ${h.capabilities} at level 0`);
   } else if (h.framework === "") {
     problems.push("Header.framework is empty at level 1");

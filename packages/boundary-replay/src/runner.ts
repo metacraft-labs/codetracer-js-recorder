@@ -43,6 +43,8 @@ import {
   REPLAY_GLOBAL,
   type ReplayConfig,
   bootstrapPosition,
+  rewriteDynamicImports,
+  rewriteHtmlImports,
   stripBoundaryShim,
 } from "@codetracer/boundary-shim";
 import { RECORDER_VERSION } from "@codetracer/instrumenter";
@@ -64,6 +66,8 @@ import {
   type ContextOptions,
   loadPlaywright,
   type Page,
+  type Request,
+  type Route,
 } from "./playwright.js";
 
 /** The in-page runtime bundle (`scripts/bundle.mjs` builds it). */
@@ -90,6 +94,13 @@ export interface ReplayOptions {
   timeoutMs?: number;
   /** A browser to use instead of launching one. */
   browser?: Browser;
+  /**
+   * Test seam: how long the runner waits before it answers a request for
+   * `url` from the build, in ms (default 0), so a test can replay a session
+   * with a resource slower than it was on record and show that the replay
+   * keeps the recorded order anyway. Never set in production.
+   */
+  responseDelayMs?: (url: string) => number;
 }
 
 /** What a replay found. */
@@ -144,6 +155,7 @@ const CONTENT_TYPES: Record<string, string> = {
   ".wasm": "application/wasm",
   ".svg": "image/svg+xml",
   ".png": "image/png",
+  ".wav": "audio/wav",
   ".ico": "image/x-icon",
 };
 
@@ -163,6 +175,34 @@ function fileUnder(root: string, pathname: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * `body` (the file `file`) with its dynamic `import()` calls given the seam
+ * by `rewrite` (§6, §8.1). A file with no `import` in it is served byte for
+ * byte. One that is not UTF-8 cannot be rewritten without changing its other
+ * bytes, and is refused (the caller ends the replay `NonReplayable`) rather
+ * than served with calls the replay cannot see.
+ */
+function withImportSeam(
+  body: Buffer,
+  file: string,
+  rewrite: (text: string, name: string) => string,
+): Buffer {
+  if (!body.includes("import")) return body;
+  let text: string;
+  try {
+    // `ignoreBOM` keeps a byte order mark in the text, so it is written back.
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+      body,
+    );
+  } catch {
+    throw new Error(
+      `${file} is not UTF-8, so the replay cannot give its dynamic import() calls their seam`,
+    );
+  }
+  const out = rewrite(text, file);
+  return out === text ? body : Buffer.from(out, "utf-8");
 }
 
 /** The replay context's options from `Env` (§7.4). */
@@ -488,13 +528,120 @@ export async function replaySession(
     /** At level 0, the external scripts the replayed document's parser inserts. */
     let parserScripts = new Set<string>();
     let documents = 0;
+    let page: Page | undefined;
+    const level0 = header.protocol_level === 0;
+    /**
+     * End the replay with a typed divergence the runner sees (a frame the
+     * build cannot answer): latched in the page's `__ctReplay`, which the
+     * runner reports.
+     */
+    const diverge = async (kind: string, detail: string): Promise<void> => {
+      try {
+        await page?.evaluate(
+          ([k, d]: [string, string]) => {
+            try {
+              (
+                globalThis as unknown as {
+                  __ctReplay: { fail(k: string, d: string): never };
+                }
+              ).__ctReplay.fail(k, d);
+            } catch {
+              // Latched: fail always throws.
+            }
+          },
+          [kind, detail] as [string, string],
+        );
+      } catch {
+        // The page is gone; the replay reports what it reached.
+      }
+    };
+    /**
+     * Whether the page has a script element fetched from `url` that has not
+     * settled (`__ctReplay.pendingScriptElement`): a script request the log
+     * has no execution of is then a script the page inserted, not a module's
+     * dependency. A page that cannot be asked (gone, or closing once the
+     * replay ended) counts as having one: the request is then held, never
+     * answered, since answering a script the session never ran would run it,
+     * while holding a module's dependency can only stall the replay, which
+     * then fails rather than goes on as it was not recorded.
+     */
+    const pageScriptElement = async (url: string): Promise<boolean> => {
+      if (page === undefined) return true;
+      try {
+        return (
+          (await page.evaluate(
+            (u: string) =>
+              (
+                globalThis as unknown as {
+                  __ctReplay: { pendingScriptElement(u: string): boolean };
+                }
+              ).__ctReplay.pendingScriptElement(u),
+            url,
+          )) === true
+        );
+      } catch {
+        return true;
+      }
+    };
+    /** Whether the page's document is still being parsed. */
+    const pageParsing = async (): Promise<boolean> => {
+      try {
+        return (
+          (await page?.evaluate(() => document.readyState === "loading")) ===
+          true
+        );
+      } catch {
+        return true;
+      }
+    };
+    /** Rewritten file bodies (the import seam), by path. */
+    const rewritten = new Map<string, Buffer>();
     await context.route("**/*", async (route, request) => {
+      try {
+        await serve(route, request);
+      } catch (e) {
+        // A file the runner cannot serve as the session's page had it (a
+        // script whose dynamic imports cannot be found): the replay cannot
+        // go on as recorded, and says so.
+        await diverge(
+          "NonReplayable",
+          `the runner cannot serve ${request.url()}: ${(e as Error).message}`,
+        );
+        await route.abort("blockedbyclient").catch(() => undefined);
+      }
+    });
+    async function serve(route: Route, request: Request): Promise<void> {
       let url: URL;
       try {
         url = new URL(request.url());
       } catch {
         await route.abort("blockedbyclient");
         return;
+      }
+      const isNavigation =
+        request.isNavigationRequest() && request.resourceType() === "document";
+      const mainFrame = request.frame().parentFrame() === null;
+      if (isNavigation && !mainFrame) {
+        // A frame of the page navigates (§7.4): its document is answered
+        // from the build, as the page's own; a frame the build cannot
+        // answer (another origin, a document it does not have) is refused,
+        // typed, rather than shown with another document.
+        if (url.origin !== origin || request.method() !== "GET") {
+          await diverge(
+            "NonReplayable",
+            `a frame of the page navigates to ${url.href}, a document of another origin than the recorded page's, which the replay cannot answer`,
+          );
+          await route.abort("blockedbyclient");
+          return;
+        }
+        if (fileUnder(build, url.pathname) === undefined) {
+          await diverge(
+            "NonReplayable",
+            `a frame of the page navigates to ${url.href}, which the build does not hold, so the replay cannot answer it`,
+          );
+          await route.abort("blockedbyclient");
+          return;
+        }
       }
       // §7.4: no network. The build's files at the recorded origin, the
       // first document only (a later navigation ends the session).
@@ -503,10 +650,7 @@ export async function replaySession(
         return;
       }
       let firstDocument = false;
-      if (
-        request.isNavigationRequest() &&
-        request.resourceType() === "document"
-      ) {
+      if (isNavigation && mainFrame) {
         if (documents++ > 0) {
           await route.abort("blockedbyclient");
           return;
@@ -527,22 +671,41 @@ export async function replaySession(
         });
         return;
       }
-      if (request.resourceType() === "script") {
+      const key = url.href.split("#")[0];
+      if (request.resourceType() === "script" && mainFrame) {
         // A script whose execution the log has runs when its DocTask comes
         // due (the preload scanner's request is the one held). At level 0
         // the shim ran before every script of the page and logged each
-        // execution, so a script of the document's that the log does not have
-        // did not run before the session ended, and does not run on replay
-        // either. Anything else (a module's dependency, which is not a script
-        // element) is answered as it comes.
-        const key = url.href.split("#")[0];
+        // execution, so a script element of the page's (one the parser
+        // inserts, or one the page inserted) that the log does not have did
+        // not run before the session ended, and does not run on replay
+        // either. Anything else (a module's dependency or a dynamic import's
+        // module, which are not script elements) is answered as it comes.
         if (
           plan.takeScript(key) ||
-          (header.protocol_level === 0 && plan.holds && parserScripts.has(key))
+          (level0 &&
+            plan.holds &&
+            (parserScripts.has(key) || (await pageScriptElement(key))))
         ) {
           await held.hold(`script:${key}`);
         }
+      } else if (
+        (mainFrame ||
+          (isNavigation &&
+            request.frame().parentFrame()?.parentFrame() === null)) &&
+        !(request.resourceType() === "stylesheet" && (await pageParsing())) &&
+        plan.takeResource(key)
+      ) {
+        // A resource whose element's `load` or `error` the log has (§6,
+        // `DocTask` 5): answered when that event comes due. Not a style
+        // sheet while the document parses: a pending style sheet blocks the
+        // parser's scripts, the replay's parser gates among them, so the
+        // replay could not hold the parser where the log has it; its events
+        // are held back and dispatched from the log all the same.
+        await held.hold(`resource:${key}`);
       }
+      const delay = options.responseDelayMs?.(url.href) ?? 0;
+      if (delay > 0) await sleep(delay);
       const file =
         (instrumented === undefined
           ? undefined
@@ -554,10 +717,28 @@ export async function replaySession(
       }
       const ext = path.extname(file).toLowerCase();
       let body: Buffer = fs.readFileSync(file);
+      if (ext === ".js" || ext === ".mjs") {
+        // The dynamic import() seam (§6, §8.1), at every level: the one the
+        // deploy step put into the bundle when asked (`--import-seam`), which
+        // the archived bundle leaves out, and otherwise the replay
+        // runtime's, which refuses an import the log does not order rather
+        // than let the module run wherever the replay browser's network
+        // decides.
+        let r = rewritten.get(file);
+        if (r === undefined) {
+          r = withImportSeam(body, file, rewriteDynamicImports);
+          rewritten.set(file, r);
+        }
+        body = r;
+      }
       // The bundle as archived carries no bootstrap; one left in a page is
       // the record shim's, which replay installs itself (§8.1, §10).
       if (ext === ".html" || ext === ".htm") {
-        body = stripBoundaryShim(body);
+        body = withImportSeam(
+          stripBoundaryShim(body),
+          file,
+          rewriteHtmlImports,
+        );
         if (firstDocument) {
           const html = body.toString("utf-8");
           parserScripts = new Set(parserScriptUrls(html, url.href));
@@ -583,7 +764,7 @@ export async function replaySession(
         },
         body,
       });
-    });
+    }
 
     const config: ReplayConfig = {
       log: Buffer.from(loaded.stream).toString("base64"),
@@ -597,17 +778,19 @@ export async function replaySession(
         `globalThis.__codetracer_args=${JSON.stringify(report.traceArgs)};`;
     }
     // Init scripts run in every document of the context, the page's first
-    // about:blank included; only the recorded origin's document is replayed.
+    // about:blank and its frames' documents included; only the recorded
+    // origin's top-level document is replayed (a frame's document is the
+    // build's, run as it comes: it is not the session's, §7.4).
     const scripts = [preamble, fs.readFileSync(RUNTIME_BUNDLE_PATH, "utf-8")];
     if (header.protocol_level === 0) scripts.push(boundaryShimReplayBundle());
     if (stub !== "") scripts.push(stub);
     for (const content of scripts) {
       await context.addInitScript({
-        content: `if (globalThis.location && location.origin === ${JSON.stringify(origin)}) {\n${content}\n}`,
+        content: `if (globalThis.location && globalThis.top === globalThis && location.origin === ${JSON.stringify(origin)}) {\n${content}\n}`,
       });
     }
 
-    const page = await context.newPage();
+    page = await context.newPage();
     await page.goto(env.url, { waitUntil: "commit", timeout: timeoutMs });
     const status = await waitForReplay(page, timeoutMs);
     report.checkpoints = status.checkpoints;

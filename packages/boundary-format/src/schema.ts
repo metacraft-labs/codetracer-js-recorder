@@ -307,6 +307,8 @@ export const RECORD_SCHEMA = [
       ["seq", "u64"],
       ["kind", "u8"],
       ["src", "str"],
+      ["target", "str"],
+      ["event", "str"],
     ],
   },
   {
@@ -378,10 +380,10 @@ export const ENUM_VALUE_SETS: Readonly<
   // DOMContentLoaded and before load (LOADING_PHASE).
   Loading: { phase: [1, 3] },
   // 1 a script runs, 2 DOMContentLoaded, 3 load, 4 a script ran that wrote no
-  // record while it ran (DOC_TASK).
-  DocTask: { kind: [1, 4] },
+  // record while it ran, 5 an event of a resource element (DOC_TASK).
+  DocTask: { kind: [1, 5] },
   // What produced the value (PLATFORM_VALUE_SRC).
-  PlatformValue: { src: [1, 6] },
+  PlatformValue: { src: [1, 7] },
 };
 
 /**
@@ -425,6 +427,14 @@ export const DOC_TASK = {
    * first boundary read was in a microtask): written when it settled.
    */
   scriptSettled: 4,
+  /**
+   * An event of a resource element: an element's `load` or `error` (an
+   * image, a style sheet, a frame, an object, a track) or a media element's
+   * event. `target` names the element (§10.2), `event` the event's type,
+   * and `src` the resource replay holds until then; empty for a media
+   * element, whose events replay dispatches from the log.
+   */
+  resourceEvent: 5,
 } as const;
 
 /**
@@ -467,6 +477,12 @@ export const PLATFORM_VALUE_SRC = {
   performance: 5,
   /** `IdleDeadline.didTimeout`. */
   idleDeadline: 6,
+  /**
+   * A media element's state (`currentTime`, `duration`, `buffered`, …;
+   * query `<property>["<target>"]`) or the outcome of its `play()` (query
+   * `play["<target>"]`, the task id the platform task's).
+   */
+  media: 7,
 } as const;
 
 type Schema = (typeof RECORD_SCHEMA)[number];

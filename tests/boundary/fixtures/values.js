@@ -429,8 +429,10 @@
       window.postMessage("b", "*");
     },
 
-    // A window handler set by markup (values-markup.html) and a message the
-    // page posts to itself.
+    // Window handlers set by markup on <body> (values-markup.html): a
+    // message the page posts to itself, a history traversal's popstate, a
+    // fragment navigation's hashchange. Each sees its event as trusted, as
+    // on record.
     markup: function () {
       window.postMessage("m", "*");
       setTimeout(function () {
@@ -438,11 +440,32 @@
         done();
       }, 200);
     },
+    "markup-popstate": function () {
+      history.pushState({ n: 1 }, "", "?case=markup-popstate&step=2");
+      history.back();
+      setTimeout(function () {
+        slot("popstate", window.__popSaw);
+        done();
+      }, 200);
+    },
+    "markup-hashchange": function () {
+      location.hash = "moved";
+      setTimeout(function () {
+        slot("hashchange", window.__hashSaw);
+        done();
+      }, 200);
+    },
   };
 
   // Each case starts once the document has loaded, so what it reads is in
-  // tasks of the page's own rather than in the document's loading.
-  window.addEventListener("load", function () {
+  // tasks of the page's own; with `at=loading`, while the script runs, in
+  // the document's loading (the parser waits for this script at the end of
+  // the body), so its records interleave with the document's own tasks.
+  if (params.get("at") === "loading") {
     cases[params.get("case")]();
-  });
+  } else {
+    window.addEventListener("load", function () {
+      cases[params.get("case")]();
+    });
+  }
 })();

@@ -25,6 +25,7 @@ import * as path from "node:path";
 
 import { compareUtf8, sortedFilesUnder } from "@codetracer/instrumenter";
 
+import { stripImportSeam } from "./import-seam.js";
 import { withoutBootstraps } from "./placement.js";
 
 /** The manifest's file name. */
@@ -95,9 +96,34 @@ export function stripBoundaryShim(html: Buffer): Buffer {
   return stripped === text ? html : Buffer.from(stripped, "latin1");
 }
 
-/** The bytes a file is hashed by: HTML without the bootstrap, others as they are. */
+/**
+ * The bytes without the dynamic `import()` seam the deploy step inserts
+ * (`import-seam.ts`): its exact inverse, applied to a byte-preserving
+ * latin1 view (the inserted strings are ASCII).
+ */
+export function stripImportSeamBytes(content: Buffer): Buffer {
+  const text = content.toString("latin1");
+  const stripped = stripImportSeam(text);
+  return stripped === text ? content : Buffer.from(stripped, "latin1");
+}
+
+/** Whether the deploy step rewrites the dynamic imports of the file. */
+function isScript(relativePath: string): boolean {
+  const ext = path.posix.extname(relativePath).toLowerCase();
+  return ext === ".js" || ext === ".mjs";
+}
+
+/**
+ * The bytes a file is hashed by: HTML without the bootstrap, and HTML and
+ * scripts without the dynamic `import()` seam (§8.1); others as they are.
+ * So the deployed bundle has one build hash, before and after the deploy
+ * step installs the recorder.
+ */
 export function hashedBytes(relativePath: string, content: Buffer): Buffer {
-  return isHtml(relativePath) ? stripBoundaryShim(content) : content;
+  if (isHtml(relativePath)) {
+    return stripImportSeamBytes(stripBoundaryShim(content));
+  }
+  return isScript(relativePath) ? stripImportSeamBytes(content) : content;
 }
 
 function sha256Hex(bytes: Buffer): string {

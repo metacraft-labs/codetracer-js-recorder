@@ -20,7 +20,7 @@
  */
 
 import { replaceAccessor, replaceValue } from "../context.js";
-import { INPUT_EVENT_TYPES } from "../seams-dom.js";
+import { INPUT_EVENT_TYPES, dispatchedFromScript } from "../seams-dom.js";
 import { patchStorageEvents } from "../seams-storage.js";
 import { resolveTarget, targetOf } from "../targets.js";
 import type { RecordOf } from "@codetracer/boundary-format";
@@ -490,6 +490,26 @@ export function replayInput(ctx: ReplayContext): ReplayInjector {
           ev.stopImmediatePropagation();
           if (ev.cancelable) ev.preventDefault();
         }
+      },
+      { capture: true },
+    );
+  }
+  // The replay browser's own navigation events: a traversal's `popstate`,
+  // a link's (an injected click activates it, where the visitor's click
+  // did) and every `hashchange` are tasks the log has (`Task{kind 12}`),
+  // which `replayNavigation` dispatches in their place, so the platform's are
+  // held back; a fragment navigation's `popstate`, fired synchronously by the
+  // page's own replayed code (seams-dom.ts, `listenForPageEvents`), is the
+  // one the visitor's page saw, and reaches it.
+  for (const type of ["popstate", "hashchange"]) {
+    ctx.orig.addEventListener.call(
+      w,
+      type,
+      (ev: Event) => {
+        if (!ev.isTrusted) return;
+        const fromPage = dispatchedFromScript() && injecting === undefined;
+        if (type === "popstate" && fromPage) return;
+        ev.stopImmediatePropagation();
       },
       { capture: true },
     );

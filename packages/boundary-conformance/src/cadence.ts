@@ -93,7 +93,12 @@ export function checkpointCadence(
     }
     if (!("seq" in r)) return;
     if (r.record === "Loading") parsing = r.phase === 1;
-    if (r.record === "DocTask" && r.kind !== 1) parsing = false;
+    // DOMContentLoaded and load end the parsing; every other document task
+    // (a script's execution, a resource element's event) follows the
+    // `Loading` that says where the document was.
+    if (r.record === "DocTask" && (r.kind === 2 || r.kind === 3)) {
+      parsing = false;
+    }
     if (r.record === "Checkpoint") {
       checkpoints += 1;
       if (r.ordinal !== ordinal) {

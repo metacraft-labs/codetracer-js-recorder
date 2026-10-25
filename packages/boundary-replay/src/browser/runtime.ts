@@ -29,9 +29,11 @@
  *   the replayed document is at that position, and, while the document
  *   parses, only when the parser is held there (by a parser gate,
  *   `../gates.ts`, or by a script the runner holds). The document's own
- *   tasks (an external script's execution, `DOMContentLoaded`, `load`)
- *   are `DocTask` records: the runner holds them until the scheduler lets
- *   them go, at that point of the log.
+ *   tasks (an external script's execution, `DOMContentLoaded`, `load`, a
+ *   resource element's event) are `DocTask` records: the runner holds them
+ *   until the scheduler lets them go, at that point of the log, and the
+ *   platform's resource events that come at any other point are held back
+ *   and dispatched from the log in their turn.
  * - **Divergence** (§7.2). The first divergence is latched: it is thrown
  *   into whatever made the call, every later call throws it again, and the
  *   scheduler stops. The runner then writes no trace.
@@ -47,12 +49,22 @@ import {
   seqOf,
   toHex,
 } from "@codetracer/boundary-format";
+import {
+  IMPORT_SEAM_CAPABILITY,
+  IMPORT_SEAM_GLOBAL,
+} from "@codetracer/boundary-shim/dist/browser/config.js";
 import { domV1Hash } from "@codetracer/boundary-shim/dist/browser/dom-v1.js";
 import {
   DocumentProgress,
   describePosition,
+  listenForResourceEvents,
   samePosition,
 } from "@codetracer/boundary-shim/dist/browser/document-progress.js";
+import { resourceEventOf } from "@codetracer/boundary-shim/dist/browser/resource-events.js";
+import {
+  resolveTarget,
+  targetOf,
+} from "@codetracer/boundary-shim/dist/browser/targets.js";
 import {
   type ShimOriginals,
   captureOriginals,
@@ -217,6 +229,27 @@ export function installReplayRuntime(
     number,
     (task: TaskRecord) => void | PromiseLike<void>
   >();
+  /**
+   * Tasks whose platform work the page's replay does not start by itself
+   * (a dynamic `import()`, whose module is fetched and evaluated only when
+   * the scheduler says so, §6): the function that starts it, and whether
+   * it was started.
+   */
+  const starters = new Map<bigint, () => PromiseLike<void>>();
+  const started = new Set<bigint>();
+  /**
+   * The values a client delivers when they come due at a quiescent point
+   * (a `MutationObserver`'s records, by the observer's task id, §6).
+   */
+  const valueDue = new Map<bigint, () => void>();
+  /**
+   * The stand-in dispatcher of the client (the generic shim's, whose
+   * listeners see the event as trusted, §10.5); a plain `dispatchEvent`
+   * otherwise.
+   */
+  let standIn: (target: EventTarget, ev: Event) => void = (target, ev) => {
+    w.EventTarget.prototype.dispatchEvent.call(target, ev);
+  };
   let pendingEffects: RecordOf<"DomEffect">[] = [];
 
   const status: ReplayStatus = {
@@ -283,6 +316,39 @@ export function installReplayRuntime(
       );
     }
   };
+
+  // ── The dynamic import() seam, by default (§6 "Dynamic `import()`") ──
+  //
+  // The runner serves every script and page with each dynamic `import()`
+  // rewritten into a call of `__ctBoundaryImport` (`rewriteDynamicImports`),
+  // whether or not the deployed bundle carried the seam. Only a session
+  // whose recorder declared the seam (`Header.capabilities` holding
+  // `import-seam`, the generic shim installed with `--import-seam`) has its
+  // imports in the log, and the shim's replay mode then puts its own seam
+  // in place of this one. For any other session the log does not say where
+  // the module evaluated or when the import settled, so the first call ends
+  // the replay as non-replayable from here (JBR-AREQ4), never a replay that
+  // runs the module wherever the replay browser's network decides.
+  Object.defineProperty(w, IMPORT_SEAM_GLOBAL, {
+    value: function refuseDynamicImport(
+      _load: unknown,
+      specifier: unknown,
+    ): never {
+      // The specifier is named only when it is a string: converting
+      // anything else would run page code.
+      const named =
+        typeof specifier === "string" ? ` of ${JSON.stringify(specifier)}` : "";
+      return fail(
+        "NonReplayable",
+        `the session is non-replayable from here: the page makes a dynamic import()${named} ("dynamic-import"), which the log does not order, since the session's recorder did not declare the ${JSON.stringify(IMPORT_SEAM_CAPABILITY)} capability (the generic shim records dynamic imports only when installed with boundary-shim --import-seam)`,
+      );
+    },
+    enumerable: false,
+    // The generic shim's replay mode replaces it for a session that has
+    // the seam.
+    configurable: true,
+    writable: false,
+  });
 
   const guard = () => {
     if (failed !== undefined) throw new Divergence(failed);
@@ -413,6 +479,7 @@ export function installReplayRuntime(
   let awaiting:
     | { kind: "script"; src: string; takeAtSettle: boolean }
     | { kind: "domContentLoaded" | "load" }
+    | { kind: "resource"; target: string; event: string }
     | undefined;
 
   /** Wake the scheduler: the document moved on. */
@@ -495,6 +562,76 @@ export function installReplayRuntime(
     },
   });
   orig.addEventListener.call(doc, "readystatechange", () => kick());
+
+  // ── Resource elements' events (§6, `DocTask` kind 5) ─────────────────
+  //
+  // The browser dispatches an image's, a style sheet's, a frame's (…) `load`
+  // and `error`, and a media element's events, when the network or the
+  // media pipeline delivers something. The runner holds the requests the
+  // log has such an event for (`gates.ts`, `resource:<url>`); the
+  // scheduler lets one go when its `DocTask` comes due and lets the
+  // platform's event through then. Any other such event of the platform's is
+  // held back before a listener of the page sees it: one that arrived early
+  // (a resource with no request of its own: cached, a `data:` URL) is
+  // dispatched as a stand-in when its `DocTask` comes due, and a media
+  // element's always is, since the media pipeline cannot be held.
+
+  /** Platform events of resource elements held back until their `DocTask`. */
+  const earlyEvents: { target: string; event: string }[] = [];
+  /**
+   * Elements the page listens at for a resource event that are not in the
+   * document (`new Image()`), which a target string cannot reach.
+   */
+  const watchedElements: Element[] = [];
+  const seenResourceEvents = new WeakSet<Event>();
+  listenForResourceEvents(
+    w,
+    orig.addEventListener,
+    (ev) => {
+      if (seenResourceEvents.has(ev)) return;
+      seenResourceEvents.add(ev);
+      progress.noteElementEvent(ev);
+      const r = resourceEventOf(w, ev);
+      if (r === undefined) return;
+      if (
+        !r.media &&
+        awaiting?.kind === "resource" &&
+        awaiting.target === r.target
+      ) {
+        if (awaiting.event === r.event) {
+          // The event the log has next: the page's listeners see the
+          // platform's own.
+          awaiting = undefined;
+          kick();
+          return;
+        }
+        try {
+          fail(
+            "TaskOrderMismatch",
+            `the replayed element ${r.target} dispatched ${r.event} where the log has it dispatch ${awaiting.event}`,
+          );
+        } catch {
+          // Latched; the scheduler reports it.
+        }
+      }
+      ev.stopImmediatePropagation();
+      if (!r.media) earlyEvents.push({ target: r.target, event: r.event });
+      kick();
+    },
+    (el) => {
+      watchedElements.push(el);
+    },
+  );
+
+  /** The element a resource event's target names (§10.2). */
+  const resourceElement = (target: string): Element | undefined => {
+    const r = resolveTarget(target, doc);
+    if (r instanceof w.Element) return r;
+    const detached = watchedElements.filter(
+      (e) => !e.isConnected && targetOf(e) === target,
+    );
+    return detached.length === 1 ? detached[0] : undefined;
+  };
   // A gate the page's Content-Security-Policy blocks (an inline gate under
   // a `script-src` without 'unsafe-inline', or a written gate's URL the
   // policy does not allow) neither runs nor holds anything: the replay
@@ -579,41 +716,6 @@ export function installReplayRuntime(
     if (left > 0) heldScripts.set(src, left - 1);
     inFlight.set(src, (inFlight.get(src) ?? 0) + 1);
     letGo(`script:${src}`);
-  };
-
-  /**
-   * The external script whose `DocTask` the recorder wrote when it settled,
-   * after the reads at the cursor: those reads are that script's (a module,
-   * whose running the recorder cannot see, or a script whose first
-   * boundary read was in a microtask). `undefined` when the reads up to the
-   * next record that is not a read are not followed by one.
-   */
-  const scriptAfterReads = (): string | undefined => {
-    for (let i = skipMarks(at); i < records.length; i = skipMarks(i + 1)) {
-      const r = records[i];
-      switch (r.record) {
-        case "Loading": {
-          const t = records[skipMarks(i + 1)];
-          return t?.record === "DocTask" && t.kind === 4 ? t.src : undefined;
-        }
-        case "DocTask":
-          return r.kind === 4 ? r.src : undefined;
-        case "Task":
-        case "Input":
-        case "DomEffect":
-        case "Checkpoint":
-        case "Navigation":
-        case "End":
-        case "Gap":
-        case "Refusal":
-        case "Error":
-        case "Scrubbed":
-          return undefined;
-        default:
-          break;
-      }
-    }
-    return undefined;
   };
 
   // ── Level 1: whether `inject` dispatches DOM events ───────────────────
@@ -830,6 +932,22 @@ export function installReplayRuntime(
       case "Task":
         runTask(r);
         return "ran";
+      case "PlatformValue": {
+        // A MutationObserver's records whose microtask the replay's own
+        // loading did not reach where the visitor's did (the elements the
+        // parser inserted are delivered at whatever microtask checkpoint
+        // comes next): delivered now, at the position the log has.
+        const deliver =
+          r.src === 3 && r.query === "callback"
+            ? valueDue.get(r.task_id)
+            : undefined;
+        if (deliver !== undefined) {
+          status.tasks++;
+          runPage(deliver);
+          return "ran";
+        }
+        break;
+      }
       default:
         break;
     }
@@ -871,9 +989,88 @@ export function installReplayRuntime(
     return moveDocumentOn(r);
   };
 
+  /** Start task `id`'s platform work now; `false` if it has none to start. */
+  const startTask = (id: bigint): boolean => {
+    const start = starters.get(id);
+    if (start === undefined || started.has(id)) return false;
+    started.add(id);
+    status.tasks++;
+    runPage(() => start());
+    return true;
+  };
+
+  /**
+   * The page work the scheduler holds back that the records at the cursor
+   * belong to (§6): the reads (or the position, `atLoading`) of the script
+   * whose `DocTask` 4 follows them, or of the task whose `Task` follows them
+   * and whose platform work the scheduler starts (a dynamic `import()`, whose
+   * module evaluates, making its reads and changing the document, before the
+   * import settles).
+   */
+  type HeldWork = { script: string } | { task: bigint } | undefined;
+  const workAfter = (from: number): HeldWork => {
+    const after = (r: BoundaryRecord | undefined): HeldWork => {
+      if (r?.record === "DocTask") {
+        return r.kind === 4 ? { script: r.src } : undefined;
+      }
+      if (r?.record === "Task") {
+        return starters.has(r.task_id) && !started.has(r.task_id)
+          ? { task: r.task_id }
+          : undefined;
+      }
+      return undefined;
+    };
+    for (let i = skipMarks(from); i < records.length; i = skipMarks(i + 1)) {
+      const r = records[i];
+      switch (r.record) {
+        case "Loading":
+          return after(records[skipMarks(i + 1)]);
+        case "DocTask":
+        case "Task":
+          return after(r);
+        case "Input":
+        case "DomEffect":
+        case "Checkpoint":
+        case "Navigation":
+        case "End":
+        case "Gap":
+        case "Refusal":
+        case "Error":
+        case "Scrubbed":
+          return undefined;
+        default:
+          break;
+      }
+    }
+    return undefined;
+  };
+
   /** The `DocTask` at the cursor: let the document run that task. */
   const letDocTaskGo = (r: RecordOf<"DocTask">): Step => {
     at++;
+    if (r.kind === 5) {
+      const early = earlyEvents.findIndex(
+        (e) => e.target === r.target && e.event === r.event,
+      );
+      if (r.src === "" || early >= 0) {
+        // A media element's event, or one the platform dispatched early:
+        // a stand-in, now.
+        if (early >= 0) earlyEvents.splice(early, 1);
+        const el = resourceElement(r.target);
+        if (el === undefined) {
+          fail(
+            "TaskOrderMismatch",
+            `the log has ${r.target} dispatch ${r.event} here, but the replayed page has no such element`,
+          );
+        }
+        status.tasks++;
+        runPage(() => standIn(el!, new w.Event(r.event)));
+        return "ran";
+      }
+      awaiting = { kind: "resource", target: r.target, event: r.event };
+      letGo(`resource:${r.src}`);
+      return "wait";
+    }
     if (r.kind === 1 || r.kind === 4) {
       awaiting = { kind: "script", src: r.src, takeAtSettle: false };
       openScript(r.src);
@@ -912,6 +1109,13 @@ export function installReplayRuntime(
    * wait; when nothing the scheduler holds back can make it, diverge.
    */
   const moveDocumentOn = (target: RecordOf<"Loading"> | undefined): Step => {
+    // The reads at the cursor (or the position the `Loading` there names)
+    // are those of held page work: a task whose platform work the scheduler
+    // starts runs without the parser, so it goes first.
+    const work = workAfter(target === undefined ? at : at + 1);
+    if (work !== undefined && "task" in work && startTask(work.task)) {
+      return "ran";
+    }
     if (gateHeld !== undefined) {
       openGate();
       return "wait";
@@ -919,15 +1123,19 @@ export function installReplayRuntime(
     // The parser moves on by itself: what it runs next (an inline script)
     // may be what makes the read.
     if (progress.state === "loading" && !parserHeld()) return "wait";
-    if (target === undefined) {
-      // Everything else is held: the reads are those of the script whose
-      // `DocTask` (kind 4) follows them, if one does.
-      const src = scriptAfterReads();
-      if (src !== undefined && (heldScripts.get(src) ?? 0) > 0) {
-        awaiting = { kind: "script", src, takeAtSettle: true };
-        openScript(src);
-        return "wait";
-      }
+    // Everything else is held: the reads, or the position, are those of
+    // the script whose `DocTask` (kind 4) follows them, if one does. Its
+    // `Loading` was measured when it settled, so it counts what the
+    // script inserted: let it go, and take the `Loading` with its `DocTask`
+    // when it settles (`takeDocTask` checks the position then).
+    if (
+      work !== undefined &&
+      "script" in work &&
+      (heldScripts.get(work.script) ?? 0) > 0
+    ) {
+      awaiting = { kind: "script", src: work.script, takeAtSettle: true };
+      openScript(work.script);
+      return "wait";
     }
     const stuck = (why: string): never =>
       target === undefined
@@ -1135,7 +1343,10 @@ export function installReplayRuntime(
     }
   };
 
-  const replay: CtReplay & { status(): ReplayStatus } = {
+  const replay: CtReplay & {
+    status(): ReplayStatus;
+    pendingScriptElement(url: string): boolean;
+  } = {
     protocol: 1,
     level,
     header,
@@ -1156,6 +1367,50 @@ export function installReplayRuntime(
     },
     onUnregisteredTask(kind, run) {
       unregistered.set(kind, run);
+    },
+    onTaskStart(taskId, start) {
+      starters.set(BigInt(taskId), start);
+    },
+    onValueDue(taskId, run) {
+      valueDue.set(BigInt(taskId), run);
+    },
+    takePosition() {
+      guard();
+      const r = current();
+      if (r?.record !== "Loading") return true;
+      const q = progress.position();
+      if (q === undefined || !samePosition(q, r)) return false;
+      at++;
+      return true;
+    },
+    useStandIns(dispatch) {
+      standIn = dispatch;
+    },
+    takeDueTask(taskId) {
+      if (failed !== undefined) return false;
+      const i = skipMarks(at);
+      const loading = records[i];
+      if (loading?.record !== "Loading") return false;
+      const q = progress.position();
+      if (q === undefined || !samePosition(q, loading)) return false;
+      const j = skipMarks(i + 1);
+      const task = records[j];
+      const id = BigInt(taskId);
+      if (task?.record !== "Task" || task.task_id !== id) return false;
+      if (registered.get(id) !== task.kind) return false;
+      at = j + 1;
+      status.tasks++;
+      return true;
+    },
+    /**
+     * Whether a script element of the document that has not settled was
+     * fetched from `url` (no fragment): the runner asks it of a script
+     * request the log has no execution of, to tell a script the page
+     * inserted (which never ran during the session, so it is held) from a
+     * module's dependency or a dynamic import's module (answered).
+     */
+    pendingScriptElement(url) {
+      return progress.pendingScripts().some((s) => progress.srcOf(s) === url);
     },
     checkpointDue: () => current()?.record === "Checkpoint",
     gate,

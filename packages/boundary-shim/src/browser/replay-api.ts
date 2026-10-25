@@ -158,6 +158,47 @@ export interface CtReplay {
     kind: number,
     run: (task: TaskRecord) => void | PromiseLike<void>,
   ): void;
+  /**
+   * Start the platform work of task `taskId` with `start` only when the
+   * scheduler says so (§6): when the records at the cursor are the reads,
+   * or the document position, that precede the task's `Task` (a dynamic
+   * `import()`, whose module evaluates before it settles), or when its
+   * `Task` comes due. `start`'s promise settles when the work has; the
+   * scheduler waits for it.
+   */
+  onTaskStart(taskId: bigint, start: () => PromiseLike<void>): void;
+  /**
+   * Run `run` when a value of task `taskId` comes due at a quiescent point
+   * with no `Task` before it: a `MutationObserver`'s records
+   * (`PlatformValue` src 3, query `callback`), which the platform hands
+   * the page in a microtask of its own (§6). `run` makes the read.
+   */
+  onValueDue(taskId: bigint, run: () => void): void;
+  /**
+   * For page code the platform runs in a microtask of its own (a
+   * `MutationObserver` callback): `true` when the record at the cursor is
+   * not a `Loading`, or is the `Loading` of the replayed document's
+   * position now, which is then consumed; `false` when the document is
+   * elsewhere, and the value is left for the scheduler.
+   */
+  takePosition(): boolean;
+  /**
+   * The dispatcher of the events replay dispatches in the platform's place
+   * that the runner dispatches itself (a resource element's events, §6):
+   * the generic shim's makes its listeners see them as trusted (§10.5).
+   */
+  useStandIns(dispatch: (target: EventTarget, ev: Event) => void): void;
+  /**
+   * The platform settled task `taskId`'s work (a platform task, §6) while
+   * the document loads: when the log's next records are the `Loading` of
+   * the document's position now and that task's `Task`, they are consumed
+   * and `true` returned, and the client lets the page's continuation run
+   * now, as on record, where it ran inside the task of the script that made
+   * the call (between the script's run and its `load`, which no quiescent
+   * point of the scheduler reaches). `false` leaves the task to the
+   * scheduler.
+   */
+  takeDueTask(taskId: bigint): boolean;
   /** Whether the record at the cursor is a `Checkpoint`. */
   checkpointDue(): boolean;
   /**

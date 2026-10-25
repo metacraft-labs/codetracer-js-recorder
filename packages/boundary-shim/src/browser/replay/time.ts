@@ -294,10 +294,20 @@ function withoutGates(entries: unknown[]): unknown[] {
  * known; its own callback only collects. The page's runs when the scheduler
  * releases its `Task`, with the logged entries of an
  * `IntersectionObserver`, a `ResizeObserver` or a `PerformanceObserver`
- * rebuilt as objects of their interfaces, and with the replay browser's own
- * records of a `MutationObserver` once they are shown to equal the logged
- * ones (the page's DOM changes are replayed, so are its records; a
- * difference is an `ArgumentMismatch`). `takeRecords()` likewise.
+ * rebuilt as objects of their interfaces. `takeRecords()` likewise.
+ *
+ * A `MutationObserver`'s callback is a microtask of the platform's (DOM,
+ * "notify mutation observers"), with no `Task`: the page's DOM changes are
+ * replayed, so the platform queues the same microtask at the same point, and
+ * the page's callback runs in it, with the replay browser's own records once
+ * they are shown to equal the logged ones (an `ArgumentMismatch`
+ * otherwise), when the log's next value is that callback's, at the document
+ * position before it (`takePosition`). The records of the elements the
+ * parser inserts are delivered at whatever microtask checkpoint comes next,
+ * which the replay's gates make come sooner: those are collected, and handed
+ * to the page when the log's value comes due at a quiescent point
+ * (`onValueDue`), at its position. The runner's gates are left out of
+ * every record.
  */
 function replayObservers(ctx: ReplayContext): void {
   const { w, replay, orig } = ctx;
@@ -313,6 +323,11 @@ function replayObservers(ctx: ReplayContext): void {
       ...a: unknown[]
     ) => unknown;
     const tasks = new WeakMap<object, bigint>();
+    /**
+     * A MutationObserver's records the platform delivered that the page
+     * has not been handed yet.
+     */
+    const pendingOf = new WeakMap<object, unknown[]>();
     // The elements each observer was asked to observe: what a logged
     // entry's target names.
     const observed = new WeakMap<object, Set<Element>>();
@@ -353,13 +368,37 @@ function replayObservers(ctx: ReplayContext): void {
       }
       const id = ctx.nextTaskId();
       const collected: unknown[] = [];
+      /** A MutationObserver's records handed to the page, compared first. */
+      const deliver = () => {
+        const records = realRecords(o, collected.splice(0));
+        logged(id, "callback", observedJson(name, records));
+        callback.call(o, records, o);
+      };
+      /** Whether the log's next value is this observer's callback, now. */
+      const dueNow = (): boolean => {
+        try {
+          const v = replay.peek();
+          const next = v.kind === "Loading" ? replay.peekAt(1) : v;
+          const r = next.record;
+          return (
+            r?.record === "PlatformValue" &&
+            r.src === src &&
+            r.query === "callback" &&
+            r.task_id === id &&
+            replay.takePosition()
+          );
+        } catch {
+          // The replay has diverged; it is reported already.
+          return false;
+        }
+      };
       const o = Reflect.construct(
         Orig,
         [
           (entries: unknown) => {
-            if (name === "MutationObserver") {
-              collected.push(...(entries as unknown[]));
-            }
+            if (name !== "MutationObserver") return;
+            collected.push(...withoutGates(entries as unknown[]));
+            if (collected.length > 0 && dueNow()) deliver();
           },
           ...rest,
         ],
@@ -368,13 +407,12 @@ function replayObservers(ctx: ReplayContext): void {
       tasks.set(o, id);
       observed.set(o, new Set());
       replay.registerTask(id, TaskKind.observer, 0);
+      if (name === "MutationObserver") {
+        pendingOf.set(o, collected);
+        replay.onValueDue(id, deliver);
+        return o;
+      }
       replay.onTask(id, () => {
-        if (name === "MutationObserver") {
-          const records = realRecords(o, collected.splice(0));
-          logged(id, "callback", observedJson(name, records));
-          callback.call(o, records, o);
-          return;
-        }
         const v = JSON.parse(logged(id, "callback").value) as unknown;
         if (name === "PerformanceObserver") {
           const pv = v as { entries?: unknown; droppedEntriesCount?: number };
@@ -406,12 +444,23 @@ function replayObservers(ctx: ReplayContext): void {
         },
       );
     }
+    const origDisconnect = proto.disconnect as
+      | ((this: object) => unknown)
+      | undefined;
+    if (name === "MutationObserver" && typeof origDisconnect === "function") {
+      // The platform drops the records it has not delivered; so are those it
+      // delivered early to the replay that the page was not handed yet.
+      replaceValue(proto, "disconnect", function disconnect(this: object) {
+        pendingOf.get(this)?.splice(0);
+        return origDisconnect.call(this);
+      });
+    }
     if (!takeRecords || typeof origTake !== "function") continue;
     replaceValue(proto, "takeRecords", function takeRecords(this: object) {
       const id = tasks.get(this);
       if (id === undefined) return origTake.call(this);
       if (name === "MutationObserver") {
-        const records = realRecords(this, []);
+        const records = realRecords(this, pendingOf.get(this)?.splice(0) ?? []);
         logged(id, "takeRecords", observedJson(name, records));
         return records;
       }

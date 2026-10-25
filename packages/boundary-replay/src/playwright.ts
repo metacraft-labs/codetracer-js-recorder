@@ -60,6 +60,12 @@ export interface Request {
   isNavigationRequest(): boolean;
   /** The request's headers, lower-case names. */
   headers(): Record<string, string>;
+  /** The frame that made the request (for a navigation, the one navigated). */
+  frame(): Frame;
+}
+export interface Frame {
+  /** `null` for the page's main frame. */
+  parentFrame(): Frame | null;
 }
 export interface Page {
   goto(

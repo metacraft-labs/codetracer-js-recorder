@@ -72,7 +72,19 @@ This is a monorepo managed with npm workspaces:
   the replay runner's gates use the same scanner, so record and replay agree
   on positions (`tests/boundary/bootstrap-placement.test.ts`). It follows an
   encoding declaration that begins the head, which must stay in the first
-  1024 bytes for the encoding prescan. Its browser tests
+  1024 bytes for the encoding prescan. Only when asked (`--import-seam`, the
+  vite plugin's `importSeam`; never by default, since it changes the page's
+  own code) the same deploy step rewrites every dynamic `import()` of the
+  site's scripts (and of its pages' inline scripts) into a call of the shim's
+  seam, `__ctBoundaryImport` (`src/import-seam.ts`, found with SWC, never as
+  text), and the shim declares `import-seam` in `Header.capabilities`;
+  `bundle-manifest` hashes files with the seam removed, so the build hash
+  does not change. The replay runner applies the same rewrite to everything
+  it serves, at both levels, and in a session that does not declare the seam
+  the replay runtime's own `__ctBoundaryImport` ends the replay
+  `NonReplayable` at the page's first dynamic import
+  (`tests/boundary/import-seam.test.ts`, `tests/boundary/replay-resources.test.ts`).
+  Its browser tests
   (`tests/boundary/record-shim.test.ts`) run real headless Chromium, which the
   dev shell provides (`PLAYWRIGHT_CORE_PATH`, `PLAYWRIGHT_BROWSERS_PATH`).
 * `packages/runtime-browser/src/batch-transport.ts` — `HttpBatchTransport`,
@@ -130,7 +142,16 @@ This is a monorepo managed with npm workspaces:
   (`Loading` and `DocTask` records, written by
   `packages/boundary-shim/src/browser/document-progress.ts` on both sides)
   by the runner's gates (`src/gates.ts`), pinned by `tests/boundary/gates.test.ts`
-  and the slow-loading session of `tests/boundary/replay.test.ts`. The
+  and the slow-loading session of `tests/boundary/replay.test.ts`. So are the
+  events of resource elements (an image's, a style sheet's, a frame's `load`
+  and `error`, a media element's events; `DocTask` kind 5, decided by
+  `packages/boundary-shim/src/browser/resource-events.ts` on both sides):
+  the runner holds the resource's request until its `DocTask`, and the
+  platform's other resource events are held back and dispatched from the log;
+  a frame's navigation is answered from the build; a dynamic `import()` (in a
+  session that declares the seam) starts only when its module's reads come due. Pinned by
+  `tests/boundary/replay-resources.test.ts`, whose runner test seam
+  `responseDelayMs` replays a resource slower than it was recorded. The
   generic shim's replay mode is `packages/boundary-shim/src/browser/replay/`
   (its own bundle, `dist/boundary-shim-replay.iife.js`, so recorded pages never
   carry it), a client of `__ctReplay`; so is the reference framework's replay

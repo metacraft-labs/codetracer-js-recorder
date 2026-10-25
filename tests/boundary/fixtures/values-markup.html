@@ -2,9 +2,13 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>a window handler set by markup</title>
+    <title>window handlers set by markup</title>
   </head>
-  <body onmessage="window.__markupSaw = event.isTrusted">
+  <body
+    onmessage="window.__markupSaw = event.isTrusted"
+    onpopstate="window.__pops = (window.__pops || 0) + 1; window.__popSaw = event.isTrusted + ':' + JSON.stringify(event.state) + ':' + window.__pops"
+    onhashchange="window.__hashSaw = event.isTrusted + ':' + location.hash"
+  >
     <ul id="out"></ul>
     <script src="values.js"></script>
   </body>

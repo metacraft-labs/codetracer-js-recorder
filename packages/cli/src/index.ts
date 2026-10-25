@@ -43,7 +43,7 @@ if (!command || command === "--help" || command === "-h") {
   codetracer-js-recorder record <file> [-- app-args...]
   codetracer-js-recorder read-spans <trace-dir|container.ct> [--all]
   codetracer-js-recorder boundary-shim <html-file|dir>... [--build-hash <hex>]
-                         [--ingest <url> [--consent-required]]
+                         [--ingest <url> [--consent-required]] [--import-seam]
   codetracer-js-recorder bundle-manifest <dir> [--out <file>]
 
 Commands:
@@ -82,6 +82,11 @@ Boundary-shim options:
                           <url>/batches); needs --build-hash
   --consent-required      Request nothing from the ingest until the page's
                           consent callback answers yes
+  --import-seam           Also rewrite each dynamic import() of the pages'
+                          inline scripts and of the .js/.mjs files under a
+                          directory into a call of the shim's seam, so the
+                          log orders it (without it, a session is not
+                          replayable past its first dynamic import)
 
 Bundle-manifest options:
   --out <file>            Where to write the manifest (default:

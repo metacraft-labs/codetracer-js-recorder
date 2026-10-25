@@ -415,8 +415,11 @@ export function observedJson(name: string, list: unknown, third?: unknown) {
 
 /**
  * Observer callbacks are tasks (`TaskReg{kind 10}` at construction, a
- * `Task` per callback, §10.1), and what each hands the page is a
- * `PlatformValue` after its `Task`: the entries of an
+ * `Task` per callback, §10.1), but for a `MutationObserver`'s, which are
+ * microtasks of the platform's: its `TaskReg` names it, and each callback
+ * writes the document's position while it loads (`Recorder.microtask`)
+ * and no `Task`. What each hands the page is a `PlatformValue` (after its
+ * `Task`, if it has one): the entries of an
  * `IntersectionObserver`, a `ResizeObserver` or a `PerformanceObserver`
  * (their layout and timing values depend on the machine), the records of a
  * `MutationObserver` (which replay compares with its own). A
@@ -446,9 +449,15 @@ function patchObservers({ w, rec, orig }: SeamContext): void {
         return Reflect.construct(Orig, [callback, ...rest], new.target);
       }
       const taskId = rec.nextTaskId();
+      // A MutationObserver's callback is a microtask of the platform's,
+      // not a task (DOM, "notify mutation observers"): its value is
+      // written where it runs, after the document's position, and replay
+      // runs it as the platform's microtask too (§6, §10.1).
+      const microtask = name === "MutationObserver";
       const run = function (this: unknown, ...a: unknown[]): unknown {
         rec.guard(() => {
-          rec.task(taskId, TaskKind.observer);
+          if (microtask) rec.microtask();
+          else rec.task(taskId, TaskKind.observer);
           value(taskId, "callback", observedJson(name, a[0], a[2]));
         });
         return callback.apply(this, a);

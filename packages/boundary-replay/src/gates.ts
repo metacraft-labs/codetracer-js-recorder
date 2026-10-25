@@ -284,11 +284,19 @@ export interface DocumentPlan {
    * recorder started, or a module's dependency, which is not an element).
    */
   takeScript(url: string): boolean;
+  /**
+   * Whether a request for the resource at `url` (no fragment) is one to
+   * hold until its element's event comes due: as many requests of each are
+   * held as the log has `load` or `error` events reporting on it (`DocTask`
+   * 5 with that `src`; a media element's events have none, §6).
+   */
+  takeResource(url: string): boolean;
 }
 
 /** {@link DocumentPlan} of a decoded log. */
 export function documentPlan(records: readonly BoundaryRecord[]): DocumentPlan {
   const scripts = new Map<string, number>();
+  const resources = new Map<string, number>();
   let parser = false;
   let domContentLoaded = false;
   let load = false;
@@ -299,16 +307,26 @@ export function documentPlan(records: readonly BoundaryRecord[]): DocumentPlan {
       scripts.set(r.src, (scripts.get(r.src) ?? 0) + 1);
     } else if (r.kind === 2) domContentLoaded = true;
     else if (r.kind === 3) load = true;
+    else if (r.kind === 5 && r.src !== "") {
+      resources.set(r.src, (resources.get(r.src) ?? 0) + 1);
+    }
   }
+  const take = (counts: Map<string, number>, url: string): boolean => {
+    const left = counts.get(url) ?? 0;
+    if (left === 0) return false;
+    counts.set(url, left - 1);
+    return true;
+  };
   return {
-    holds: parser || domContentLoaded || load || scripts.size > 0,
+    holds:
+      parser ||
+      domContentLoaded ||
+      load ||
+      scripts.size > 0 ||
+      resources.size > 0,
     gates: { parser, domContentLoaded, load },
-    takeScript(url) {
-      const left = scripts.get(url) ?? 0;
-      if (left === 0) return false;
-      scripts.set(url, left - 1);
-      return true;
-    },
+    takeScript: (url) => take(scripts, url),
+    takeResource: (url) => take(resources, url),
   };
 }
 

@@ -50,6 +50,13 @@ export function replayPlatformTask<T>(
     let done: (() => void) | undefined;
     const arrived = (go: () => void) => {
       outcome = go;
+      if (!released && replay.takeDueTask(id)) {
+        // Settled where the log has it, while the document loads (§6).
+        replay.offTask(id);
+        released = true;
+        go();
+        return;
+      }
       if (released) {
         go();
         done?.();

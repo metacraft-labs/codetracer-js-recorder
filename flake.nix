@@ -265,7 +265,7 @@
             # npm dependencies (pre-fetched for offline install)
             npmDeps = pkgs.fetchNpmDeps {
               src = ./.;
-              hash = "sha256-BR2SCv97XwNg4l3ioJ+szv2l/r3p/XnKOfy8TxESB+E=";
+              hash = "sha256-Er4EqQsOqZbMpOggypcxwr4IELY+c1qs5FirszFnXXw=";
             };
 
             # Rust dependencies for the native addon (vendored from Cargo.lock)

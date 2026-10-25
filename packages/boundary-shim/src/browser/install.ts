@@ -18,7 +18,12 @@ import {
   type TransportStatus,
 } from "@codetracer/runtime-browser/dist/batch-transport.js";
 
-import { CONTROL_GLOBAL, RECORDER_NAME, type ShimConfig } from "./config.js";
+import {
+  CONTROL_GLOBAL,
+  IMPORT_SEAM_CAPABILITY,
+  RECORDER_NAME,
+  type ShimConfig,
+} from "./config.js";
 import type { SeamContext, ShimWindow } from "./context.js";
 import { domV1Hash } from "./dom-v1.js";
 import { recordDocumentProgress } from "./document-progress.js";
@@ -26,6 +31,8 @@ import { captureOriginals, type ShimOriginals } from "./originals.js";
 import { Recorder } from "./recorder.js";
 import { listenForPageEvents, patchDomSeams } from "./seams-dom.js";
 import { listenForStorageEvents, patchMessageSeams } from "./seams-message.js";
+import { patchImportSeam } from "./seams-import.js";
+import { patchMediaSeams } from "./seams-media.js";
 import { patchNetSeams } from "./seams-net.js";
 import { patchPerformance } from "./seams-perf.js";
 import { patchPlatformSeams } from "./seams-platform.js";
@@ -140,7 +147,11 @@ export function installBoundaryShim(
       build_hash: config.buildHash ?? "",
       session_id: sessionId,
       prev_session: config.prevSession ?? "",
-      capabilities: "[]",
+      // The dynamic import() seam is the one capability a level-0 session
+      // declares: the deploy step was asked to put it into the page (§8.1).
+      capabilities: JSON.stringify(
+        config.importSeam === true ? [IMPORT_SEAM_CAPABILITY] : [],
+      ),
     },
     readEnvironment(w, orig),
   );
@@ -171,6 +182,10 @@ export function installBoundaryShim(
     patchPerformance,
     patchMessageSeams,
     patchRefusals,
+    patchMediaSeams,
+    // Only where the deploy step rewrote the page's import() calls into
+    // calls of the seam (§8.1); the Header declares it above.
+    ...(config.importSeam === true ? [patchImportSeam] : []),
   ]) {
     rec.guard(() => patch(ctx));
   }
