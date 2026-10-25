@@ -42,7 +42,7 @@ import {
   REPLAY_CONFIG_GLOBAL,
   REPLAY_GLOBAL,
   type ReplayConfig,
-  bootstrapPosition,
+  bootstrapPlacement,
   rewriteDynamicImports,
   rewriteHtmlImports,
   stripBoundaryShim,
@@ -745,12 +745,20 @@ export async function replaySession(
           // At level 0 the recorded document had the record bootstrap at
           // the start of its head, which implied the head there when the
           // page has no `<head>` tag; a gate stands in for it, so the
-          // replayed document is built the same (`gates.ts`).
-          const bootstrapAt =
-            header.protocol_level === 0 ? bootstrapPosition(html) : undefined;
-          if (plan.holds || bootstrapAt !== undefined) {
+          // replayed document is built the same (`gates.ts`), with the copy
+          // of the page's encoding declaration the bootstrap had before it,
+          // if it had one.
+          const placement =
+            header.protocol_level === 0 ? bootstrapPlacement(html) : undefined;
+          if (plan.holds || placement !== undefined) {
             body = Buffer.from(
-              insertGates(html, { ...plan.gates, bootstrapAt }).html,
+              insertGates(html, {
+                ...plan.gates,
+                bootstrapAt: placement?.at,
+                ...(placement?.declarationCopy !== undefined
+                  ? { declarationCopy: placement.declarationCopy }
+                  : {}),
+              }).html,
               "utf-8",
             );
           }

@@ -17,7 +17,7 @@ import * as path from "node:path";
 import { sortedFilesUnder } from "@codetracer/instrumenter";
 
 import { rewriteDynamicImports, rewriteHtmlImports } from "./import-seam.js";
-import { bootstrapPosition, withoutBootstraps } from "./placement.js";
+import { placeBootstrap, withoutBootstraps } from "./placement.js";
 
 import {
   BOOTSTRAP_MARKER,
@@ -147,7 +147,14 @@ export function bootstrapScript(
  * tokenizer (`./placement.ts`); the replay runner places its stand-in for
  * the bootstrap with the same function.
  */
-export { bootstrapPosition, bootstrapRanges } from "./placement.js";
+export {
+  type BootstrapPlacement,
+  bootstrapPlacement,
+  bootstrapPosition,
+  bootstrapRanges,
+  declaredEncoding,
+  PRESCAN_WINDOW_BYTES,
+} from "./placement.js";
 
 /**
  * The page cannot get the bootstrap without being changed otherwise: the
@@ -164,18 +171,21 @@ export class BoundaryShimInjectionError extends Error {
 /**
  * Insert the bootstrap as the first element of the page's head, before any
  * script of the page (creating no `<head>`: without one it goes where the
- * tree builder implies the head; see {@link bootstrapPosition}). An
- * existing bootstrap is replaced, so injecting twice leaves one.
+ * tree builder implies the head; see `bootstrapPlacement`), after an
+ * encoding declaration that begins the head, or else with a copy of the
+ * page's encoding declaration before it, so that the declaration the
+ * encoding prescan finds stays in the page's first 1024 bytes. An existing
+ * bootstrap (and its copy) is replaced, so injecting twice leaves one.
  */
 export function injectBoundaryShim(
   html: string,
   config: ShimConfig = {},
   options: InjectOptions = {},
 ): string {
-  const tag = bootstrapScript(config, options);
-  const without = withoutBootstraps(html);
-  const at = bootstrapPosition(without);
-  return without.slice(0, at) + tag + without.slice(at);
+  return placeBootstrap(
+    withoutBootstraps(html),
+    bootstrapScript(config, options),
+  );
 }
 
 /**

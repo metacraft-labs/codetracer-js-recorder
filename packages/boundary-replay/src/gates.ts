@@ -49,7 +49,10 @@
  *   head, the bootstrap implying it there): the replayed page gets a gate at
  *   that same position (`GateOptions.bootstrapAt`), so its tree is the
  *   recorded one and replay can hold the parser where the recording could
- *   first have stopped.
+ *   first have stopped. When the bootstrap had a copy of the page's
+ *   encoding declaration before it (`bootstrapPlacement`), the same copy
+ *   goes before the gate (`GateOptions.declarationCopy`): the copy is an
+ *   element of the recorded tree, which the gate, taking itself out, is not.
  * - Not before `<col>`: a script ends
  *   the column group it would be in, and the `<col>` then implies another;
  *   nor right after `<pre>` or `<listing>`, whose first newline the parser
@@ -103,6 +106,12 @@ export interface GateOptions {
    * whatever else is asked, standing in for it (see the module comment).
    */
   bootstrapAt?: number;
+  /**
+   * Level 0: the copy of the page's encoding declaration the record
+   * bootstrap had before it (`bootstrapPlacement`), put right before the
+   * stand-in; only with {@link bootstrapAt}.
+   */
+  declarationCopy?: string;
 }
 
 /** What {@link insertGates} did. */
@@ -234,7 +243,11 @@ export function insertGates(html: string, options: GateOptions): GatedDocument {
     if (!inserts.includes(standIn)) inserts.push(standIn);
     inserts.sort((a, b) => a - b);
   }
-  let out = splice(html, inserts, PARSER_GATE);
+  let out = splice(html, inserts, (p) =>
+    p === standIn && options.declarationCopy !== undefined
+      ? options.declarationCopy + PARSER_GATE
+      : PARSER_GATE,
+  );
   if (!plaintext) {
     // The event gates go last, where the parser appends them to the body,
     // followed by a parser gate, which takes them out of the document before
@@ -251,13 +264,17 @@ export function insertGates(html: string, options: GateOptions): GatedDocument {
   };
 }
 
-/** `html` with `text` inserted at each of the ascending `positions`. */
-function splice(html: string, positions: number[], text: string): string {
-  if (text === "" || positions.length === 0) return html;
+/** `html` with `text(p)` inserted at each of the ascending `positions` `p`. */
+function splice(
+  html: string,
+  positions: number[],
+  text: (position: number) => string,
+): string {
+  if (positions.length === 0) return html;
   const parts: string[] = [];
   let at = 0;
   for (const p of positions) {
-    parts.push(html.slice(at, p), text);
+    parts.push(html.slice(at, p), text(p));
     at = p;
   }
   parts.push(html.slice(at));

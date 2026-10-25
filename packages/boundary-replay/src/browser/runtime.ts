@@ -278,6 +278,41 @@ export function installReplayRuntime(
     return (seqOf(r) ?? 0n).toString();
   };
 
+  /**
+   * Whether an inline parser gate the parser has gone past never ran: it is
+   * still in the document (a gate that runs takes every gate out first,
+   * `removeGates`) and an element follows it, so the parser went on past its
+   * end tag without running it. With scripting on, only the page's
+   * Content-Security-Policy skips a parser-inserted inline script (CSP,
+   * "Should element's inline type behavior be blocked by Content Security
+   * Policy?", https://w3c.github.io/webappsec-csp/#should-block-inline).
+   * The `securitypolicyviolation` event says the same, but in a task of its
+   * own (CSP, "report a violation"), which the scheduler may not have seen
+   * when it finds the document past a position the gate was to hold; this
+   * reads it from the document, at once.
+   */
+  const gateBlocked = (): boolean => {
+    try {
+      const d = w.document;
+      const all = d.getElementsByTagName("*");
+      const last = all[all.length - 1];
+      const scripts = d.getElementsByTagName("script");
+      for (let i = 0; i < scripts.length; i++) {
+        const s = scripts[i];
+        if (
+          s.hasAttribute(GATE_MARKER) &&
+          !s.hasAttribute("src") &&
+          s !== last
+        ) {
+          return true;
+        }
+      }
+    } catch {
+      // No document to read yet: no gate either.
+    }
+    return false;
+  };
+
   const fail = (
     kind: DivergenceKind,
     detail: string,
@@ -285,6 +320,13 @@ export function installReplayRuntime(
     actual?: string,
     seq?: string,
   ): never => {
+    if (failed === undefined && kind !== "NonReplayable" && gateBlocked()) {
+      // Nothing held the parser where the log needed it: that, not the
+      // position the document then reached, is why the replay cannot go on.
+      kind = "NonReplayable";
+      detail =
+        "the page's Content-Security-Policy blocks the replay's gate (an inline gate the parser went past did not run): the replay cannot hold the document's loading";
+    }
     if (failed === undefined) {
       const r = current();
       failed = {
@@ -590,7 +632,6 @@ export function installReplayRuntime(
     (ev) => {
       if (seenResourceEvents.has(ev)) return;
       seenResourceEvents.add(ev);
-      progress.noteElementEvent(ev);
       const r = resourceEventOf(w, ev);
       if (r === undefined) return;
       if (

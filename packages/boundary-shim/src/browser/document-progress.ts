@@ -46,14 +46,15 @@ export { REPLAY_GATE_MARKER };
  * - `phase`: {@link LOADING_PHASE} 1 while it is parsed (`readyState`
  *   `loading`), 2 once parsed and before `DOMContentLoaded` is dispatched,
  *   3 from `DOMContentLoaded` until `load`;
- * - `elements`: the elements in the document, CodeTracer's own scripts and
- *   an inline script the parser holds for a style sheet excepted. An
- *   external script the parser waits for is counted: replay holds the
- *   parser at it, as the network held it on record;
+ * - `elements`: the elements in the document, CodeTracer's own scripts
+ *   excepted, and, while it parses, an inline classic script that is its
+ *   last element (the parser may not have run it yet). An external script
+ *   the parser waits for is counted: replay holds the parser at it, as the
+ *   network held it on record;
  * - `scripts`: the `<script>` elements that have run: an external one once
  *   its `load` or `error` was dispatched, an inline classic one once it is in
- *   the document, unless the parser is still holding it for a style sheet
- *   that blocks scripts. Inline module scripts are not counted (they run
+ *   the document, but not, while it parses, the one that is its last
+ *   element. Inline module scripts are not counted (they run
  *   later, with no event that says when), nor are the record bootstrap and
  *   the replay runner's gates.
  */
@@ -113,7 +114,6 @@ export class DocumentProgress {
   private readonly all: HTMLCollectionOf<Element>;
   private readonly scriptElements: HTMLCollectionOf<Element>;
   private readonly settledScripts = new WeakSet<Element>();
-  private readonly failedSheets = new WeakSet<Element>();
   private dcl = false;
   private loaded = false;
 
@@ -234,12 +234,12 @@ export class DocumentProgress {
     const settle = (ev: Event) => {
       if (!ev.isTrusted) return;
       const t = ev.target;
-      if (t instanceof this.w.HTMLScriptElement) {
-        if (!DocumentProgress.isOwn(t) && t.hasAttribute("src")) {
-          on.scriptSettled(t);
-        }
-      } else {
-        this.noteElementEvent(ev);
+      if (
+        t instanceof this.w.HTMLScriptElement &&
+        !DocumentProgress.isOwn(t) &&
+        t.hasAttribute("src")
+      ) {
+        on.scriptSettled(t);
       }
     };
     // An element's `load` never reaches the window (DOM, "get the parent"
@@ -267,25 +267,11 @@ export class DocumentProgress {
   }
 
   /**
-   * Note what an element's trusted event changes about the position: a
-   * style sheet's `error` (a failed style sheet no longer blocks scripts).
-   * The replay runtime calls it for an event it holds back before the
-   * capture listener of {@link listen} sees it.
-   */
-  noteElementEvent(ev: Event): void {
-    if (
-      ev.isTrusted &&
-      ev.type === "error" &&
-      ev.target instanceof this.w.HTMLLinkElement
-    ) {
-      this.failedSheets.add(ev.target);
-    }
-  }
-
-  /**
    * The scripts that have run, and the elements {@link position} does not
-   * count (CodeTracer's own scripts, and an inline script the parser holds
-   * for a style sheet: replay gets there before the parser inserts it).
+   * count (CodeTracer's own scripts, and, while the document parses, an
+   * inline script that is the document's last element,
+   * {@link trailingInlineScript}: replay gets there before the parser
+   * inserts it).
    */
   private countScripts(parsing: boolean): { run: number; uncounted: number } {
     let n = 0;
@@ -305,7 +291,7 @@ export class DocumentProgress {
         continue;
       }
       if (parsing) {
-        held ??= this.inlineHeldForStyleSheet();
+        held ??= this.trailingInlineScript();
         if (held === s) {
           uncounted++;
           continue;
@@ -317,37 +303,35 @@ export class DocumentProgress {
   }
 
   /**
-   * The inline script the parser holds for a style sheet that blocks
-   * scripts, if any (HTML, "An end tag whose tag name is script": the
-   * pending parsing-blocking script waits for "a style sheet that is
-   * blocking scripts"). It is in the document but has not run. It is the
-   * last thing the parser inserted, so the document's last node is in it,
-   * and a `<link rel=stylesheet>` before it has neither loaded (`sheet`) nor
-   * failed. Anything else the parser has got past, so it ran.
+   * The inline classic script that is the document's last element (its own
+   * elements, the bootstrap and the replay gates, aside), if any, while the
+   * document parses. The parser may not have run it yet: it may be inside
+   * it (its text not all there), or at its end tag with the script pending:
+   * held for a style sheet that blocks scripts (HTML, "An end tag whose tag
+   * name is script": the pending parsing-blocking script waits for "a style
+   * sheet that is blocking scripts"), or because the browser yielded before
+   * running it (Chromium's parser does, when its time slice is used up; a
+   * task such as an input then runs with the script in the document and not
+   * yet run). Nothing in the document tells these from a script that has
+   * just run with the parser stopped right after it, so such a script is
+   * never counted, run or not, until the parser inserts another element.
+   * The replay measures the same: at a parser gate before the script and at
+   * one right after it the position is the same, so a task the log has
+   * there is released at whichever of the two the log's reads put first.
    */
-  private inlineHeldForStyleSheet(): Element | null {
-    let last: Node | null = this.doc.documentElement;
-    while (last?.lastChild) last = last.lastChild;
-    const script =
-      last === null
-        ? null
-        : last.nodeType === 1
-          ? (last as Element)
-          : last.parentElement;
-    if (
-      script === null ||
-      script.localName !== "script" ||
-      script.hasAttribute("src")
-    ) {
-      return null;
-    }
-    const links = this.doc.getElementsByTagName("link");
-    for (let i = 0; i < links.length; i++) {
-      const l = links[i];
-      if (!l.relList.contains("stylesheet") || l.disabled) continue;
-      if (l.sheet !== null || this.failedSheets.has(l)) continue;
-      // DOCUMENT_POSITION_FOLLOWING: the script comes after the link.
-      if (l.compareDocumentPosition(script) & 4) return script;
+  private trailingInlineScript(): Element | null {
+    for (let i = this.all.length - 1; i >= 0; i--) {
+      const el = this.all[i];
+      if (DocumentProgress.isOwn(el)) continue;
+      if (
+        el.localName !== "script" ||
+        el.namespaceURI !== "http://www.w3.org/1999/xhtml" ||
+        el.hasAttribute("src") ||
+        (el.getAttribute("type") ?? "").trim().toLowerCase() === "module"
+      ) {
+        return null;
+      }
+      return el;
     }
     return null;
   }
