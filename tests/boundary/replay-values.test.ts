@@ -372,6 +372,15 @@ describe("replay gives a page the values it read", () => {
         ["reader", "unrecordable-platform-task", "FileReader.readAsText"],
         ["subtle", "unrecordable-platform-task", "crypto.subtle.generateKey"],
         ["port", "unrecordable-message", "window.postMessage"],
+        ["canvas", "canvas-readback", "CanvasRenderingContext2D.getImageData"],
+        ["clipboard", "clipboard-content", "navigator.clipboard.readText"],
+        ["caches", "cache-storage", "caches.open"],
+        [
+          "permissions",
+          "unrecordable-platform-task",
+          "navigator.permissions.query",
+        ],
+        ["fonts-event", "unrecordable-platform-task", "document.fonts loading"],
       ];
       for (const [use, feature, detail] of cases) {
         const rs = await record(`values.html?case=refused&use=${use}`);
@@ -392,6 +401,207 @@ describe("replay gives a page the values it read", () => {
           ),
         );
       }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "replay_gives_a_page_the_logged_platform_state",
+    async () => {
+      // Recorded from a page reached with a referrer, as a visitor's is.
+      const referrer = "https://search.example/?q=boundary";
+      const rs = await record("values.html?case=url", async (page) => {
+        await page.goto(`${rr.server.origin}/values.html?case=state`, {
+          referer: referrer,
+        });
+      });
+      const states = rs
+        .map((r, i) => [r, i] as const)
+        .filter(
+          ([r]) =>
+            r.record === "PlatformValue" &&
+            r.src === PLATFORM_VALUE_SRC.platformState,
+        ) as (readonly [RecordOf<"PlatformValue">, number])[];
+      const queries = states.map(([r]) => r.query);
+      // Vacuity guard: every read the page made is in the log.
+      for (const q of [
+        "document.referrer",
+        "navigator.onLine",
+        "navigator.connection.effectiveType",
+        "navigator.userAgent",
+        "navigator.webdriver",
+        "navigator.languages",
+        "navigator.hardwareConcurrency",
+        "screen.width",
+        "screen.orientation.type",
+        "performance.memory.jsHeapSizeLimit",
+        "performance.eventCounts.size",
+        'performance.eventCounts.get["click"]',
+        "performance.eventCounts.keys",
+        "performance.eventCounts.forEach",
+        "document.fonts.status",
+        'document.fonts.check["12px serif"," "]',
+        'measureText["13px sans-serif","boundary"]',
+        "WebSocket.bufferedAmount[1]",
+      ]) {
+        expect(queries, q).toContain(q);
+      }
+      const at = (q: string) => states.find(([r]) => r.query === q)!;
+      expect(JSON.parse(at("document.referrer")[0].value)).toBe(referrer);
+      expect(
+        Number(JSON.parse(at("WebSocket.bufferedAmount[1]")[0].value)),
+      ).toBeGreaterThan(0);
+      expectReplayed(await replay(rs), rs);
+      // Each value, changed in the log, reaches the page as changed: the
+      // page wrote every one into the document, so the final checkpoint
+      // differs.
+      for (const [r, i] of states) {
+        expectDiverged(
+          await replay(
+            replaced<"PlatformValue">(rs, i, { value: perturb(r.value) }),
+          ),
+          "CheckpointMismatch",
+          lastCheckpoint(rs),
+        );
+      }
+    },
+    TIMEOUT * 4,
+  );
+
+  it(
+    "replay_settles_platform_promises_with_their_logged_outcomes_in_logged_order",
+    async () => {
+      const rs = await record("values.html?case=promises");
+      const outcomes = rs
+        .map((r, i) => [r, i] as const)
+        .filter(
+          ([r]) =>
+            r.record === "PlatformValue" &&
+            r.src === PLATFORM_VALUE_SRC.platformOutcome,
+        ) as (readonly [RecordOf<"PlatformValue">, number])[];
+      // Vacuity guard: every promise's outcome is in the log, after its Task.
+      expect(outcomes.map(([r]) => r.query).sort()).toEqual(
+        [
+          'FontFace.load["ct-missing"]',
+          'HTMLImageElement.decode["path:~img"]',
+          "createImageBitmap",
+          "document.fonts.load",
+          "document.fonts.ready",
+          "navigator.clipboard.writeText",
+          "navigator.storage.estimate",
+          "navigator.storage.persisted",
+          "navigator.userAgentData.getHighEntropyValues",
+        ].sort(),
+      );
+      for (const [r, i] of outcomes) {
+        const task = rs[i - 1];
+        expect(
+          task.record === "Task" && task.task_id === r.task_id,
+          r.query,
+        ).toBe(true);
+      }
+      // Both kinds of outcome are exercised.
+      expect(outcomes.some(([r]) => r.value.startsWith('{"rejected"'))).toBe(
+        true,
+      );
+      expect(outcomes.some(([r]) => r.value.startsWith('{"resolved"'))).toBe(
+        true,
+      );
+      expectReplayed(await replay(rs), rs);
+      for (const [r, i] of outcomes) {
+        const changed = replaced<"PlatformValue">(rs, i, {
+          // The faces `document.fonts.load` resolved with are places in the
+          // set; changed, it rejects instead (a face the set does not have
+          // is checked below).
+          value:
+            r.query === "document.fonts.load"
+              ? JSON.stringify({
+                  rejected: {
+                    name: "AbortError",
+                    message: "",
+                    type: "DOMException",
+                  },
+                })
+              : perturbOutcome(r.value),
+        });
+        // A bitmap is the replay browser's own, checked against the log
+        // where the log has its outcome; every other outcome is the log's
+        // and reaches the document.
+        if (r.query === "createImageBitmap") {
+          expectDiverged(
+            await replay(changed),
+            "ArgumentMismatch",
+            seqAt(rs, i),
+          );
+        } else {
+          expectDiverged(
+            await replay(changed),
+            "CheckpointMismatch",
+            lastCheckpoint(rs),
+          );
+        }
+      }
+      // A face the replayed set does not have is a typed divergence where
+      // the page would get it.
+      const fontsLoad = outcomes.find(
+        ([r]) => r.query === "document.fonts.load",
+      )!;
+      expectDiverged(
+        await replay(
+          replaced<"PlatformValue">(rs, fontsLoad[1], {
+            value: JSON.stringify({ resolved: [7] }),
+          }),
+        ),
+        "ArgumentMismatch",
+        seqAt(rs, fontsLoad[1]),
+      );
+      // Two platform tasks released in the other order: the first released
+      // task reads its outcome where the log has the other's, and the task
+      // ids differ there.
+      const tasks = rs
+        .map((r, i) => [r, i] as const)
+        .filter(([r]) => r.record === "Task" && r.kind === 13);
+      expectDiverged(
+        await replay(withRecordsSwapped(rs, tasks[0][1], tasks[1][1])),
+        "ArgumentMismatch",
+        seqAt(rs, tasks[0][1] + 1),
+      );
+    },
+    TIMEOUT * 4,
+  );
+
+  it(
+    "replay_dispatches_online_and_offline_from_the_log",
+    async () => {
+      const rs = await record(
+        "values.html?case=online",
+        async (page, context) => {
+          await until(page, isReady, "the online case to listen");
+          await context.setOffline(true);
+          await new Promise((r) => setTimeout(r, 200));
+          await context.setOffline(false);
+        },
+      );
+      const inputs = rs.filter(
+        (r): r is RecordOf<"Input"> =>
+          r.record === "Input" && (r.type === "online" || r.type === "offline"),
+      );
+      expect(inputs.map((r) => `${r.type}@${r.target}`)).toEqual([
+        "offline@win",
+        "online@win",
+      ]);
+      const onLine = indexWhere(
+        rs,
+        "PlatformValue",
+        (r) => r.query === "navigator.onLine",
+      );
+      expect(rs[onLine]).toMatchObject({ value: "false" });
+      expectReplayed(await replay(rs), rs);
+      expectDiverged(
+        await replay(replaced<"PlatformValue">(rs, onLine, { value: "true" })),
+        "CheckpointMismatch",
+        lastCheckpoint(rs),
+      );
     },
     TIMEOUT,
   );
@@ -670,6 +880,7 @@ describe("replay gives a page the values it read", () => {
         "perf",
         "messages",
         "body-handler",
+        "promises",
       ];
       for (const c of cases) {
         const rs = await record(`values.html?case=${c}&at=loading`);
@@ -693,3 +904,54 @@ describe("replay gives a page the values it read", () => {
     TIMEOUT * 2,
   );
 });
+
+/**
+ * A different value of a logged platform state's JSON (`stateJson`): a
+ * number plus one, a string with a suffix, a boolean negated, an array with
+ * one more entry, an object whose first scalar is changed.
+ */
+function perturb(json: string): string {
+  const v = JSON.parse(json) as unknown;
+  const change = (x: unknown): unknown => {
+    if (typeof x === "number") return x + 1;
+    if (typeof x === "string") return `${x}-changed`;
+    if (typeof x === "boolean") return !x;
+    if (x === null) return 1;
+    if (Array.isArray(x)) {
+      return x.length > 0 && Array.isArray(x[0])
+        ? [...x, ["changed", 1]]
+        : [...x, "changed"];
+    }
+    const o = { ...(x as Record<string, unknown>) };
+    const k = Object.keys(o).find((key) =>
+      ["number", "string", "boolean"].includes(typeof o[key]),
+    );
+    if (k === undefined) return { ...o, changed: 1 };
+    o[k] = change(o[k]);
+    return o;
+  };
+  return JSON.stringify(change(v));
+}
+
+/**
+ * A different logged outcome (`outcomeJson`): a resolution with another
+ * value (or, for one with nothing to change, a rejection), a rejection with
+ * another name.
+ */
+function perturbOutcome(json: string): string {
+  const o = JSON.parse(json) as {
+    resolved?: unknown;
+    rejected?: { name: string; message: string; type: string };
+  };
+  if (o.rejected !== undefined) {
+    return JSON.stringify({ rejected: { ...o.rejected, name: "AbortError" } });
+  }
+  if (o.resolved === true || o.resolved === null) {
+    return JSON.stringify({
+      rejected: { name: "AbortError", message: "", type: "DOMException" },
+    });
+  }
+  return JSON.stringify({
+    resolved: JSON.parse(perturb(JSON.stringify(o.resolved))),
+  });
+}

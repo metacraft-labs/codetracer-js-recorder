@@ -280,6 +280,10 @@ export const INPUT_EVENT_TYPES: readonly string[] = [
   "compositionstart",
   "compositionupdate",
   "compositionend",
+  // the network coming and going (the platform's `navigator.onLine`, which
+  // the page then reads, is logged too: seams-environment.ts)
+  "online",
+  "offline",
 ];
 
 /** The event properties `Input.props` carries, when the event has them. */

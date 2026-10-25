@@ -35,11 +35,16 @@ import { type ReplayContext, bitsToNumber } from "./context.js";
 /**
  * The page's promise for a platform task (§6, kind 13): registered now,
  * settled when the scheduler releases its `Task` and the platform's own
- * `settled` has settled, whichever is later.
+ * `settled` has settled, whichever is later. `check`, if given, is called
+ * then, before the page's continuation is let go, with the task's id and
+ * the platform's outcome: a platform task whose outcome the log also
+ * carries (`createImageBitmap()`, `PlatformValue` src 9) reads and compares
+ * it there, where the record side wrote it, after the `Task`.
  */
 export function replayPlatformTask<T>(
   ctx: ReplayContext,
   settled: Promise<T>,
+  check?: (taskId: bigint, result: { ok: boolean; value: unknown }) => void,
 ): Promise<T> {
   const { replay, orig } = ctx;
   const id = ctx.nextTaskId();
@@ -48,7 +53,11 @@ export function replayPlatformTask<T>(
     let outcome: (() => void) | undefined;
     let released = false;
     let done: (() => void) | undefined;
-    const arrived = (go: () => void) => {
+    const arrived = (settle: () => void, ok: boolean, value: unknown) => {
+      const go = () => {
+        check?.(id, { ok, value });
+        settle();
+      };
       outcome = go;
       if (!released && replay.takeDueTask(id)) {
         // Settled where the log has it, while the document loads (§6).
@@ -64,8 +73,8 @@ export function replayPlatformTask<T>(
     };
     (orig.promiseThen as Promise<T>["then"]).call(
       settled,
-      (v) => arrived(() => resolve(v)),
-      (e: unknown) => arrived(() => reject(e)),
+      (v) => arrived(() => resolve(v), true, v),
+      (e: unknown) => arrived(() => reject(e), false, e),
     );
     replay.onTask(id, () => {
       replay.offTask(id);

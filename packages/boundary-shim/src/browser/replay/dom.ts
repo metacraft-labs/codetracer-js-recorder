@@ -450,6 +450,9 @@ const SHAPES: Record<string, EventShape> = {
   compositionstart: COMPOSITION,
   compositionupdate: COMPOSITION,
   compositionend: { ...COMPOSITION, cancelable: false },
+  // HTML, "online and offline events": plain events at the window.
+  online: { ctor: "Event", bubbles: false, cancelable: false },
+  offline: { ctor: "Event", bubbles: false, cancelable: false },
 };
 
 /** `DomEffect.effect` (§5.2). */

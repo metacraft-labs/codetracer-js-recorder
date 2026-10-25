@@ -30,7 +30,11 @@ import {
   replaceValue,
   utf8Bytes,
 } from "./context.js";
-import { WS_FRAME, XHR_EVENT } from "@codetracer/boundary-format";
+import {
+  PLATFORM_VALUE_SRC,
+  WS_FRAME,
+  XHR_EVENT,
+} from "@codetracer/boundary-format";
 
 import { TaskKind } from "./recorder.js";
 import { markPageResponse } from "./seams-platform.js";
@@ -1059,6 +1063,43 @@ function patchWebSocket(ctx: SeamContext): void {
       return origSend.call(this, data);
     },
   );
+
+  // How much of what the page sent the socket has not yet handed to the
+  // network (WebSocket standard, `bufferedAmount`): it falls as the
+  // visitor's network takes the bytes, so each read is logged
+  // (`PlatformValue` src 8, §10.4) and replay answers it from the log.
+  const buffered = Object.getOwnPropertyDescriptor(
+    OrigWs.prototype,
+    "bufferedAmount",
+  );
+  if (buffered?.get !== undefined) {
+    const get = buffered.get;
+    replaceAccessor(
+      OrigWs.prototype,
+      "bufferedAmount",
+      function (this: unknown) {
+        const v = get.call(this) as number;
+        const reqId = tracked.get(this as WebSocket);
+        if (reqId !== undefined) {
+          rec.guard(() =>
+            rec.emit("PlatformValue", {
+              src: PLATFORM_VALUE_SRC.platformState,
+              task_id: 0n,
+              query: bufferedAmountQuery(reqId),
+              value: JSON.stringify(v),
+            }),
+          );
+        }
+        return v;
+      },
+      buffered.set,
+    );
+  }
+}
+
+/** The query of a read of socket `reqId`'s `bufferedAmount` (§10.4). */
+export function bufferedAmountQuery(reqId: bigint): string {
+  return `WebSocket.bufferedAmount[${reqId}]`;
 }
 
 function patchEventSource(ctx: SeamContext): void {

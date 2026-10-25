@@ -28,7 +28,7 @@
 import { PLATFORM_VALUE_SRC } from "@codetracer/boundary-format";
 
 import { type SeamContext, replaceAccessor, replaceValue } from "./context.js";
-import { TaskKind } from "./recorder.js";
+import { recordPlatformOutcome } from "./seams-environment.js";
 import { UNRECORDABLE_PLATFORM_TASK, wrapMethod } from "./seams-platform.js";
 import { targetOf } from "./targets.js";
 
@@ -112,7 +112,7 @@ function protoOf(w: SeamContext["w"], name: string): Proto | undefined {
 
 /** Patch every seam this module owns. */
 export function patchMediaSeams(ctx: SeamContext): void {
-  const { w, rec, orig } = ctx;
+  const { w, rec } = ctx;
   const value = (query: string, json: string, taskId = 0n) =>
     rec.emit("PlatformValue", {
       src: PLATFORM_VALUE_SRC.media,
@@ -169,41 +169,12 @@ export function patchMediaSeams(ctx: SeamContext): void {
   if (media === undefined || typeof origPlay !== "function") return;
   replaceValue(media, "play", function play(this: unknown) {
     const settled = (origPlay as () => Promise<void>).call(this);
-    if (!rec.recording) return settled;
-    const query = mediaQuery("play", this);
-    const taskId = rec.guard(() => {
-      const id = rec.nextTaskId();
-      rec.emit("TaskReg", {
-        task_id: id,
-        kind: TaskKind.platform,
-        delay_ms: 0,
-      });
-      return id;
-    });
-    if (taskId === undefined) return settled;
-    const settle = (outcome: unknown) =>
-      rec.guard(() => {
-        rec.task(taskId, TaskKind.platform);
-        value(query, JSON.stringify(outcome), taskId);
-      });
-    return new orig.Promise<void>((resolve, reject) => {
-      (orig.promiseThen as Promise<void>["then"]).call(
-        settled,
-        () => {
-          settle({ resolved: true });
-          resolve();
-        },
-        (e: unknown) => {
-          const err = e as { name?: unknown; message?: unknown } | null;
-          settle({
-            rejected: {
-              name: String(err?.name ?? "Error"),
-              message: String(err?.message ?? ""),
-            },
-          });
-          reject(e);
-        },
-      );
-    });
+    return recordPlatformOutcome(
+      ctx,
+      PLATFORM_VALUE_SRC.media,
+      mediaQuery("play", this),
+      settled,
+      () => true,
+    );
   });
 }

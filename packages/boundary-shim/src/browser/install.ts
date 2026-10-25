@@ -31,6 +31,7 @@ import { captureOriginals, type ShimOriginals } from "./originals.js";
 import { Recorder } from "./recorder.js";
 import { listenForPageEvents, patchDomSeams } from "./seams-dom.js";
 import { listenForStorageEvents, patchMessageSeams } from "./seams-message.js";
+import { patchEnvironmentSeams } from "./seams-environment.js";
 import { patchImportSeam } from "./seams-import.js";
 import { patchMediaSeams } from "./seams-media.js";
 import { patchNetSeams } from "./seams-net.js";
@@ -183,6 +184,7 @@ export function installBoundaryShim(
     patchMessageSeams,
     patchRefusals,
     patchMediaSeams,
+    patchEnvironmentSeams,
     // Only where the deploy step rewrote the page's import() calls into
     // calls of the seam (§8.1); the Header declares it above.
     ...(config.importSeam === true ? [patchImportSeam] : []),

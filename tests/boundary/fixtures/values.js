@@ -329,6 +329,175 @@
       }, 300);
     },
 
+    // The platform's own state: where the visitor came from, the browser,
+    // the device, the network, the engine's counters, the fonts, a canvas's
+    // text metrics and a socket's unsent bytes. Every value goes into a
+    // slot, so the final checkpoint compares each.
+    state: function () {
+      var c = navigator.connection;
+      slot("referrer", document.referrer);
+      slot("onLine", navigator.onLine);
+      slot(
+        "connection",
+        c ? [c.effectiveType, c.rtt, c.saveData].join(":") : "none",
+      );
+      slot("ua", navigator.userAgent.length + ":" + navigator.webdriver);
+      slot("languages", navigator.languages.join(","));
+      slot(
+        "hardware",
+        navigator.hardwareConcurrency + ":" + navigator.maxTouchPoints,
+      );
+      slot(
+        "screen",
+        [
+          screen.width,
+          screen.height,
+          screen.colorDepth,
+          screen.orientation.type,
+        ].join(":"),
+      );
+      slot(
+        "memory",
+        performance.memory ? performance.memory.jsHeapSizeLimit : "none",
+      );
+      var counts = performance.eventCounts;
+      var n = 0;
+      counts.forEach(function () {
+        n++;
+      });
+      slot(
+        "eventCounts",
+        [
+          counts.size,
+          counts.get("click"),
+          counts.has("keydown"),
+          Array.from(counts.keys()).length,
+          n,
+        ].join(":"),
+      );
+      slot(
+        "fonts",
+        document.fonts.status + ":" + document.fonts.check("12px serif"),
+      );
+      var ctx2d = document.createElement("canvas").getContext("2d");
+      ctx2d.font = "13px sans-serif";
+      slot("measure", ctx2d.measureText("boundary").width);
+      var ws = new WebSocket(location.origin.replace("http", "ws") + "/api/ws");
+      ws.onopen = function () {
+        // Counted as unsent the moment it is queued (WebSocket standard,
+        // `send()`: "increase the bufferedAmount"); short enough for the
+        // fixture server's frame reader.
+        ws.send(new Array(101).join("x"));
+        slot("buffered", ws.bufferedAmount);
+        ws.close();
+        done();
+      };
+    },
+
+    // A chain of awaits of a platform promise that settles at once
+    // (`createImageBitmap` of an `ImageData`), started from a timer nested
+    // past five, where HTML clamps a timer to 4 ms: what the chain costs the
+    // page, which a recorder must not raise.
+    awaits: function () {
+      var n = 100;
+      function chain(depth) {
+        if (depth > 0) {
+          setTimeout(function () {
+            chain(depth - 1);
+          }, 0);
+          return;
+        }
+        var t0 = performance.now();
+        var i = 0;
+        function step() {
+          if (i === n) {
+            slot("awaits", n + ":" + (performance.now() - t0));
+            done();
+            return;
+          }
+          i++;
+          createImageBitmap(new ImageData(1, 1)).then(step);
+        }
+        step();
+      }
+      chain(6);
+    },
+
+    // Platform promises that settle in tasks of their own with what the
+    // visitor's machine says, interleaved with a timer: each continuation
+    // writes what it got and reads the clock, so both the outcome and the
+    // order are checked.
+    promises: function () {
+      var order = [];
+      function note(what) {
+        order.push(what);
+        Date.now();
+      }
+      function failed(what) {
+        return function (e) {
+          note(
+            what + ":rejected:" + e.name + ":" + (e instanceof DOMException),
+          );
+        };
+      }
+      navigator.storage.estimate().then(function (e) {
+        note("estimate:" + e.quota + ":" + e.usage);
+      }, failed("estimate"));
+      navigator.storage.persisted().then(function (p) {
+        note("persisted:" + p);
+      }, failed("persisted"));
+      document.fonts.ready.then(function (s) {
+        note("ready:" + (s === document.fonts));
+      }, failed("ready"));
+      document.fonts.load("12px serif").then(function (faces) {
+        note("fontsLoad:" + faces.length);
+      }, failed("fontsLoad"));
+      var face = new FontFace("ct-missing", "local(ct-no-such-font)");
+      face.load().then(function (f) {
+        note("faceLoad:" + (f === face));
+      }, failed("faceLoad"));
+      var img = new Image();
+      img.src = "resources-dot.svg";
+      img.decode().then(function () {
+        note("decode:ok");
+      }, failed("decode"));
+      createImageBitmap(new ImageData(2, 3)).then(function (b) {
+        note("bitmap:" + b.width + "x" + b.height);
+      }, failed("bitmap"));
+      navigator.clipboard.writeText("copied").then(function () {
+        note("clipboard:ok");
+      }, failed("clipboard"));
+      navigator.userAgentData.getHighEntropyValues(["platform"]).then(function (
+        v,
+      ) {
+        note("uaData:" + v.platform + ":" + v.mobile);
+      }, failed("uaData"));
+      setTimeout(function () {
+        note("timer");
+      }, 0);
+      setTimeout(function () {
+        slot("order", order.join(","));
+        done();
+      }, 1000);
+    },
+
+    // The network going and coming back: each event is input, and the
+    // `navigator.onLine` its listener reads comes from the log.
+    online: function () {
+      var seen = [];
+      function on(e) {
+        seen.push(e.type + ":" + navigator.onLine);
+        Date.now();
+        if (e.type === "online") {
+          slot("online", seen.join(","));
+          done();
+        }
+      }
+      window.addEventListener("offline", on);
+      window.addEventListener("online", on);
+      document.body.setAttribute("data-ready", "1");
+    },
+
     // What the shim cannot order exactly, and refuses: `?use=` picks one
     // seam (one Refusal is written per feature, so each needs its own
     // recording). The page keeps working: each writes what it got.
@@ -375,6 +544,63 @@
           });
           window.postMessage("take", "*", [ch.port2]);
           ch.port1.postMessage("hi");
+        },
+        // A canvas read back: its pixels are the visitor's GPU's and fonts'.
+        canvas: function () {
+          var c = document.createElement("canvas").getContext("2d");
+          c.fillText("x", 1, 10);
+          slot("canvas", c.getImageData(0, 0, 4, 4).data.length);
+          done();
+        },
+        // The clipboard's contents: the user's data.
+        clipboard: function () {
+          navigator.clipboard.readText().then(
+            function (t) {
+              slot("clipboard", t.length);
+              done();
+            },
+            function (e) {
+              slot("clipboard", e.name);
+              done();
+            },
+          );
+        },
+        // The Cache API: storage with contents of its own.
+        caches: function () {
+          caches.open("c").then(
+            function () {
+              slot("caches", "open");
+              done();
+            },
+            function (e) {
+              slot("caches", e.name);
+              done();
+            },
+          );
+        },
+        // A permission's live status.
+        permissions: function () {
+          navigator.permissions
+            .query({ name: "geolocation" })
+            .then(function (s) {
+              slot("permissions", s.state);
+              done();
+            });
+        },
+        // An event the platform dispatches at the document's font set, which
+        // the page listens for.
+        "fonts-event": function () {
+          document.fonts.addEventListener("loadingerror", function () {
+            slot("fonts", "loadingerror");
+            done();
+          });
+          document.fonts.onloadingdone = function () {
+            slot("fonts", "loadingdone");
+            done();
+          };
+          var face = new FontFace("ct-missing", "local(ct-no-such-font)");
+          document.fonts.add(face);
+          face.load().catch(function () {});
         },
       };
       uses[params.get("use")]();

@@ -383,7 +383,7 @@ export const ENUM_VALUE_SETS: Readonly<
   // record while it ran, 5 an event of a resource element (DOC_TASK).
   DocTask: { kind: [1, 5] },
   // What produced the value (PLATFORM_VALUE_SRC).
-  PlatformValue: { src: [1, 7] },
+  PlatformValue: { src: [1, 9] },
 };
 
 /**
@@ -483,6 +483,23 @@ export const PLATFORM_VALUE_SRC = {
    * `play["<target>"]`, the task id the platform task's).
    */
   media: 7,
+  /**
+   * A read of the platform's own state, answered from the log on replay:
+   * `document.referrer`, the navigator's (`navigator.onLine`,
+   * `navigator.connection.*`, `navigator.userAgent`, …), the screen's,
+   * `performance.memory` and `performance.eventCounts`, an open socket's
+   * `bufferedAmount`, a font's or the document's font set's status, a
+   * canvas's `measureText()`. Task id 0; the query names the read.
+   */
+  platformState: 8,
+  /**
+   * The outcome of a platform promise that settles in a platform task
+   * (`navigator.storage.estimate()`, `document.fonts.ready`,
+   * `FontFace.load()`, `HTMLImageElement.decode()`, `createImageBitmap()`,
+   * …): `{"resolved": <value>}` or `{"rejected": {name, message, type}}`;
+   * the task id the platform task's.
+   */
+  platformOutcome: 9,
 } as const;
 
 type Schema = (typeof RECORD_SCHEMA)[number];

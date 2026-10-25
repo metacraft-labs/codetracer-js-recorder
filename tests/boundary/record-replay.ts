@@ -43,13 +43,14 @@ const RECORDER_CLI = path.join(REPO_ROOT, "packages/cli/dist/index.js");
 
 /** The slice of Playwright's page these tests drive. */
 export interface Page {
-  goto(url: string): Promise<unknown>;
+  goto(url: string, options?: { referer?: string }): Promise<unknown>;
   evaluate<T>(fn: () => T): Promise<T>;
   setInputFiles(selector: string, files: string): Promise<void>;
   click(selector: string): Promise<void>;
 }
 export interface Context {
   newPage(): Promise<Page>;
+  setOffline(offline: boolean): Promise<void>;
   close(): Promise<void>;
 }
 

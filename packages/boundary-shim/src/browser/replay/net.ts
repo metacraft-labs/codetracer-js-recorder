@@ -14,7 +14,11 @@
  */
 
 import type { RecordOf } from "@codetracer/boundary-format";
-import { RESPONSE_TYPE, WS_FRAME } from "@codetracer/boundary-format";
+import {
+  PLATFORM_VALUE_SRC,
+  RESPONSE_TYPE,
+  WS_FRAME,
+} from "@codetracer/boundary-format";
 
 import { asConstructor, replaceAccessor, replaceValue } from "../context.js";
 import { TaskKind } from "../recorder.js";
@@ -22,6 +26,7 @@ import {
   WS_EXTENSIONS_HEADER,
   WS_PROTOCOL_HEADER,
   absoluteUrl,
+  bufferedAmountQuery,
   bodyDigest,
   frameOf,
   messageBytes,
@@ -676,7 +681,18 @@ function replayWebSocket(ctx: ReplayContext): void {
     {
       url: (c) => c.url,
       readyState: (c) => c.readyState,
-      bufferedAmount: () => 0,
+      // Answered from the log: how fast the visitor's network took the
+      // bytes (§10.4).
+      bufferedAmount: (c) =>
+        Number(
+          JSON.parse(
+            replay.next("PlatformValue", {
+              src: PLATFORM_VALUE_SRC.platformState,
+              task_id: 0n,
+              query: bufferedAmountQuery(c.reqId),
+            }).value,
+          ),
+        ),
       extensions: (c) => c.extensions,
       protocol: (c) => c.protocol,
       binaryType: (c) => c.binaryType,

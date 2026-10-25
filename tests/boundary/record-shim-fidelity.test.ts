@@ -186,7 +186,22 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
       const forever = await open(shimDir, "streams.html?case=fetch-forever");
       const s = await slots(forever.page);
       expect(forever.pageErrors).toEqual([]);
-      expect(s["r-chunks"]).toBe("chunks=c0\n|c1\n|c2\n");
+      // The page's three reads. The server writes a line every 100 ms, and
+      // each read gets what the network has delivered by then: one line,
+      // or, when the renderer was not scheduled for longer than that, the
+      // lines that arrived meanwhile in one piece. Either way the pieces
+      // are the server's lines in order, and the log must hold exactly
+      // these pieces.
+      const pieces = s["r-chunks"].slice("chunks=".length).split("|");
+      expect(pieces).toHaveLength(3);
+      expect(pieces.join("")).toMatch(/^c0\n(c\d+\n)*$/);
+      expect(
+        pieces
+          .join("")
+          .split("\n")
+          .slice(0, -1)
+          .map((l, k) => l === `c${k}`),
+      ).not.toContain(false);
       expect(s["r-ended"]).toBe("ended=no");
       // The page's cancel reached the server: the stream it never finished
       // was closed by the client.
@@ -225,10 +240,11 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
               .data,
           ),
         ),
-      ).toEqual(["c0\n", "c1\n", "c2\n"]);
+      ).toEqual(pieces);
       expect(chunks[0]).toBeGreaterThan(headAt);
-      // c1 and c2 were written 100 ms apart, so each reached the page in a
-      // network task of its own: a Task with the request's id precedes it.
+      // The lines were written 100 ms apart, so each later piece reached the
+      // page in a network task of its own: a Task with the request's id
+      // precedes it.
       for (const i of chunks.slice(1)) {
         expect(log.records[i - 1]).toMatchObject({
           record: "Task",
@@ -1137,6 +1153,56 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
           "registered timers: only the page's function timer",
         ).toEqual([1]);
       }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "jsbound_shim_settles_platform_promises_without_timer_clamping",
+    async () => {
+      // §6 "Platform tasks": the shim settles the page's promise for a
+      // platform promise in a task of its own. A page that awaits such
+      // promises in a chain runs each continuation inside the task before
+      // it, so a timer made there is nested one deeper each time, and HTML
+      // clamps a timer nested past five to 4 ms: settling through the
+      // original setTimeout made N awaits cost the page at least
+      // 4 * (N - 5) ms that the platform does not (and a hidden page far
+      // more, throttled timers). The plain arm is the platform's own cost.
+      const n = 100;
+      const clamped = 4 * (n - 5);
+      async function arm(
+        root: string,
+      ): Promise<{ ms: number; log?: DecodedLog }> {
+        const o = await open(root, "values.html?case=awaits");
+        expect(o.pageErrors).toEqual([]);
+        const [count, ms] = (await slots(o.page))["r-awaits"]
+          .slice("awaits=".length)
+          .split(":")
+          .map(Number);
+        expect(count).toBe(n);
+        const log = root === shimDir ? await stopAndDecode(o.page) : undefined;
+        await o.context.close();
+        return { ms, log };
+      }
+      const plain = await arm(plainDir);
+      const shimmed = await arm(shimDir);
+      // Vacuity: the shim recorded every one of the awaited promises, as a
+      // platform task and its outcome (src 9), so each went through it.
+      const log = shimmed.log!;
+      const outcomes = recordsOf(
+        log,
+        "PlatformValue",
+        (r) => r.src === 9 && r.query === "createImageBitmap",
+      );
+      expect(outcomes.length).toBe(n);
+      expect(
+        recordsOf(log, "Task", (r) => r.kind === 13).length,
+      ).toBeGreaterThanOrEqual(n);
+      expect(plain.ms, "the platform's own cost").toBeLessThan(clamped / 2);
+      expect(
+        shimmed.ms,
+        `${n} awaits took ${shimmed.ms} ms with the shim, ${plain.ms} ms without; timers clamped to 4 ms would take at least ${clamped} ms`,
+      ).toBeLessThan(clamped / 2);
     },
     TIMEOUT,
   );

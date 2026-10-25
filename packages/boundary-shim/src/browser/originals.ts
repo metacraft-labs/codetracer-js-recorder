@@ -75,6 +75,19 @@ export interface ShimOriginals {
   pushState: History["pushState"];
   replaceState: History["replaceState"];
   addEventListener: EventTarget["addEventListener"];
+  /**
+   * `MessageChannel` and the `MessagePort` methods the shim makes a task of
+   * its own with (seams-environment.ts `ownTask`); `undefined` where the
+   * platform has no channels.
+   */
+  messageChannel:
+    | {
+        Channel: typeof MessageChannel;
+        postMessage: MessagePort["postMessage"];
+        start: MessagePort["start"];
+        close: MessagePort["close"];
+      }
+    | undefined;
 }
 
 /** The layout getters §10.1 lists, and the prototype that defines each. */
@@ -191,6 +204,15 @@ export function captureOriginals(w: Window & typeof globalThis): ShimOriginals {
     pushState: w.History.prototype.pushState,
     replaceState: w.History.prototype.replaceState,
     addEventListener: w.EventTarget.prototype.addEventListener,
+    messageChannel:
+      typeof w.MessageChannel === "function" && w.MessagePort !== undefined
+        ? {
+            Channel: w.MessageChannel,
+            postMessage: w.MessagePort.prototype.postMessage,
+            start: w.MessagePort.prototype.start,
+            close: w.MessagePort.prototype.close,
+          }
+        : undefined,
   };
 }
 

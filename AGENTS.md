@@ -70,9 +70,14 @@ This is a monorepo managed with npm workspaces:
   `src/placement.ts`) is found with the HTML tokenizer in `src/html-scan.ts`,
   never a text search (a `<head>` in a comment or a script is not the head);
   the replay runner's gates use the same scanner, so record and replay agree
-  on positions (`tests/boundary/bootstrap-placement.test.ts`). It follows an
-  encoding declaration that begins the head, which must stay in the first
-  1024 bytes for the encoding prescan. Only when asked (`--import-seam`, the
+  on positions (`tests/boundary/bootstrap-placement.test.ts`). The page's
+  encoding declaration must stay in the first 1024 bytes for the encoding
+  prescan: the bootstrap follows a declaration that only inert elements
+  (a title, comments, `<meta>` elements that declare nothing) precede, and
+  otherwise a copy of the declaration (`<meta charset=<label>>`) goes right
+  before it, marked by the bootstrap's `data-codetracer-boundary-shim=charset`
+  so that stripping removes both (the build hash is the page's) and the
+  replay runner puts the same copy before its stand-in. Only when asked (`--import-seam`, the
   vite plugin's `importSeam`; never by default, since it changes the page's
   own code) the same deploy step rewrites every dynamic `import()` of the
   site's scripts (and of its pages' inline scripts) into a call of the shim's
@@ -82,8 +87,11 @@ This is a monorepo managed with npm workspaces:
   does not change. The replay runner applies the same rewrite to everything
   it serves, at both levels, and in a session that does not declare the seam
   the replay runtime's own `__ctBoundaryImport` ends the replay
-  `NonReplayable` at the page's first dynamic import
-  (`tests/boundary/import-seam.test.ts`, `tests/boundary/replay-resources.test.ts`).
+  `NonReplayable` at the page's first dynamic import, a level-1 session's
+  included (`tests/boundary/import-seam.test.ts`,
+  `tests/boundary/replay-resources.test.ts`, whose
+  `replay_refuses_a_dynamic_import_of_a_level_1_session` runs the
+  conformance suite's reference framework).
   Its browser tests
   (`tests/boundary/record-shim.test.ts`) run real headless Chromium, which the
   dev shell provides (`PLAYWRIGHT_CORE_PATH`, `PLAYWRIGHT_BROWSERS_PATH`).
@@ -160,7 +168,15 @@ This is a monorepo managed with npm workspaces:
   page's listeners through `replay/trusted.ts` (a view whose `isTrusted` is
   `true`), and the values of observers, the performance timeline and idle
   deadlines are `PlatformValue` records (`entries.ts`, one JSON form for both
-  sides); each such value is pinned by `tests/boundary/replay-values.test.ts`,
+  sides); so are the platform's own state the page reads (the referrer, the
+  navigator's, the screen's, the network's, the fonts', a socket's
+  `bufferedAmount`; src 8) and the outcomes of the platform promises that
+  report on it (src 9, after their platform task's `Task`, which the shim
+  settles in a task of its own, a message task, never a timer, which HTML
+  clamps when nested), both in `seams-environment.ts` and
+  `replay/environment.ts`, one table of reads for both sides; what cannot be
+  recorded faithfully there (a canvas read back, the clipboard's contents,
+  the Cache API, a permission's status) is refused. Each such value is pinned by `tests/boundary/replay-values.test.ts`,
   which records a fixture case, replays it to `End`, and replays it again with
   the value edited, which must diverge. A `.ct` is read through the native addon's `readCtfsMember` (the
   canonical CTFS reader), never a second container decoder. The conformance

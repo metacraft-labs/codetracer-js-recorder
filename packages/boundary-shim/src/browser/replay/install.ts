@@ -22,6 +22,7 @@ import {
   replayInput,
   replayNavigation,
 } from "./dom.js";
+import { replayEnvironmentSeams } from "./environment.js";
 import { replayImportSeam } from "./imports.js";
 import { replayMediaSeams } from "./media.js";
 import { replayMessageSeams } from "./message.js";
@@ -68,6 +69,7 @@ export function installReplayShim(
   });
   replayTimeSeams(ctx);
   replayMediaSeams(ctx);
+  replayEnvironmentSeams(ctx);
   replayImportSeam(ctx);
   replayNetSeams(ctx);
   replayXhr(ctx);

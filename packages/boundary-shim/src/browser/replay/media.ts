@@ -15,10 +15,11 @@
 import { PLATFORM_VALUE_SRC } from "@codetracer/boundary-format";
 
 import { replaceAccessor, replaceValue } from "../context.js";
-import { TaskKind } from "../recorder.js";
+
 import { MEDIA_STATE, mediaQuery } from "../seams-media.js";
 import { wrapMethod } from "../seams-platform.js";
 import type { ReplayContext } from "./context.js";
+import { replayPlatformOutcome } from "./environment.js";
 
 type Proto = Record<string, unknown>;
 
@@ -165,34 +166,18 @@ export function replayMediaSeams(ctx: ReplayContext): void {
   const origPlay = media?.play;
   if (media === undefined || typeof origPlay !== "function") return;
   replaceValue(media, "play", function play(this: unknown) {
-    const platform = (origPlay as () => Promise<void>).call(this);
     // The replay browser's own outcome is not the visitor's.
+    const platform = (origPlay as () => Promise<void>).call(this);
     (orig.promiseThen as Promise<void>["then"]).call(
       platform,
       () => undefined,
       () => undefined,
     );
-    const query = mediaQuery("play", this);
-    const id = ctx.nextTaskId();
-    replay.registerTask(id, TaskKind.platform, 0);
-    return new orig.Promise<void>((resolve, reject) => {
-      replay.onTask(id, () => {
-        replay.offTask(id);
-        const outcome = JSON.parse(logged(query, id)) as {
-          resolved?: boolean;
-          rejected?: { name?: string; message?: string };
-        };
-        if (outcome.rejected === undefined) {
-          resolve();
-          return;
-        }
-        reject(
-          new w.DOMException(
-            String(outcome.rejected.message ?? ""),
-            String(outcome.rejected.name ?? "Error"),
-          ),
-        );
-      });
-    });
+    return replayPlatformOutcome(
+      ctx,
+      PLATFORM_VALUE_SRC.media,
+      mediaQuery("play", this),
+      () => undefined,
+    );
   });
 }
