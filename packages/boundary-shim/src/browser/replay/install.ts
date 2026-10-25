@@ -27,6 +27,7 @@ import { replayImportSeam } from "./imports.js";
 import { replayMediaSeams } from "./media.js";
 import { replayMessageSeams } from "./message.js";
 import { replayNetSeams } from "./net.js";
+import { replayNotifications } from "./notification.js";
 import { replayPlatformSeams } from "./platform.js";
 import { replayTimeSeams } from "./time.js";
 import { installTrustedEvents } from "./trusted.js";
@@ -70,6 +71,9 @@ export function installReplayShim(
   replayTimeSeams(ctx);
   replayMediaSeams(ctx);
   replayEnvironmentSeams(ctx);
+  // After the environment seams: the constructor it replaces inherits the
+  // statics they patched.
+  replayNotifications(ctx);
   replayImportSeam(ctx);
   replayNetSeams(ctx);
   replayXhr(ctx);

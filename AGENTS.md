@@ -182,7 +182,8 @@ This is a monorepo managed with npm workspaces:
   read of a media query list's `matches` as `LayoutRead`s), and the events
   that report their changes are input (`seams-dom.ts` `INPUT_EVENT_TYPES`; a
   media query list's `change` at target `mql:<n>`, the visual viewport's at
-  `visualViewport`). A trusted event the page's own code dispatches inside
+  `visualViewport`; a notification's `show`, `click`, `close` and `error`
+  at `notification:<n>`, `seams-notification.ts` and `replay/notification.ts`). A trusted event the page's own code dispatches inside
   a call (`focus()`, `requestSubmit()`) is never input: script lies below
   its listener (`dispatchedFromScript`), and replay lets it through by the
   same test (`jsStackDepth` in `replay/dom.ts`, measured against the depth

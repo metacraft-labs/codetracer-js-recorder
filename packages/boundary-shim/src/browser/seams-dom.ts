@@ -557,7 +557,7 @@ const Effect = {
  * order, at level 0). `name` is the target's name when it is no node or
  * window (a `MediaQueryList`'s `mql:<n>`).
  */
-function recordInput(
+export function recordInput(
   ctx: SeamContext,
   ev: Event,
   name = targetOf(ev.target),

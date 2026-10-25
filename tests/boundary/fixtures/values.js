@@ -592,6 +592,50 @@
       document.body.setAttribute("data-ready", "1");
     },
 
+    // Notifications the page shows. Headless Chromium refuses them (its
+    // `Notification.permission` is "denied" even when the context grants
+    // it), so each gets a real `error`; the visitor's system showing,
+    // closing and the visitor clicking one (`show`, `close`, `click`) are
+    // never dispatched there, and the test writes them into the log. Each
+    // listener of the first reads one value of its own, so each event must
+    // be dispatched at that notification for its read to happen; the second
+    // listens for `error` only. `timestamp` defaults to the visitor's clock.
+    notification: function () {
+      slot(
+        "state",
+        [Notification.permission, Notification.maxActions].join(","),
+      );
+      var first = new Notification("first", { body: "b" });
+      var second = new Notification("second", { timestamp: 7 });
+      slot("ts", first.timestamp + "," + second.timestamp);
+      first.onshow = function () {
+        Notification.permission;
+      };
+      first.addEventListener("close", function () {
+        Notification.maxActions;
+      });
+      first.onclick = function () {
+        first.timestamp;
+      };
+      var errors = [];
+      function failed(which) {
+        return function (e) {
+          errors.push(
+            which + ":" + (e.target === (which === "first" ? first : second)),
+          );
+          if (errors.length === 2) {
+            slot(
+              "errors",
+              errors.sort().join(" ") + ":" + Notification.permission,
+            );
+            done();
+          }
+        };
+      }
+      first.onerror = failed("first");
+      second.addEventListener("error", failed("second"));
+    },
+
     // A label the user clicks: the browser forwards the click to its
     // checkbox (HTML, the label element's activation behavior), which the
     // page's listener counts.

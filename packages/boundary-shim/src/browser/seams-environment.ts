@@ -211,6 +211,13 @@ export const STATIC_STATE_READS: readonly {
     name: "permission",
     query: "Notification.permission",
   },
+  // How many actions a notification may show, which the visitor's system
+  // decides (Notifications API, `maxActions`).
+  {
+    global: "Notification",
+    name: "maxActions",
+    query: "Notification.maxActions",
+  },
 ];
 
 /**

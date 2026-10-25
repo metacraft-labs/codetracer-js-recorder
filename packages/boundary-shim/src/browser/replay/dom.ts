@@ -30,6 +30,7 @@ import {
   VISUAL_VIEWPORT_EVENT_TYPES,
   VISUAL_VIEWPORT_TARGET,
 } from "../seams-dom.js";
+import { NOTIFICATION_EVENT_TYPES } from "../seams-notification.js";
 import { patchStorageEvents } from "../seams-storage.js";
 import { resolveTarget, targetOf } from "../targets.js";
 import type { RecordOf } from "@codetracer/boundary-format";
@@ -551,6 +552,29 @@ const VISUAL_VIEWPORT_EVENT: EventShape = {
   composed: false,
 };
 
+/**
+ * An event at a notification (Notifications API, "fire an event named
+ * show/close/error on notification"): a plain event that does not bubble.
+ */
+const NOTIFICATION_EVENT: EventShape = {
+  ctor: "Event",
+  bubbles: false,
+  cancelable: false,
+  composed: false,
+};
+
+/**
+ * A notification's `click` (Notifications API, "activating a
+ * notification"): a plain event, cancelable (cancelling it keeps the page
+ * from being focused).
+ */
+const NOTIFICATION_CLICK: EventShape = {
+  ctor: "Event",
+  bubbles: false,
+  cancelable: true,
+  composed: false,
+};
+
 /** `DomEffect.effect` (§5.2). */
 const Effect = {
   value: 1,
@@ -813,13 +837,18 @@ export function replayInput(ctx: ReplayContext): ReplayInjector {
       // found among the lists, and only its `change` is input.
       // So is the visual viewport (`visualViewport`), whose events are
       // plain ones.
+      // So is a notification the page made (`notification:<n>`), whose
+      // events are plain ones too.
       const isList = input.target.startsWith("mql:");
       const isViewport = input.target === VISUAL_VIEWPORT_TARGET;
+      const isNotification = input.target.startsWith("notification:");
       const target: EventTarget | null = isList
         ? (ctx.mediaQueries.get(input.target) ?? null)
         : isViewport
           ? (w.visualViewport ?? null)
-          : resolveTarget(input.target, doc);
+          : isNotification
+            ? (ctx.notifications.get(input.target) ?? null)
+            : resolveTarget(input.target, doc);
       if (target === null) return `target ${input.target} does not resolve`;
       const shape = isList
         ? input.type === "change"
@@ -829,7 +858,13 @@ export function replayInput(ctx: ReplayContext): ReplayInjector {
           ? VISUAL_VIEWPORT_EVENT_TYPES.includes(input.type)
             ? VISUAL_VIEWPORT_EVENT
             : undefined
-          : SHAPES[input.type];
+          : isNotification
+            ? NOTIFICATION_EVENT_TYPES.includes(input.type)
+              ? input.type === "click"
+                ? NOTIFICATION_CLICK
+                : NOTIFICATION_EVENT
+              : undefined
+            : SHAPES[input.type];
       if (shape === undefined)
         return `event type ${input.type} is not captured`;
       const props = JSON.parse(input.props) as Record<string, unknown>;

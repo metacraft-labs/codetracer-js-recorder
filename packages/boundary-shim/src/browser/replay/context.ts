@@ -40,6 +40,11 @@ export interface ReplayContext {
    */
   mediaQueries: Map<string, MediaQueryList>;
   /**
+   * The notifications the page made, by their target (`notification:<n>`,
+   * seams-notification.ts `notificationTarget`), for the injector.
+   */
+  notifications: Map<string, Notification>;
+  /**
    * The input replay is dispatching (`event`, undefined between inputs) and
    * the JavaScript stack depth its own listeners run at (`depth`, Infinity
    * until measured), which tells a trusted event the page's listener caused
@@ -47,8 +52,8 @@ export interface ReplayContext {
    * `replayInput`). The shim's first listener on every target an input can
    * be injected at measures it: the window's capture listeners for a node,
    * and the listeners the shim puts on a `MediaQueryList` (replayLayout's
-   * `matchMedia`) and on the visual viewport, which no event at the window
-   * passes.
+   * `matchMedia`), on the visual viewport and on a notification
+   * (replay/notification.ts), which no event at the window passes.
    */
   injection: { event: Event | undefined; depth: number };
 }
@@ -82,6 +87,7 @@ export function newReplayContext(
       },
     },
     mediaQueries: new Map(),
+    notifications: new Map(),
     injection: { event: undefined, depth: Infinity },
   };
 }

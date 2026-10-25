@@ -892,6 +892,108 @@ describe("replay gives a page the values it read", () => {
   );
 
   it(
+    "replay_dispatches_a_notifications_events_at_it_and_answers_its_timestamp",
+    async () => {
+      // Refused by the visitor's system: a real `error` at each.
+      const { records: rs, slots } = await rr.recordPage(
+        "values.html?case=notification",
+      );
+      expect(slots).toContain("errors=first:true second:true:denied");
+      const inputs = rs
+        .filter((r): r is RecordOf<"Input"> => r.record === "Input")
+        .filter((r) => r.target.startsWith("notification:"))
+        .map((r) => `${r.type}@${r.target}`);
+      expect(inputs.sort()).toEqual([
+        "error@notification:1",
+        "error@notification:2",
+      ]);
+      // The second notification's timestamp is the page's own, logged under
+      // its own target.
+      expect(
+        rs.some(
+          (r) =>
+            r.record === "PlatformValue" &&
+            r.query === 'Notification.timestamp["notification:2"]' &&
+            r.value === "7",
+        ),
+      ).toBe(true);
+      expectReplayed(await replay(rs), rs);
+      // The visitor's clock and actions, changed in the log, reach the page
+      // as changed.
+      for (const query of [
+        'Notification.timestamp["notification:1"]',
+        "Notification.maxActions",
+      ]) {
+        const at = indexWhere(rs, "PlatformValue", (r) => r.query === query);
+        expectDiverged(
+          await replay(
+            replaced<"PlatformValue">(rs, at, {
+              value: perturb((rs[at] as RecordOf<"PlatformValue">).value),
+            }),
+          ),
+          "CheckpointMismatch",
+          lastCheckpoint(rs),
+        );
+      }
+      // A notification the page never made is a typed divergence.
+      const first = indexWhere(
+        rs,
+        "Input",
+        (r) => r.target === "notification:1",
+      );
+      expectDiverged(
+        await replay(
+          replaced<"Input">(rs, first, { target: "notification:9" }),
+        ),
+        "InjectionFailed",
+        seqAt(rs, first),
+      );
+      // The visitor's system showing and closing the first, and the visitor
+      // clicking it, written into the recording: replay dispatches each at
+      // the first notification, whose listener makes the event's read.
+      const events = [
+        {
+          type: "show",
+          target: "notification:1",
+          reads: [["Notification.permission", '"granted"']] as [
+            string,
+            string,
+          ][],
+        },
+        {
+          type: "click",
+          target: "notification:1",
+          reads: [['Notification.timestamp["notification:1"]', "123"]] as [
+            string,
+            string,
+          ][],
+        },
+        {
+          type: "close",
+          target: "notification:1",
+          reads: [["Notification.maxActions", "2"]] as [string, string][],
+        },
+      ];
+      const written = withInputsBeforeEnd(rs, events);
+      expectReplayed(await replay(written), written);
+      // Each at the second notification reaches no listener of its: its
+      // read is never made.
+      for (const event of events) {
+        const misplaced = withInputsBeforeEnd(rs, [
+          { ...event, target: "notification:2" },
+        ]);
+        const input = misplaced.map((r) => r.record).lastIndexOf("Input");
+        expectDiverged(
+          await replay(misplaced),
+          "MissingRead",
+          seqAt(misplaced, input + 1),
+        );
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  it(
     "input_is_told_from_the_page_events_when_the_page_replaced_the_global_error",
     async () => {
       const { records: rs, slots } = await rr.recordPage(
