@@ -155,8 +155,11 @@ export class Recorder {
 
   /** Write `Header` and `Env`, the two records without a `seq`. */
   start(header: SeqFields<"Header">, env: SeqFields<"Env">): void {
+    if (!this.recording) return;
     this.guard(() => {
       this.push({ record: "Header", ...header } as BoundaryRecord);
+      // The Header sink may stop this session before startup can continue.
+      if (!this.recording) return;
       this.push({ record: "Env", ...env } as BoundaryRecord);
     });
   }
@@ -168,16 +171,29 @@ export class Recorder {
   emit<K extends SeqKind>(kind: K, fields: SeqFields<K>): void {
     if (this.state !== "recording") return;
     if (kind !== "Loading" && kind !== "DocTask") this.progress?.beforeRecord();
+    // Progress may emit Loading/DocTask through a sink that stops the session.
+    if (!this.recording) return;
     const record = {
       record: kind,
       seq: this.nextSeq,
       ...fields,
     } as unknown as BoundaryRecord;
-    // The seq is committed only once the frame is encoded, so a record that
-    // fails to encode leaves no hole: the Refusal written by `fault` takes
-    // its seq.
-    this.push(record);
+    // Encode before reserving a seq: an encoder failure must leave no hole.
+    // Reserve before calling the sink, which may synchronously fault this
+    // session after accepting the frame. Its Refusal needs the following seq.
+    const frame = this.encode(record);
+    const seq = this.nextSeq;
     this.nextSeq += 1n;
+    try {
+      this.append(frame, seq);
+    } catch (error) {
+      // A sink that rejected the frame without changing this session leaves
+      // its seq available to the guard's Refusal. Never roll back a nested
+      // write or a terminal callback's state.
+      if (this.recording && this.nextSeq === seq + 1n) this.nextSeq = seq;
+      throw error;
+    }
+    if (!this.recording) return;
     if (kind === "Checkpoint") {
       this.recordsSinceCheckpoint = 0;
     } else {
@@ -270,12 +286,18 @@ export class Recorder {
   checkpoint(): void {
     if (this.state !== "recording") return;
     const stateHash = this.opts.checkpointHash();
+    // Providers may flush framework work that stops this session. Do not call
+    // another provider or commit checkpoint bookkeeping after that boundary.
+    if (!this.recording) return;
+    const domDigest = this.opts.checkpointDomDigest?.() ?? "";
+    // emit rechecks state before writing if the DOM provider stopped recording.
     this.emit("Checkpoint", {
       ordinal: this.checkpointOrdinal,
       scheme: this.opts.checkpointScheme,
       state_hash: stateHash,
-      dom_digest: this.opts.checkpointDomDigest?.() ?? "",
+      dom_digest: domDigest,
     });
+    if (!this.recording) return;
     this.checkpointOrdinal += 1;
     this.monoAtCheckpoint = this.monoNow;
     this.wallAtCheckpoint = this.wallNow;
@@ -295,18 +317,31 @@ export class Recorder {
       ) {
         this.checkpoint();
       }
+      // A final checkpoint (including its sink) can halt or fault the session.
+      if (!this.recording) return;
       const end = {
         record: "End",
         last_seq: this.nextSeq - 1n,
         reason,
       } as BoundaryRecord;
+      // An encoding failure still faults an active session. Once encoded,
+      // close before delivery: terminal sink callbacks must not append records.
+      const frame = this.encode(end);
+      this.state = "ended";
       const sink = this.opts.sink;
       if (sink === undefined) {
-        this.push(end);
+        this.frames.push(frame);
       } else {
-        sink.end(unloading, this.encode(end));
+        try {
+          sink.end(unloading, frame);
+        } catch (error) {
+          // Acceptance is unknown: never append after a possible End or retry.
+          // Remain closed and clean up; this void API cannot promise delivery.
+          this.state = "faulted";
+          this.haltSink();
+          throw error;
+        }
       }
-      this.state = "ended";
     });
   }
 
@@ -326,6 +361,9 @@ export class Recorder {
    */
   fault(error: unknown): void {
     if (this.inFault || this.state !== "recording") return;
+    // Describing the error and delivering Refusal both call external code.
+    // Close first; only the private terminal push below may write the refusal.
+    this.state = "faulted";
     this.inFault = true;
     try {
       const detail = describe(error);
@@ -341,13 +379,8 @@ export class Recorder {
         // The encoder cannot write even the refusal: the log simply stops.
       }
     } finally {
-      this.state = "faulted";
       this.inFault = false;
-      try {
-        this.opts.sink?.halt();
-      } catch {
-        // The sink's own failure is its own (it never throws).
-      }
+      this.haltSink();
     }
   }
 
@@ -391,13 +424,25 @@ export class Recorder {
     return out;
   }
 
+  /** Cleanup is terminal too, and may not throw into the page. */
+  private haltSink(): void {
+    try {
+      this.opts.sink?.halt();
+    } catch {
+      // A failed sink cannot be recovered by writing more frames to it.
+    }
+  }
+
   private push(record: BoundaryRecord): void {
-    const frame = this.encode(record);
+    this.append(this.encode(record), "seq" in record ? record.seq : undefined);
+  }
+
+  private append(frame: Uint8Array, seq: bigint | undefined): void {
     const sink = this.opts.sink;
     if (sink === undefined) {
       this.frames.push(frame);
     } else {
-      sink.append(frame, "seq" in record ? record.seq : undefined);
+      sink.append(frame, seq);
     }
   }
 
