@@ -874,75 +874,67 @@ function findSuperCallIndex(stmts: Statement[]): number {
   return -1;
 }
 
-// ---------- check if function body has explicit return ----------
+// ---------- check whether control can fall off the end of a body ----------
 
-function hasExplicitReturn(stmts: Statement[]): boolean {
-  for (const stmt of stmts) {
-    if (stmt.type === "ReturnStatement") return true;
-    // Check nested blocks but not nested functions (returns in nested functions don't count)
-    if (stmt.type === "BlockStatement") {
-      if (hasExplicitReturn((stmt as BlockStatement).stmts)) return true;
-    }
-    if (stmt.type === "IfStatement") {
+/**
+ * Whether control can reach the end of the statement list `stmts`, so that a
+ * function body ending there needs the implicit `__ct.ret` after it. A call
+ * that returns by falling off its end must record its exit like one that
+ * returns explicitly, even when the function also has an early `return`:
+ * without it the trace leaves the call open, every later event is one frame
+ * deeper than it ran, and the frame never closes.
+ *
+ * Conservative in the direction of recording: only a list whose last
+ * statement certainly leaves the function (a `return`, a `throw`, a block
+ * that ends so, an `if` both of whose branches end so, a `try` whose paths
+ * all end so) is taken not to complete. Anything else gets the implicit
+ * return, which is unreachable, and so never runs, when the body cannot in
+ * fact fall off its end (a `switch` whose every case returns, an endless
+ * loop). Completion as ECMA-262 defines it for statements:
+ * https://tc39.es/ecma262/#sec-completion-record-specification-type
+ */
+function completesNormally(stmts: Statement[]): boolean {
+  if (stmts.length === 0) return true;
+  return statementCompletesNormally(stmts[stmts.length - 1]);
+}
+
+/** {@link completesNormally} for one statement. */
+function statementCompletesNormally(stmt: Statement): boolean {
+  switch (stmt.type) {
+    case "ReturnStatement":
+    case "ThrowStatement":
+      return false;
+    case "BlockStatement":
+      return completesNormally((stmt as BlockStatement).stmts);
+    case "IfStatement": {
       const ifStmt = stmt as { consequent: Statement; alternate?: Statement };
-      if (ifStmt.consequent.type === "ReturnStatement") return true;
-      if (
-        ifStmt.consequent.type === "BlockStatement" &&
-        hasExplicitReturn((ifStmt.consequent as BlockStatement).stmts)
-      )
-        return true;
-      if (ifStmt.alternate) {
-        if (ifStmt.alternate.type === "ReturnStatement") return true;
-        if (
-          ifStmt.alternate.type === "BlockStatement" &&
-          hasExplicitReturn((ifStmt.alternate as BlockStatement).stmts)
-        )
-          return true;
-      }
+      return (
+        ifStmt.alternate === undefined ||
+        ifStmt.alternate === null ||
+        statementCompletesNormally(ifStmt.consequent) ||
+        statementCompletesNormally(ifStmt.alternate)
+      );
     }
-    if (stmt.type === "SwitchStatement") {
-      const sw = stmt as { cases: Array<{ consequent: Statement[] }> };
-      for (const c of sw.cases) {
-        if (hasExplicitReturn(c.consequent)) return true;
-      }
-    }
-    if (stmt.type === "TryStatement") {
+    case "TryStatement": {
       const tr = stmt as {
         block: BlockStatement;
-        handler?: { body: BlockStatement };
-        finalizer?: BlockStatement;
+        handler?: { body: BlockStatement } | null;
+        finalizer?: BlockStatement | null;
       };
-      if (hasExplicitReturn(tr.block.stmts)) return true;
-      if (tr.handler && hasExplicitReturn(tr.handler.body.stmts)) return true;
-      if (tr.finalizer && hasExplicitReturn(tr.finalizer.stmts)) return true;
+      // A finally block that leaves the function overrides the rest.
+      if (tr.finalizer && !completesNormally(tr.finalizer.stmts)) return false;
+      return (
+        completesNormally(tr.block.stmts) ||
+        (tr.handler !== undefined &&
+          tr.handler !== null &&
+          completesNormally(tr.handler.body.stmts))
+      );
     }
-    // Loop bodies
-    if (
-      stmt.type === "WhileStatement" ||
-      stmt.type === "DoWhileStatement" ||
-      stmt.type === "ForStatement" ||
-      stmt.type === "ForInStatement" ||
-      stmt.type === "ForOfStatement"
-    ) {
-      const loop = stmt as { body: Statement };
-      if (loop.body.type === "ReturnStatement") return true;
-      if (
-        loop.body.type === "BlockStatement" &&
-        hasExplicitReturn((loop.body as BlockStatement).stmts)
-      )
-        return true;
-    }
-    if (stmt.type === "LabeledStatement") {
-      const labeled = stmt as { body: Statement };
-      if (labeled.body.type === "ReturnStatement") return true;
-      if (
-        labeled.body.type === "BlockStatement" &&
-        hasExplicitReturn((labeled.body as BlockStatement).stmts)
-      )
-        return true;
-    }
+    default:
+      // Loops, `switch`, labelled statements (a `break` may leave them) and
+      // every simple statement can complete normally.
+      return true;
   }
-  return false;
 }
 
 // ---------- ensure block wrapping for single-statement bodies ----------
@@ -2064,7 +2056,7 @@ function transformClassMethod(cm: ClassMethod, ctx: TransformContext): void {
  *    (or after super() for derived constructors)
  * 2. Rewrite return statements to use __ct.ret(fnId, expr)
  * 3. Insert step calls before each executable statement
- * 4. Append implicit __ct.ret(fnId) if no explicit return
+ * 4. Append implicit __ct.ret(fnId) where control can fall off the end
  */
 /**
  * Build the `__ct.step` call for a statement, registering its site and
@@ -2207,8 +2199,9 @@ function instrumentFunctionBody(
     }
   }
 
-  // Append implicit __ct.ret if no explicit return found
-  if (!hasExplicitReturn(stmts)) {
+  // Append the implicit __ct.ret where control can fall off the end, even
+  // when the body also returns explicitly elsewhere (completesNormally).
+  if (completesNormally(stmts)) {
     const bodySpan = body.span;
     const resolved = resolveSpan(bodySpan.end, ctx);
     ctx.manifest.addReturnSite(

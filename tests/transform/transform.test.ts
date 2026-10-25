@@ -139,6 +139,80 @@ function greet(name) {
     expect(fnBodyMatch![1]).toContain("__ct.ret(1)");
   });
 
+  it("records the exit of a call that falls off its end after an early return", () => {
+    // Every path through each function, run with a `__ct` that only counts
+    // entries and exits per function (the same stand-in as the semantic
+    // equivalence tests below: these tests check the instrumented code's
+    // calls, not a recorder): each call that ends, by `return`, by falling
+    // off its end, or by a `return` inside `try`/`finally`, must report its
+    // exit, so the trace closes every call it opened.
+    const original = `
+function early(x) {
+  if (x) {
+    return 1;
+  }
+  side.push(x);
+}
+function bare(x) {
+  if (x) return;
+  side.push(x);
+}
+function nested(x) {
+  for (let i = 0; i < 3; i++) {
+    if (i === x) return i;
+  }
+}
+function tryFinally(x) {
+  try {
+    if (x) return "t";
+  } finally {
+    side.push("f");
+  }
+}
+function bothBranches(x) {
+  if (x) return 1;
+  else return 2;
+}
+function main() {
+  return [true, false, 1, 9].map((x) => [
+    early(x), bare(x), nested(x), tryFinally(x), bothBranches(x),
+  ]);
+}
+`;
+    const { code } = inst(original);
+    const run = new Function(
+      "side",
+      `
+      const counts = {};
+      const at = (id) => (counts[id] = counts[id] || { enter: 0, ret: 0 });
+      const __ct = {
+        step: function(_siteId) {},
+        enter: function(fnId, _args) { at(fnId).enter++; },
+        ret: function(fnId, value) { at(fnId).ret++; return value; },
+        write: function(_siteId) {},
+      };
+      ${code}
+      const result = main();
+      return { result, counts };
+    `,
+    );
+    const { result, counts } = run([]) as {
+      result: unknown[];
+      counts: Record<string, { enter: number; ret: number }>;
+    };
+    // The instrumented program still computes what the original does.
+    expect(result).toEqual(
+      new Function("side", original + "\nreturn main();")([]),
+    );
+    // Vacuity guard: every function ran (the six above, the arrow and the
+    // module-level frame).
+    expect(Object.keys(counts).length).toBe(8);
+    for (const [fnId, c] of Object.entries(counts)) {
+      expect(c.enter, `function ${fnId}`).toBeGreaterThan(0);
+      expect(c.ret, `function ${fnId}`).toBe(c.enter);
+    }
+  });
+
   it("instruments module-level code as a top-level function", () => {
     const result = inst(`
 const x = 1;
