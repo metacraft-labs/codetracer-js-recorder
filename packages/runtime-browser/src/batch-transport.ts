@@ -232,6 +232,12 @@ export interface TransportOriginals {
   Promise: PromiseConstructor;
   mathRandom: () => number;
   performanceNow: (() => number) | undefined;
+  /**
+   * `Document.prototype.visibilityState`'s accessor: a boundary shim logs
+   * the page's reads of it (record) or answers them from the log (replay),
+   * and the transport's own read, when the page is hidden, is neither.
+   */
+  visibilityState: { descriptor: PropertyDescriptor } | undefined;
 }
 
 function moduleOriginals(): TransportOriginals {
@@ -239,8 +245,16 @@ function moduleOriginals(): TransportOriginals {
     fetch?: typeof fetch;
     Navigator?: { prototype: Navigator };
     EventTarget?: { prototype: EventTarget };
+    Document?: { prototype: Document };
     performance?: { now?: () => number };
   };
+  const visibility =
+    g.Document === undefined
+      ? undefined
+      : Object.getOwnPropertyDescriptor(
+          g.Document.prototype,
+          "visibilityState",
+        );
   return {
     fetch: g.fetch,
     sendBeacon: g.Navigator?.prototype.sendBeacon,
@@ -251,10 +265,26 @@ function moduleOriginals(): TransportOriginals {
     Promise,
     mathRandom: Math.random,
     performanceNow: g.performance?.now,
+    visibilityState:
+      visibility?.get === undefined ? undefined : { descriptor: visibility },
   };
 }
 
 const MODULE_ORIGINALS = moduleOriginals();
+
+/**
+ * `doc.visibilityState` read through the captured accessor (`orig`), so a
+ * boundary shim's seam never sees it.
+ */
+export function visibilityOf(
+  doc: Document,
+  orig: Pick<TransportOriginals, "visibilityState">,
+): string | undefined {
+  const get = orig.visibilityState?.descriptor.get;
+  // No accessor to capture (not a browser document): nothing patched it.
+  if (get === undefined) return doc.visibilityState;
+  return String(get.call(doc) as unknown);
+}
 
 /**
  * The originals the transport uses: the replay runner's
@@ -285,6 +315,7 @@ export function resolveTransportOriginals(
     Promise: pick("Promise"),
     mathRandom: pick("mathRandom"),
     performanceNow: pick("performanceNow"),
+    visibilityState: pick("visibilityState"),
   };
 }
 
@@ -1232,7 +1263,7 @@ export class HttpBatchTransport {
     if (doc !== undefined) {
       add.call(doc, "visibilitychange", () =>
         this.guard(() => {
-          if (doc.visibilityState === "hidden") this.drainNow();
+          if (visibilityOf(doc, this.orig) === "hidden") this.drainNow();
         }),
       );
     }

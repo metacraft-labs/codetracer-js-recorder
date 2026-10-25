@@ -498,6 +498,422 @@
       document.body.setAttribute("data-ready", "1");
     },
 
+    // The viewport changing under the page: the window's `resize`, the
+    // visual viewport's, and the `change` of the media query lists whose
+    // `matches` flips, with what each listener then reads of the window's
+    // geometry and the lists. Two lists of one query are two targets.
+    viewport: function () {
+      var seen = [];
+      var narrow = matchMedia("(max-width: 500px)");
+      var narrow2 = matchMedia("(max-width: 500px)");
+      var wide = matchMedia("(min-width: 5000px)");
+      slot(
+        "start",
+        [
+          innerWidth,
+          innerHeight,
+          outerWidth,
+          devicePixelRatio,
+          scrollY,
+          narrow.matches,
+          wide.matches,
+          visualViewport.width,
+        ].join(","),
+      );
+      var finishing = false;
+      function finish() {
+        if (finishing) return;
+        finishing = true;
+        setTimeout(function () {
+          slot("seen", seen.join(" "));
+          done();
+        }, 300);
+      }
+      window.addEventListener("resize", function (e) {
+        seen.push(
+          "resize:" +
+            innerWidth +
+            "x" +
+            innerHeight +
+            ":" +
+            narrow.matches +
+            ":" +
+            (e.target === window),
+        );
+        finish();
+      });
+      narrow.addEventListener("change", function (e) {
+        seen.push("narrow:" + e.matches + ":" + e.media + ":" + narrow.matches);
+      });
+      narrow2.onchange = function (e) {
+        seen.push("narrow2:" + e.matches + ":" + (e.target === narrow2));
+      };
+      visualViewport.addEventListener("resize", function () {
+        seen.push("vv:" + visualViewport.width + ":" + visualViewport.scale);
+      });
+      document.body.setAttribute("data-ready", "1");
+    },
+
+    // Focus the page's listeners of a media query list's `change` and of the
+    // visual viewport's `resize` move: no node, so the window's listeners
+    // never see those events, and the `focus` each `focus()` dispatches
+    // inside the page's listener is the page's own (not input), which must
+    // reach its listeners on replay as on record.
+    "viewport-focus": function () {
+      var seen = [];
+      var narrow = matchMedia("(max-width: 500px)");
+      var a = document.createElement("input");
+      a.id = "byList";
+      var b = document.createElement("input");
+      b.id = "byViewport";
+      document.body.appendChild(a);
+      document.body.appendChild(b);
+      function onFocus(e) {
+        seen.push(
+          "focus:" + e.target.id + ":" + e.isTrusted + ":" + (Date.now() > 0),
+        );
+      }
+      a.addEventListener("focus", onFocus);
+      b.addEventListener("focus", onFocus);
+      narrow.addEventListener("change", function () {
+        seen.push("change");
+        a.focus();
+      });
+      visualViewport.addEventListener("resize", function () {
+        seen.push("vv");
+        b.focus();
+      });
+      window.addEventListener("resize", function () {
+        setTimeout(function () {
+          slot("seen", seen.join(" "));
+          done();
+        }, 300);
+      });
+      document.body.setAttribute("data-ready", "1");
+    },
+
+    // A label the user clicks: the browser forwards the click to its
+    // checkbox (HTML, the label element's activation behavior), which the
+    // page's listener counts.
+    "label-click": function () {
+      var label = document.createElement("label");
+      label.id = "lab";
+      label.textContent = "toggle";
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.id = "labbox";
+      label.appendChild(box);
+      document.body.appendChild(label);
+      var clicks = 0;
+      box.addEventListener("click", function () {
+        clicks++;
+        Date.now();
+        slot("box", clicks + ":" + box.checked);
+      });
+      box.addEventListener("change", function () {
+        setTimeout(function () {
+          slot("clicks", clicks);
+          done();
+        }, 100);
+      });
+      document.body.setAttribute("data-ready", "1");
+    },
+
+    // A page that replaces the global `Error` with a function that makes
+    // the platform's errors (as error-tracking and zone libraries have
+    // done): the stack the shim reads to tell the browser's events from the
+    // page's must still be the platform's. The user's click is input, and
+    // the focus the page's listener moves is not.
+    "error-replaced": function () {
+      var NativeError = Error;
+      window.Error = function Error(message) {
+        return new NativeError(message);
+      };
+      window.Error.prototype = NativeError.prototype;
+      var button = document.createElement("button");
+      button.id = "err";
+      button.textContent = "go";
+      var input = document.createElement("input");
+      input.id = "errfield";
+      document.body.appendChild(button);
+      document.body.appendChild(input);
+      input.addEventListener("focus", function () {
+        Date.now();
+      });
+      button.addEventListener("click", function () {
+        input.focus();
+        slot("clicked", Date.now() > 0);
+        done();
+      });
+      document.body.setAttribute("data-ready", "1");
+    },
+
+    // Focus the page's own code moves: `focus()` dispatches `focus` and
+    // `focusin` (trusted) inside the call, in the page's task.
+    "script-focus": function () {
+      var seen = [];
+      var input = document.createElement("input");
+      input.id = "moved";
+      document.body.appendChild(input);
+      input.addEventListener("focus", function (e) {
+        seen.push("focus:" + e.isTrusted + ":" + (Date.now() > 0));
+      });
+      setTimeout(function () {
+        seen.push("before");
+        input.focus();
+        seen.push("after:" + (document.activeElement === input));
+        slot("seen", seen.join(" "));
+        done();
+      }, 10);
+    },
+
+    // Focus the page's listener of the user's click moves, and a checkbox
+    // the page clicks itself: each event is dispatched inside the page's
+    // own call, in the click's task.
+    "click-focus": function () {
+      var seen = [];
+      var button = document.createElement("button");
+      button.id = "go";
+      button.textContent = "go";
+      var input = document.createElement("input");
+      input.id = "field";
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.id = "box2";
+      document.body.appendChild(button);
+      document.body.appendChild(input);
+      document.body.appendChild(box);
+      input.addEventListener("focus", function (e) {
+        seen.push("focus:" + e.isTrusted + ":" + (Date.now() > 0));
+      });
+      box.addEventListener("change", function (e) {
+        seen.push("change:" + e.isTrusted + ":" + box.checked);
+      });
+      button.addEventListener("click", function () {
+        seen.push("click");
+        input.focus();
+        box.click();
+        seen.push("after:" + (document.activeElement === input));
+        slot("seen", seen.join(" "));
+        done();
+      });
+      document.body.setAttribute("data-ready", "1");
+    },
+
+    // A field the user focuses, whose listener reads the clock: on replay
+    // the focus effect is applied, then the recorded `focus` injected, and
+    // the listener runs once, for the latter.
+    "user-focus": function () {
+      var input = document.createElement("input");
+      input.id = "typed";
+      document.body.appendChild(input);
+      var seen = 0;
+      input.addEventListener("focus", function () {
+        seen++;
+        Date.now();
+        slot("focused", seen);
+        done();
+      });
+      document.body.setAttribute("data-ready", "1");
+    },
+
+    // A media element's own `resize` (its video's size became known), which
+    // is a resource event of the document, never the window's input. The
+    // video plays a canvas's stream (refused on record: `captureStream`
+    // carries the canvas's pixels; this case is checked on record only).
+    "media-resize": function () {
+      var c = document.createElement("canvas");
+      c.width = 8;
+      c.height = 6;
+      c.getContext("2d").fillRect(0, 0, 8, 6);
+      var v = document.createElement("video");
+      v.id = "vid";
+      v.muted = true;
+      document.body.appendChild(v);
+      v.addEventListener("resize", function () {
+        slot("resize", v.videoWidth + "x" + v.videoHeight);
+        done();
+      });
+      v.srcObject = c.captureStream(10);
+      v.play().catch(function () {});
+    },
+
+    // The window losing and regaining the focus (to a frame of its own and
+    // back), and whether the document has it then.
+    focus: function () {
+      var seen = [];
+      window.addEventListener("blur", function () {
+        seen.push("blur:" + document.hasFocus());
+      });
+      window.addEventListener("focus", function () {
+        seen.push("focus:" + document.hasFocus());
+        slot("seen", seen.join(" "));
+        done();
+      });
+      // At a fixed place, so the test clicks into it with the mouse alone
+      // (a locator's click would run the driver's own code in the page).
+      var f = document.createElement("iframe");
+      f.id = "frame";
+      f.style.cssText =
+        "position: fixed; left: 0; top: 300px; width: 200px; height: 100px";
+      f.srcdoc = "<input id=inner>";
+      f.onload = function () {
+        document.body.setAttribute("data-ready", "1");
+      };
+      document.body.appendChild(f);
+      slot("start", document.hasFocus());
+    },
+
+    // The page's lifecycle: `pageshow` (in the document's load, as on
+    // record), and the events headless Chromium never dispatches, which
+    // the tests write into the log (`visibilitychange`, `freeze`, `resume`
+    // at the document, `languagechange` at the window). Their listeners
+    // only read the state those events report, so what they read is
+    // compared read by read; `pageshow`'s writes what it got.
+    lifecycle: function () {
+      window.addEventListener("pageshow", function (e) {
+        slot("pageshow", e.persisted + ":" + e.isTrusted);
+        slot(
+          "state",
+          [
+            document.visibilityState,
+            document.hidden,
+            document.wasDiscarded,
+          ].join(","),
+        );
+        done();
+      });
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "hidden") document.hidden;
+      });
+      document.onfreeze = function () {
+        document.visibilityState;
+      };
+      document.addEventListener("resume", function () {
+        document.wasDiscarded;
+      });
+      window.onlanguagechange = function () {
+        navigator.language;
+      };
+    },
+
+    // The user leaving: the page asks to stay (the test dismisses the
+    // dialog, so the page and its session go on).
+    beforeunload: function () {
+      window.addEventListener("beforeunload", function (e) {
+        e.preventDefault();
+        e.returnValue = "";
+        slot(
+          "beforeunload",
+          [e.cancelable, e instanceof BeforeUnloadEvent, Date.now() > 0].join(
+            ":",
+          ),
+        );
+        done();
+      });
+      document.body.setAttribute("data-ready", "1");
+    },
+
+    // The permission- and device-dependent state a page reads, and the
+    // platform promises that report on it.
+    device: function () {
+      var order = [];
+      function note(what) {
+        order.push(what);
+      }
+      function failed(what) {
+        return function (e) {
+          note(what + ":rejected:" + e.name);
+        };
+      }
+      slot(
+        "state",
+        [
+          Notification.permission,
+          document.hasFocus(),
+          document.visibilityState,
+          document.hidden,
+          document.wasDiscarded,
+          navigator.userActivation.isActive,
+          navigator.userActivation.hasBeenActive,
+          visualViewport.scale,
+          visualViewport.offsetTop,
+        ].join(","),
+      );
+      var pending = [
+        document.hasStorageAccess().then(function (v) {
+          note("hasStorageAccess:" + v);
+        }, failed("hasStorageAccess")),
+        document.requestStorageAccess().then(function (v) {
+          note("requestStorageAccess:" + v);
+        }, failed("requestStorageAccess")),
+        navigator.mediaDevices.enumerateDevices().then(function (list) {
+          var seen = list
+            .map(function (d) {
+              var caps =
+                typeof d.getCapabilities === "function"
+                  ? d.getCapabilities()
+                  : undefined;
+              return [
+                d.kind,
+                d.label,
+                d.deviceId,
+                d.groupId,
+                d instanceof MediaDeviceInfo,
+                d instanceof InputDeviceInfo,
+                d.toJSON().label,
+                caps === undefined ? "-" : caps.width && caps.width.max,
+              ].join("/");
+            })
+            .join(";");
+          note("devices:" + seen);
+          // What the page saw, also as a read the replay checks: a replay
+          // that hands it other devices diverges here, naming them.
+          localStorage.getItem("devices:" + seen);
+        }, failed("devices")),
+        Notification.requestPermission(function (p) {
+          note("callback:" + p);
+        }).then(function (p) {
+          note("permission:" + p);
+        }, failed("permission")),
+      ];
+      Promise.all(pending).then(function () {
+        slot("order", order.join(","));
+        done();
+      });
+    },
+
+    // The promises that are attributes keep their identity across reads,
+    // as the platform's do, and change when the platform's changes.
+    "fonts-identity": function () {
+      var a = document.fonts.ready;
+      var b = document.fonts.ready;
+      var face = new FontFace("ct-identity", "local(ct-no-such-font)");
+      var c = face.loaded;
+      var d = face.loaded;
+      slot("same", [a === b, c === d, a === c].join(","));
+      var left = 2;
+      function settled() {
+        if (--left === 0) done();
+      }
+      a.then(function (s) {
+        slot("ready", s === document.fonts);
+        settled();
+      });
+      c.then(
+        function () {
+          slot("loaded", "resolved");
+          settled();
+        },
+        function (e) {
+          slot("loaded", e.name + ":" + (face.loaded === c));
+          slot("after", document.fonts.ready === a);
+          settled();
+        },
+      );
+      face.load().catch(function () {});
+    },
+
     // What the shim cannot order exactly, and refuses: `?use=` picks one
     // seam (one Refusal is written per feature, so each needs its own
     // recording). The page keeps working: each writes what it got.
@@ -586,6 +1002,46 @@
               slot("permissions", s.state);
               done();
             });
+        },
+        // A live battery status, whose events the browser dispatches.
+        battery: function () {
+          navigator.getBattery().then(
+            function (b) {
+              slot("battery", typeof b.level);
+              done();
+            },
+            function (e) {
+              slot("battery", e.name);
+              done();
+            },
+          );
+        },
+        // The visitor's position: personal data.
+        geolocation: function () {
+          navigator.geolocation.getCurrentPosition(
+            function () {
+              slot("geolocation", "position");
+              done();
+            },
+            function (e) {
+              slot("geolocation", e.code);
+              done();
+            },
+            { timeout: 200 },
+          );
+        },
+        // A camera's stream: media the log cannot carry.
+        "user-media": function () {
+          navigator.mediaDevices.getUserMedia({ video: true }).then(
+            function () {
+              slot("media", "stream");
+              done();
+            },
+            function (e) {
+              slot("media", e.name);
+              done();
+            },
+          );
         },
         // An event the platform dispatches at the document's font set, which
         // the page listens for.

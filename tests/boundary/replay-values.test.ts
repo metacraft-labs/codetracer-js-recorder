@@ -30,6 +30,7 @@ import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  type BoundaryRecord,
   type RecordOf,
   PLATFORM_VALUE_SRC,
   WS_FRAME,
@@ -52,6 +53,7 @@ import {
   startRecordReplay,
   until,
   utf8,
+  withInputsBeforeEnd,
 } from "./record-replay.js";
 
 const TIMEOUT = 120_000;
@@ -381,6 +383,13 @@ describe("replay gives a page the values it read", () => {
           "navigator.permissions.query",
         ],
         ["fonts-event", "unrecordable-platform-task", "document.fonts loading"],
+        ["battery", "unrecordable-platform-task", "navigator.getBattery"],
+        [
+          "geolocation",
+          "geolocation",
+          "navigator.geolocation.getCurrentPosition",
+        ],
+        ["user-media", "media-capture", "navigator.mediaDevices.getUserMedia"],
       ];
       for (const [use, feature, detail] of cases) {
         const rs = await record(`values.html?case=refused&use=${use}`);
@@ -601,6 +610,627 @@ describe("replay gives a page the values it read", () => {
         await replay(replaced<"PlatformValue">(rs, onLine, { value: "true" })),
         "CheckpointMismatch",
         lastCheckpoint(rs),
+      );
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "replay_dispatches_resize_and_media_query_changes_and_answers_the_viewport",
+    async () => {
+      const { records: rs, slots } = await rr.recordPage(
+        "values.html?case=viewport",
+        async (page) => {
+          await until(page, isReady, "the viewport case to listen");
+          await (
+            page as unknown as {
+              setViewportSize(s: {
+                width: number;
+                height: number;
+              }): Promise<void>;
+            }
+          ).setViewportSize({ width: 400, height: 300 });
+        },
+      );
+      // (The pointer, now over another element, also writes its pointer and
+      // mouse events.)
+      const inputs = rs.filter(
+        (r): r is RecordOf<"Input"> =>
+          r.record === "Input" && (r.type === "resize" || r.type === "change"),
+      );
+      // The window's resize, the visual viewport's, and both lists of the
+      // query that flipped (the third list's did not), each at its target.
+      expect(inputs.map((r) => `${r.type}@${r.target}`).sort()).toEqual(
+        [
+          "change@mql:1",
+          "change@mql:2",
+          "resize@visualViewport",
+          "resize@win",
+        ].sort(),
+      );
+      const change = inputs.find((r) => r.target === "mql:1")!;
+      expect(JSON.parse(change.props)).toEqual({
+        matches: true,
+        media: "(max-width: 500px)",
+      });
+      const seen = slots.find((s) => s.startsWith("seen="))!;
+      expect(seen).toContain("resize:400x300:true:true");
+      expect(seen).toContain("narrow:true:(max-width: 500px):true");
+      expect(seen).toContain("narrow2:true:true");
+      // Every read of the window's geometry and of a list's `matches` is in
+      // the log.
+      const layout = rs
+        .map((r, i) => [r, i] as const)
+        .filter(([r]) => r.record === "LayoutRead") as (readonly [
+        RecordOf<"LayoutRead">,
+        number,
+      ])[];
+      const props = new Set(layout.map(([r]) => r.prop));
+      for (const p of [
+        "innerWidth",
+        "innerHeight",
+        "outerWidth",
+        "devicePixelRatio",
+        "scrollY",
+        "matchMedia:(max-width: 500px)",
+        "matchMedia:(min-width: 5000px)",
+      ]) {
+        expect(props, p).toContain(p);
+      }
+      expect(layout.every(([r]) => r.target === "win")).toBe(true);
+      expectReplayed(await replay(rs), rs);
+      // Each read, changed in the log, reaches the page as changed.
+      for (const [r, i] of layout) {
+        expectDiverged(
+          await replay(
+            replaced<"LayoutRead">(rs, i, { value: perturb(r.value) }),
+          ),
+          "CheckpointMismatch",
+          lastCheckpoint(rs),
+        );
+      }
+      // A change injected at another list reaches that list's listeners,
+      // not the first list's, whose read of `matches` is then never made.
+      const at = rs.indexOf(change);
+      expect(rs[at + 1]).toMatchObject({
+        record: "LayoutRead",
+        prop: "matchMedia:(max-width: 500px)",
+      });
+      expectDiverged(
+        await replay(replaced<"Input">(rs, at, { target: "mql:3" })),
+        "MissingRead",
+        seqAt(rs, at + 1),
+      );
+      // A list the page never made is a typed divergence.
+      expectDiverged(
+        await replay(replaced<"Input">(rs, at, { target: "mql:9" })),
+        "InjectionFailed",
+        seqAt(rs, at),
+      );
+    },
+    TIMEOUT * 4,
+  );
+
+  it(
+    "replay_dispatches_visibility_lifecycle_and_language_events_from_the_log",
+    async () => {
+      // `pageshow` runs in the document's load, on record and on replay.
+      const { records: rs, slots } = await rr.recordPage(
+        "values.html?case=lifecycle",
+      );
+      expect(slots).toContain("pageshow=false:true");
+      expect(slots).toContain("state=visible,false,false");
+      // Headless Chromium never hides, freezes or resumes a page, nor
+      // changes its languages (measured with Playwright 1.56.1's Chromium:
+      // CDP Page.setWebLifecycleState, Target.activateTarget,
+      // Browser.setWindowBounds minimized, Emulation.setUserAgentOverride's
+      // acceptLanguage and Emulation.setLocaleOverride each left the page
+      // visible and fired nothing), so the inputs and the reads their
+      // listeners make are written into the recording, as the shim writes
+      // them. Each listener reads only the state its event reports, so the
+      // replay must dispatch each event at its target for its reads to
+      // happen, read by read.
+      const visibility = {
+        type: "visibilitychange",
+        target: "doc",
+        reads: [
+          ["document.visibilityState", '"hidden"'],
+          ["document.hidden", "true"],
+        ] as [string, string][],
+      };
+      const lifecycle = [
+        visibility,
+        {
+          type: "freeze",
+          target: "doc",
+          reads: [["document.visibilityState", '"hidden"']] as [
+            string,
+            string,
+          ][],
+        },
+        {
+          type: "resume",
+          target: "doc",
+          reads: [["document.wasDiscarded", "false"]] as [string, string][],
+        },
+        {
+          type: "languagechange",
+          target: "win",
+          reads: [["navigator.language", '"de-DE"']] as [string, string][],
+        },
+      ];
+      const written = withInputsBeforeEnd(rs, lifecycle);
+      expectReplayed(await replay(written), written);
+      // The written read of `query`: the first after the written input.
+      const writtenRead = (log: BoundaryRecord[], query: string) => {
+        const input = log.map((r) => r.record).lastIndexOf("Input");
+        return log.findIndex(
+          (r, i) =>
+            i > input && r.record === "PlatformValue" && r.query === query,
+        );
+      };
+      // Visible: the listener does not read `hidden`, which the log has.
+      const visible = withInputsBeforeEnd(rs, [
+        {
+          ...visibility,
+          reads: [
+            ["document.visibilityState", '"visible"'],
+            ["document.hidden", "true"],
+          ],
+        },
+      ]);
+      expectDiverged(
+        await replay(visible),
+        "MissingRead",
+        seqAt(visible, writtenRead(visible, "document.hidden")),
+      );
+      // Each event at the wrong target reaches no listener: its first read
+      // is never made.
+      for (const [input, wrong] of [
+        [lifecycle[0], "win"],
+        [lifecycle[1], "win"],
+        [lifecycle[2], "win"],
+        [lifecycle[3], "doc"],
+      ] as const) {
+        const misplaced = withInputsBeforeEnd(rs, [
+          { ...input, target: wrong },
+        ]);
+        expectDiverged(
+          await replay(misplaced),
+          "MissingRead",
+          seqAt(misplaced, writtenRead(misplaced, input.reads[0][0])),
+        );
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  it(
+    "a_focus_the_page_moves_itself_is_its_own_and_replays_inside_its_task",
+    async () => {
+      const { records: rs, slots } = await rr.recordPage(
+        "values.html?case=script-focus",
+      );
+      expect(slots).toContain("seen=before focus:true:true after:true");
+      // Not input: the page's own call dispatched them, in its task.
+      expect(
+        rs.filter((r) => r.record === "Input" && /^focus|^blur/.test(r.type)),
+      ).toEqual([]);
+      // The listener's read is in the timer's task, where replay's page
+      // code makes it again.
+      const timer = indexWhere(rs, "Task", (r) => r.kind === 1);
+      const clock = indexWhere(rs, "Clock", () => true, 0);
+      expect(clock).toBeGreaterThan(timer);
+      expectReplayed(await replay(rs), rs);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "events_the_page_listener_of_an_injected_click_causes_reach_it_inside_the_click",
+    async () => {
+      const { records: rs, slots } = await rr.recordPage(
+        "values.html?case=click-focus",
+        async (page) => {
+          await until(page, isReady, "the click-focus case to listen");
+          await page.click("#go");
+        },
+      );
+      expect(slots).toContain(
+        "seen=click focus:true:true change:true:true after:true",
+      );
+      // The user's click is input (and the focus its mousedown gives the
+      // button); the field's focus and the checkbox's change the page's
+      // listener caused are not.
+      const inputs = rs
+        .filter((r): r is RecordOf<"Input"> => r.record === "Input")
+        .map((r) => `${r.type}@${r.target}`);
+      expect(inputs).toContain("click@path:#go");
+      expect(inputs.filter((i) => /@path:#(field|box2)$/.test(i))).toEqual([]);
+      expectReplayed(await replay(rs), rs);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a_focus_the_page_moves_in_a_listener_of_a_list_or_the_visual_viewport_reaches_it",
+    async () => {
+      // The injected `change` at a list and `resize` at the visual viewport
+      // never pass the window, where replay measures the depth of an
+      // injected event's listeners; the page's own `focus()` in their
+      // listeners must still reach the page, as on record.
+      const { records: rs, slots } = await rr.recordPage(
+        "values.html?case=viewport-focus",
+        async (page) => {
+          await until(page, isReady, "the viewport-focus case to listen");
+          await (
+            page as unknown as {
+              setViewportSize(s: {
+                width: number;
+                height: number;
+              }): Promise<void>;
+            }
+          ).setViewportSize({ width: 400, height: 300 });
+        },
+      );
+      const seen = slots.find((s) => s.startsWith("seen="))!;
+      expect(seen).toContain("change focus:byList:true:true");
+      expect(seen).toContain("vv focus:byViewport:true:true");
+      const inputs = rs
+        .filter((r): r is RecordOf<"Input"> => r.record === "Input")
+        .map((r) => `${r.type}@${r.target}`);
+      // The list's and the viewport's events are input; the focus the
+      // page's listeners moved is not.
+      expect(inputs).toContain("change@mql:1");
+      expect(inputs).toContain("resize@visualViewport");
+      expect(inputs.filter((i) => /@path:#by(List|Viewport)$/.test(i))).toEqual(
+        [],
+      );
+      expectReplayed(await replay(rs), rs);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "input_is_told_from_the_page_events_when_the_page_replaced_the_global_error",
+    async () => {
+      const { records: rs, slots } = await rr.recordPage(
+        "values.html?case=error-replaced",
+        async (page) => {
+          await until(page, isReady, "the error-replaced case to listen");
+          await page.click("#err");
+        },
+      );
+      expect(slots).toContain("clicked=true");
+      const inputs = rs
+        .filter((r): r is RecordOf<"Input"> => r.record === "Input")
+        .map((r) => `${r.type}@${r.target}`);
+      expect(inputs).toContain("click@path:#err");
+      expect(inputs).not.toContain("focus@path:#errfield");
+      expectReplayed(await replay(rs), rs);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a_click_the_browser_forwards_from_a_label_reaches_the_page_once_on_replay",
+    async () => {
+      const { records: rs, slots } = await rr.recordPage(
+        "values.html?case=label-click",
+        async (page) => {
+          await until(page, isReady, "the label-click case to listen");
+          await page.click("#lab", { position: { x: 2, y: 2 } } as never);
+        },
+      );
+      expect(slots).toContain("clicks=1");
+      expect(slots).toContain("box=1:true");
+      const inputs = rs
+        .filter((r): r is RecordOf<"Input"> => r.record === "Input")
+        .map((r) => `${r.type}@${r.target}`);
+      expect(inputs).toContain("click@path:#lab");
+      expect(inputs).toContain("click@path:#labbox");
+      expectReplayed(await replay(rs), rs);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a_focus_the_user_gave_reaches_the_page_once_on_replay",
+    async () => {
+      const { records: rs, slots } = await rr.recordPage(
+        "values.html?case=user-focus",
+        async (page) => {
+          await until(page, isReady, "the user-focus case to listen");
+          await page.click("#typed");
+        },
+      );
+      expect(slots).toContain("focused=1");
+      const at = indexWhere(
+        rs,
+        "Input",
+        (r) => r.type === "focus" && r.target === "path:#typed",
+      );
+      // Its focus effect precedes it: replay applies it (`focus()`, whose
+      // own trusted `focus` is replay's and reaches no listener), then
+      // injects the recorded event.
+      expect(rs[at - 2]).toMatchObject({ record: "DomEffect", effect: 5 });
+      expectReplayed(await replay(rs), rs);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a_media_elements_own_resize_is_a_resource_event_not_input",
+    async () => {
+      const rs = await record("values.html?case=media-resize");
+      // Vacuity guard: the video's resize reached the page, as a resource
+      // event of the document.
+      expect(
+        rs.some(
+          (r) =>
+            r.record === "DocTask" &&
+            r.kind === 5 &&
+            r.event === "resize" &&
+            r.target === "path:#vid",
+        ),
+      ).toBe(true);
+      // Only the window's `resize` is input.
+      expect(
+        rs.filter((r) => r.record === "Input" && r.type === "resize"),
+      ).toEqual([]);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "replay_dispatches_a_beforeunload_the_user_started",
+    async () => {
+      const { records: rs, slots } = await rr.recordPage(
+        "values.html?case=beforeunload",
+        async (page) => {
+          await until(page, isReady, "the beforeunload case to listen");
+          const p = page as unknown as {
+            mouse: { click(x: number, y: number): Promise<void> };
+            on(e: "dialog", f: (d: { dismiss(): Promise<void> }) => void): void;
+            close(o: { runBeforeUnload: boolean }): Promise<void>;
+          };
+          // The page may ask to stay only after the user interacted with
+          // it (HTML, "sticky activation"); the dialog is dismissed, so the
+          // page stays.
+          await p.mouse.click(2, 2);
+          p.on("dialog", (d) => void d.dismiss());
+          await p.close({ runBeforeUnload: true });
+        },
+      );
+      expect(slots).toContain("beforeunload=true:true:true");
+      const at = indexWhere(rs, "Input", (r) => r.type === "beforeunload");
+      expect((rs[at] as RecordOf<"Input">).target).toBe("win");
+      expectReplayed(await replay(rs), rs);
+      // Another event in its place reaches no beforeunload listener.
+      expectDiverged(
+        await replay(replaced<"Input">(rs, at, { type: "languagechange" })),
+        "MissingRead",
+        seqAt(rs, at + 1),
+      );
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "replay_dispatches_the_window_focus_and_blur_and_answers_has_focus",
+    async () => {
+      const { records: rs, slots } = await rr.recordPage(
+        "values.html?case=focus",
+        async (page) => {
+          await until(page, isReady, "the focus case to listen");
+          // Native clicks: into the frame (fixed at 0,300 200x100), then
+          // back on the page.
+          const mouse = (
+            page as unknown as {
+              mouse: { click(x: number, y: number): Promise<void> };
+            }
+          ).mouse;
+          await mouse.click(50, 350);
+          await mouse.click(2, 2);
+        },
+      );
+      const inputs = rs.filter(
+        (r): r is RecordOf<"Input"> =>
+          r.record === "Input" && (r.type === "blur" || r.type === "focus"),
+      );
+      expect(inputs.map((r) => `${r.type}@${r.target}`)).toEqual([
+        "blur@win",
+        "focus@win",
+      ]);
+      expect(slots).toContain("seen=blur:true focus:true");
+      const reads = rs
+        .map((r, i) => [r, i] as const)
+        .filter(
+          ([r]) =>
+            r.record === "PlatformValue" && r.query === "document.hasFocus",
+        );
+      expect(reads.length).toBe(3);
+      expectReplayed(await replay(rs), rs);
+      for (const [r, i] of reads) {
+        expectDiverged(
+          await replay(
+            replaced<"PlatformValue">(rs, i, {
+              value: perturb((r as RecordOf<"PlatformValue">).value),
+            }),
+          ),
+          "CheckpointMismatch",
+          lastCheckpoint(rs),
+        );
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  it(
+    "replay_gives_a_page_the_logged_permission_device_and_focus_state",
+    async () => {
+      const { records: rs, slots } = await rr.recordPage(
+        "values.html?case=device",
+      );
+      const values = rs
+        .map((r, i) => [r, i] as const)
+        .filter(
+          ([r]) =>
+            r.record === "PlatformValue" &&
+            (r.src === PLATFORM_VALUE_SRC.platformState ||
+              r.src === PLATFORM_VALUE_SRC.platformOutcome),
+        ) as (readonly [RecordOf<"PlatformValue">, number])[];
+      // Vacuity guard: every read and promise is in the log.
+      expect(values.map(([r]) => r.query).sort()).toEqual(
+        [
+          "Notification.permission",
+          "document.hasFocus",
+          "document.visibilityState",
+          "document.hidden",
+          "document.wasDiscarded",
+          "navigator.userActivation.isActive",
+          "navigator.userActivation.hasBeenActive",
+          "visualViewport.scale",
+          "visualViewport.offsetTop",
+          "document.hasStorageAccess",
+          "document.requestStorageAccess",
+          "navigator.mediaDevices.enumerateDevices",
+          "Notification.requestPermission",
+        ].sort(),
+      );
+      // The legacy callback runs before the promise's continuation.
+      const order = slots.find((s) => s.startsWith("order="))!;
+      expect(order.indexOf("callback:")).toBeLessThan(
+        order.indexOf("permission:"),
+      );
+      expectReplayed(await replay(rs), rs);
+      // Each value, changed in the log, reaches the page as changed: where
+      // it writes it into the document, or, for the devices, at the storage
+      // read it names them in (the next test).
+      const devicesRead = indexWhere(rs, "StorageRead", (r) =>
+        r.key.startsWith("devices:"),
+      );
+      for (const [r, i] of values) {
+        const changed =
+          r.src === PLATFORM_VALUE_SRC.platformOutcome
+            ? perturbOutcome(r.value)
+            : perturb(r.value);
+        const devices =
+          r.query === "navigator.mediaDevices.enumerateDevices" &&
+          changed.startsWith('{"resolved"');
+        expectDiverged(
+          await replay(replaced<"PlatformValue">(rs, i, { value: changed })),
+          devices ? "ArgumentMismatch" : "CheckpointMismatch",
+          devices ? seqAt(rs, devicesRead) : lastCheckpoint(rs),
+        );
+      }
+    },
+    TIMEOUT * 4,
+  );
+
+  it(
+    "replay_gives_a_page_the_logged_devices_as_objects_of_their_interface",
+    async () => {
+      // Headless Chromium lists no devices, so the visitor's are written
+      // into the log: one input device with capabilities, one output.
+      const rs = await record("values.html?case=device");
+      const at = indexWhere(
+        rs,
+        "PlatformValue",
+        (r) => r.query === "navigator.mediaDevices.enumerateDevices",
+      );
+      const read = indexWhere(rs, "StorageRead", (r) =>
+        r.key.startsWith("devices:"),
+      );
+      expect((rs[read] as RecordOf<"StorageRead">).key).toBe("devices:");
+      // The page reads storage under a key naming what it saw of each
+      // device (kind, label, id, group, whether it is a MediaDeviceInfo and
+      // an InputDeviceInfo, toJSON()'s label, getCapabilities()'s width),
+      // which the log has as the recording's: the replay diverges there,
+      // and its key is what the replayed page saw.
+      for (const [device, saw] of [
+        [
+          {
+            deviceId: "cam-1",
+            kind: "videoinput",
+            label: "Camera",
+            groupId: "g1",
+            capabilities: { width: { min: 1, max: 1920 } },
+          },
+          "devices:videoinput/Camera/cam-1/g1/true/true/Camera/1920",
+        ],
+        [
+          {
+            deviceId: "spk",
+            kind: "audiooutput",
+            label: "Speakers",
+            groupId: "g2",
+          },
+          "devices:audiooutput/Speakers/spk/g2/true/false/Speakers/-",
+        ],
+      ] as const) {
+        const report = await rr.replay(
+          replaced<"PlatformValue">(rs, at, {
+            value: JSON.stringify({ resolved: [device] }),
+          }),
+        );
+        expectDiverged(report, "ArgumentMismatch", seqAt(rs, read));
+        expect(report.divergence?.actual).toContain(`key="${saw}"`);
+      }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "replay_keeps_the_identity_of_the_font_promises_a_page_reads_again",
+    async () => {
+      // `document.fonts.ready === document.fonts.ready` and the same for a
+      // face's `loaded`, as the platform answers, on record and on replay.
+      const { records: rs, slots } = await rr.recordPage(
+        "values.html?case=fonts-identity",
+      );
+      expect(slots).toContain("same=true,true,false");
+      expect(slots).toContain("loaded=NetworkError:true");
+      expect(slots).toContain("after=true");
+      const identities = (query: string) =>
+        rs
+          .map((r, i) => [r, i] as const)
+          .filter(
+            ([r]) =>
+              r.record === "PlatformValue" &&
+              r.src === PLATFORM_VALUE_SRC.platformState &&
+              r.query === query,
+          ) as (readonly [RecordOf<"PlatformValue">, number])[];
+      const ready = identities("document.fonts.ready");
+      const loaded = identities('FontFace.loaded["ct-identity"]');
+      // Each read is logged: the first hands a new promise (its platform
+      // task's TaskReg follows), the next ones the promise of that task.
+      // (The ids are whatever the session had minted by then: the browser
+      // may dispatch input, such as the pointer entering, before the case.)
+      for (const reads of [ready, loaded]) {
+        const task = rs[reads[0][1] + 1] as RecordOf<"TaskReg">;
+        expect([task.record, task.kind]).toEqual(["TaskReg", 13]);
+        const id = task.task_id.toString();
+        expect(reads.map(([r]) => r.value)).toEqual(["null", id, id]);
+      }
+      expectReplayed(await replay(rs), rs);
+      // A read the log says handed a new promise: the replay registers a
+      // platform task (its TaskReg) where the log has the next read.
+      expectDiverged(
+        await replay(
+          replaced<"PlatformValue">(rs, ready[1][1], { value: "null" }),
+        ),
+        "ExtraRead",
+        seqAt(rs, ready[1][1] + 1),
+      );
+      // A read of a promise the replay never handed is a typed divergence
+      // where the page reads it.
+      expectDiverged(
+        await replay(
+          replaced<"PlatformValue">(rs, ready[1][1], { value: "999999" }),
+        ),
+        "ArgumentMismatch",
+        seqAt(rs, ready[1][1]),
       );
     },
     TIMEOUT,

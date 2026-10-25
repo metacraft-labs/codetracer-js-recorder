@@ -179,6 +179,12 @@ export interface RuntimeOriginals {
   WebSocket: (new (url: string) => unknown) | undefined;
   dateNow: () => number;
   performanceNow: (() => number) | undefined;
+  /**
+   * `Document.prototype.visibilityState`'s accessor, read when the page is
+   * hidden to flush: in a replayed page the shim answers the page's reads
+   * of it from the log, and the runtime's own read is none of them.
+   */
+  visibilityState: { descriptor: PropertyDescriptor } | undefined;
 }
 
 type PublishedOriginals = Partial<RuntimeOriginals> | undefined;
@@ -187,13 +193,23 @@ function globalOriginals(): RuntimeOriginals {
   const g = globalThis as {
     WebSocket?: new (url: string) => unknown;
     performance?: { now?: () => number };
+    Document?: { prototype: Document };
   };
+  const visibility =
+    g.Document === undefined
+      ? undefined
+      : Object.getOwnPropertyDescriptor(
+          g.Document.prototype,
+          "visibilityState",
+        );
   return {
     setTimeout: globalThis.setTimeout,
     clearTimeout: globalThis.clearTimeout,
     WebSocket: g.WebSocket,
     dateNow: Date.now,
     performanceNow: g.performance?.now,
+    visibilityState:
+      visibility?.get === undefined ? undefined : { descriptor: visibility },
   };
 }
 
@@ -217,6 +233,8 @@ export function resolveOriginals(): RuntimeOriginals {
     dateNow: published?.dateNow ?? MODULE_ORIGINALS.dateNow,
     performanceNow:
       published?.performanceNow ?? MODULE_ORIGINALS.performanceNow,
+    visibilityState:
+      published?.visibilityState ?? MODULE_ORIGINALS.visibilityState,
   };
 }
 
@@ -752,7 +770,14 @@ export function createBrowserRuntime(
       globalThis.addEventListener("beforeunload", safeFlushOnLifecycle);
       if (typeof document !== "undefined") {
         document.addEventListener("visibilitychange", () => {
-          if (document.visibilityState === "hidden") {
+          // Through the original accessor (resolveOriginals): in a replayed
+          // page the shim answers the page's reads from the log.
+          const get = originals.visibilityState?.descriptor.get;
+          const state =
+            get === undefined
+              ? document.visibilityState
+              : (get.call(document) as unknown);
+          if (state === "hidden") {
             safeFlushOnLifecycle();
           }
         });

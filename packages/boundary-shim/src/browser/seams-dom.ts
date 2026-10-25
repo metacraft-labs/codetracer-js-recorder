@@ -16,7 +16,8 @@ export function patchDomSeams(ctx: SeamContext): void {
   patchHistory(ctx);
 }
 
-function patchLayout({ w, rec, orig }: SeamContext): void {
+function patchLayout(ctx: SeamContext): void {
+  const { w, rec, orig } = ctx;
   const read = (target: unknown, prop: string, value: unknown) =>
     rec.guard(() =>
       rec.emit("LayoutRead", {
@@ -101,18 +102,83 @@ function patchLayout({ w, rec, orig }: SeamContext): void {
     },
   );
 
+  patchMediaQueries(ctx);
+}
+
+/**
+ * `matchMedia` and the lists it makes (CSSOM View, "The MediaQueryList
+ * interface", https://drafts.csswg.org/cssom-view/#the-mediaquerylist-interface).
+ *
+ * A list's `matches` is evaluated against the visitor's viewport, screen
+ * and preferences each time it is read, so every read is a `LayoutRead`
+ * (target `win`, prop `matchMedia:<media>`, `{matches}`), `<media>` the
+ * list's serialised query (its `media`, which the same engine serialises the
+ * same way on replay).
+ *
+ * The browser dispatches `change` at a list when its `matches` flips (the
+ * rendering steps' "evaluate media queries and report changes"). A list is
+ * no node, so the window's listeners never see it: the shim listens on each
+ * list as `matchMedia` makes it, before the page can, and records a trusted
+ * `change` as input at target `mql:<n>`, the n-th list the page made
+ * (counting from 1; the page's code makes them in the same order on replay),
+ * with the event's `matches` and `media`.
+ */
+function patchMediaQueries(ctx: SeamContext): void {
+  const { w, rec, orig } = ctx;
   const origMatch = orig.matchMedia;
-  if (origMatch !== undefined) {
-    replaceValue(
-      w,
-      "matchMedia",
-      function matchMedia(query: string): MediaQueryList {
-        const m = origMatch.call(w, query);
-        read(w, "matchMedia:" + String(query), { matches: m.matches });
-        return m;
-      },
-    );
+  if (origMatch === undefined) return;
+  let made = 0;
+  replaceValue(
+    w,
+    "matchMedia",
+    function matchMedia(query: string): MediaQueryList {
+      const m = origMatch.call(w, query);
+      const target = mediaQueryTarget(++made);
+      orig.addEventListener.call(m, "change", (ev: Event) => {
+        if (!ev.isTrusted || !rec.recording) return;
+        rec.guard(() => recordInput(ctx, ev, target));
+      });
+      return m;
+    },
+  );
+  const matches = orig.mediaQueryMatches;
+  if (matches === undefined) return;
+  const get = matches.descriptor.get!;
+  replaceAccessor(
+    matches.owner,
+    "matches",
+    function (this: unknown) {
+      const v = get.call(this) as boolean;
+      rec.guard(() =>
+        rec.emit("LayoutRead", {
+          target: "win",
+          prop: mediaQueryProp(this),
+          value: JSON.stringify({ matches: v }),
+        }),
+      );
+      return v;
+    },
+    matches.descriptor.set,
+  );
+}
+
+/** The target of the n-th `MediaQueryList` the page made (§9.3, §10.2). */
+export function mediaQueryTarget(n: number): string {
+  return `mql:${n}`;
+}
+
+/**
+ * The `LayoutRead.prop` of a read of list `m`'s `matches`:
+ * `matchMedia:<media>`.
+ */
+export function mediaQueryProp(m: unknown): string {
+  let media = "";
+  try {
+    media = String((m as { media?: unknown }).media ?? "");
+  } catch {
+    media = "";
   }
+  return "matchMedia:" + media;
 }
 
 function patchHistory({ w, rec, orig }: SeamContext): void {
@@ -163,9 +229,38 @@ export function listenForPageEvents(
     add(type, (ev) => {
       // Events the page dispatches itself are its own deterministic
       // behaviour and happen again on replay; only the browser's are input.
-      if (!ev.isTrusted || !rec.recording) return;
-      rec.guard(() => recordInput(ctx, ev));
+      if (!ev.isTrusted || !rec.recording || !isInputEvent(w, ev)) return;
+      // A trusted event the page's own code dispatches inside one of its
+      // calls is the page's deterministic behaviour, in a task the log
+      // already has, and the replayed code dispatches it again there: the
+      // `focus`, `blur`, `focusin` and `focusout` of `focus()` and `blur()`,
+      // the `submit` of `requestSubmit()`, the `reset` of `reset()`, the
+      // `input` and `change` of a checkbox's `click()`, the `beforeunload`
+      // of a navigation the page starts (`location.href = …`; HTML,
+      // "checking if unloading is canceled"). Only what the browser
+      // dispatches from a task of its own (the user's input, the
+      // environment changing) is input.
+      if (dispatchedFromScript()) return;
+      // Chromium dispatches `beforeunload` at the window alone with the
+      // document as its `target` (as it does `load`); only the window's
+      // listeners see it, so it is input at `win`, where replay injects it.
+      rec.guard(() =>
+        recordInput(ctx, ev, ev.type === "beforeunload" ? "win" : undefined),
+      );
     });
+  }
+
+  // The visual viewport is no node, so the window's listeners never see its
+  // events: the shim listens on it, first, and records each trusted one as
+  // input at target `visualViewport`.
+  const vv = w.visualViewport;
+  if (vv !== null && vv !== undefined) {
+    for (const type of VISUAL_VIEWPORT_EVENT_TYPES) {
+      orig.addEventListener.call(vv, type, (ev: Event) => {
+        if (!ev.isTrusted || !rec.recording) return;
+        rec.guard(() => recordInput(ctx, ev, VISUAL_VIEWPORT_TARGET));
+      });
+    }
   }
 
   for (const [type, kind] of [
@@ -199,6 +294,22 @@ export function listenForPageEvents(
 }
 
 /**
+ * The realm's own `Error`, captured when the shim's bundle runs, before any
+ * page code. The stack tests below read V8's structured stack through it
+ * (`prepareStackTrace` is looked up on this intrinsic, never on whatever the
+ * global `Error` names later), so a page that replaces the global (with a
+ * function that makes the platform's errors, as error-tracking and zone
+ * libraries have done) neither adds its own frame to every stack nor turns
+ * the structured read into the text fallback: either made every event
+ * the browser dispatched look dispatched from script, and no input was
+ * recorded at all.
+ */
+const NativeError = Error as ErrorConstructor & {
+  stackTraceLimit?: number;
+  prepareStackTrace?: (e: Error, frames: unknown[]) => unknown;
+};
+
+/**
  * Whether the event whose capture listener calls this (directly, as its
  * first frame) was dispatched synchronously from script: a JavaScript frame
  * lies below the listener's (the page's `location.hash = …`, an injected
@@ -208,16 +319,13 @@ export function listenForPageEvents(
  * restored, with the text of the stack as the fallback of another engine.
  */
 export function dispatchedFromScript(): boolean {
-  const E = Error as ErrorConstructor & {
-    stackTraceLimit?: number;
-    prepareStackTrace?: (e: Error, frames: unknown[]) => unknown;
-  };
+  const E = NativeError;
   const limit = E.stackTraceLimit;
   const prepare = E.prepareStackTrace;
   try {
     E.stackTraceLimit = 4;
     E.prepareStackTrace = (_e, frames) => frames.length;
-    const stack = new Error().stack as unknown;
+    const stack = new E().stack as unknown;
     // This function's frame, the listener's, then whatever dispatched.
     if (typeof stack === "number") return stack > 2;
     const lines = String(stack ?? "")
@@ -226,6 +334,37 @@ export function dispatchedFromScript(): boolean {
     return lines.length > 2;
   } catch {
     return false;
+  } finally {
+    E.prepareStackTrace = prepare;
+    E.stackTraceLimit = limit;
+  }
+}
+
+/**
+ * The number of JavaScript frames on the stack of the function that calls
+ * this, itself included (1 for a listener the platform called from a task
+ * of its own; more when script lies below it). Read from V8's structured
+ * stack with no frame limit, set only for this one capture and restored,
+ * with the text of the stack as the fallback of another engine. Replay
+ * tells the platform's reaction to an event it injected from an event the
+ * page's own listener caused with it (replay/dom.ts, `replayInput`).
+ */
+export function jsStackDepth(): number {
+  const E = NativeError;
+  const limit = E.stackTraceLimit;
+  const prepare = E.prepareStackTrace;
+  try {
+    E.stackTraceLimit = Infinity;
+    E.prepareStackTrace = (_e, frames) => frames.length;
+    const stack = new E().stack as unknown;
+    // This function's frame is not counted.
+    if (typeof stack === "number") return stack - 1;
+    const lines = String(stack ?? "")
+      .split("\n")
+      .filter((l) => /\S/.test(l) && !/^Error\b/.test(l));
+    return lines.length - 1;
+  } catch {
+    return 1;
   } finally {
     E.prepareStackTrace = prepare;
     E.stackTraceLimit = limit;
@@ -284,7 +423,53 @@ export const INPUT_EVENT_TYPES: readonly string[] = [
   // the page then reads, is logged too: seams-environment.ts)
   "online",
   "offline",
+  // the page's environment changing under it, at the window: its viewport
+  // (`resize`, which a zoom also fires; the window's own only, see
+  // WINDOW_ONLY_INPUT_TYPES), the user's languages (`languagechange`), the
+  // user leaving (`beforeunload`); at the document: its visibility
+  // (`visibilitychange`) and the browser freezing and resuming it (Page
+  // Lifecycle `freeze` and `resume`). What the page then reads of that
+  // state (`innerWidth`, `devicePixelRatio`, `navigator.languages`,
+  // `document.visibilityState`, …) is logged where it reads it.
+  "resize",
+  "languagechange",
+  "beforeunload",
+  "visibilitychange",
+  "freeze",
+  "resume",
 ];
+
+/**
+ * The events the browser dispatches at `window.visualViewport` when the
+ * visitor pinch-zooms, pans or the on-screen keyboard resizes it (CSSOM
+ * View, "The VisualViewport interface"), recorded as input at
+ * {@link VISUAL_VIEWPORT_TARGET}.
+ */
+export const VISUAL_VIEWPORT_EVENT_TYPES: readonly string[] = [
+  "resize",
+  "scroll",
+  "scrollend",
+];
+
+/** The target of `window.visualViewport`'s events (§9.3, §10.2). */
+export const VISUAL_VIEWPORT_TARGET = "visualViewport";
+
+/**
+ * The input types that are input only at the window: a media element
+ * dispatches a `resize` of its own when its video's size changes, a
+ * resource event of the document's (resource-events.ts), whose capture
+ * reaches the window's listeners too.
+ */
+export const WINDOW_ONLY_INPUT_TYPES: ReadonlySet<string> = new Set(["resize"]);
+
+/**
+ * Whether `ev`, of a type of {@link INPUT_EVENT_TYPES}, is input: every
+ * event of those types but a {@link WINDOW_ONLY_INPUT_TYPES} one at another
+ * target than the window `w`. Shared by record and replay.
+ */
+export function isInputEvent(w: Window, ev: Event): boolean {
+  return !WINDOW_ONLY_INPUT_TYPES.has(ev.type) || ev.target === w;
+}
 
 /** The event properties `Input.props` carries, when the event has them. */
 const INPUT_PROPS: readonly string[] = [
@@ -316,6 +501,9 @@ const INPUT_PROPS: readonly string[] = [
   "deltaMode",
   "data",
   "inputType",
+  // a `MediaQueryList`'s `change` (MediaQueryListEvent)
+  "matches",
+  "media",
 ];
 
 function eventProps(ev: Event): string {
@@ -366,13 +554,16 @@ const Effect = {
  * An input event: the start of a macrotask (`Loading` while the document
  * loads, a checkpoint if one is due), the `DomEffect`s of default actions
  * that already changed state, then `Task{kind: input}` and `Input` (§9.5's
- * order, at level 0).
+ * order, at level 0). `name` is the target's name when it is no node or
+ * window (a `MediaQueryList`'s `mql:<n>`).
  */
-function recordInput(ctx: SeamContext, ev: Event): void {
+function recordInput(
+  ctx: SeamContext,
+  ev: Event,
+  name = targetOf(ev.target),
+): void {
   const { rec } = ctx;
   rec.macrotask();
-  const target = ev.target;
-  const name = targetOf(target);
   for (const [effect, value] of domEffects(ctx, ev)) {
     rec.emit("DomEffect", {
       target: name,

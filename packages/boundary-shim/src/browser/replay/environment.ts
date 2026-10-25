@@ -30,10 +30,16 @@ import { TaskKind } from "../recorder.js";
 import {
   CANVAS_READBACKS,
   EVENT_COUNTS_ITERATORS,
+  OUTCOME_CALLS,
   PLATFORM_EVENTS,
+  REFUSED_DEVICE_CALLS,
+  STATE_METHODS,
+  STATIC_STATE_READS,
   fontQuery,
   interfaceProto,
   measureQuery,
+  promiseIdentityOf,
+  settleAfter,
   stateGetters,
   stateQuery,
   stateValue,
@@ -102,11 +108,28 @@ export function replayPlatformOutcome<T>(
   src: number,
   query: string,
   resolved: (v: unknown, seq: string) => T,
+  beforeResolve?: (v: T) => void,
 ): Promise<T> {
+  return replayPlatformOutcomeTask(ctx, src, query, resolved, beforeResolve)
+    .promise;
+}
+
+/**
+ * {@link replayPlatformOutcome}, also returning the platform task's id.
+ * `beforeResolve` runs in the released task before the page's promise
+ * resolves, as on record (`seams-environment.ts` `settleAfter`).
+ */
+export function replayPlatformOutcomeTask<T>(
+  ctx: ReplayContext,
+  src: number,
+  query: string,
+  resolved: (v: unknown, seq: string) => T,
+  beforeResolve?: (v: T) => void,
+): { promise: Promise<T>; taskId: bigint } {
   const { w, replay, orig } = ctx;
   const id = ctx.nextTaskId();
   replay.registerTask(id, TaskKind.platform, 0);
-  return new orig.Promise<T>((resolve, reject) => {
+  const promise = new orig.Promise<T>((resolve, reject) => {
     replay.onTask(id, () => {
       replay.offTask(id);
       const record = replay.next("PlatformValue", { src, task_id: id, query });
@@ -115,9 +138,11 @@ export function replayPlatformOutcome<T>(
         reject(errorOf(w, outcome.rejected));
         return;
       }
-      resolve(resolved(outcome.resolved, String(record.seq)));
+      const v = resolved(outcome.resolved, String(record.seq));
+      settleAfter(beforeResolve, v, () => resolve(v));
     });
   });
+  return { promise, taskId: id };
 }
 
 /** Replace every seam this module owns. */
@@ -168,6 +193,21 @@ function replayStateReads(ctx: ReplayContext): void {
 
   for (const { proto, name, query } of stateGetters(w)) {
     getter(proto, name, () => query);
+  }
+  for (const { iface, name, query } of STATE_METHODS) {
+    wrapMethod(
+      protoOf(w, iface),
+      name,
+      (original) =>
+        function (this: unknown, ...args: unknown[]) {
+          original.apply(this, args); // the platform's receiver check
+          return logged(query);
+        },
+    );
+  }
+  for (const { global, name, query } of STATIC_STATE_READS) {
+    const owner = (w as unknown as Record<string, Proto | undefined>)[global];
+    if (owner !== undefined) getter(owner, name, () => query);
   }
   const face = protoOf(w, "FontFace");
   if (face !== undefined)
@@ -371,6 +411,82 @@ function replayPlatformOutcomes(ctx: ReplayContext): void {
     (_v, self) => self,
   );
 
+  for (const { iface, name, query, resolves } of OUTCOME_CALLS) {
+    outcome(
+      protoOf(w, iface),
+      name,
+      () => query,
+      resolves === "value" ? asIs : nothing,
+    );
+  }
+
+  // The visitor's devices, as objects of their interface whose attributes
+  // are the logged ones (own values, as `measureText()`'s metrics: script
+  // cannot make the platform's), with `toJSON()` and, for an input device,
+  // `getCapabilities()` answering from the log too.
+  const deviceProto = protoOf(w, "MediaDeviceInfo") ?? Object.prototype;
+  const inputDeviceProto = protoOf(w, "InputDeviceInfo") ?? deviceProto;
+  outcome(
+    protoOf(w, "MediaDevices"),
+    "enumerateDevices",
+    () => "navigator.mediaDevices.enumerateDevices",
+    (v) =>
+      (Array.isArray(v) ? v : []).map((d: Record<string, unknown>) => {
+        const caps = d.capabilities;
+        const info = Object.create(
+          caps === undefined ? deviceProto : inputDeviceProto,
+        ) as object;
+        const own = {
+          deviceId: String(d.deviceId ?? ""),
+          kind: String(d.kind ?? ""),
+          label: String(d.label ?? ""),
+          groupId: String(d.groupId ?? ""),
+        };
+        for (const [k, x] of Object.entries(own)) {
+          Object.defineProperty(info, k, { value: x, enumerable: true });
+        }
+        Object.defineProperty(info, "toJSON", { value: () => ({ ...own }) });
+        if (caps !== undefined) {
+          Object.defineProperty(info, "getCapabilities", {
+            value: () => JSON.parse(JSON.stringify(caps)) as unknown,
+          });
+        }
+        return info;
+      }),
+  );
+
+  // A notification permission request: the legacy callback, when the page
+  // passed one, runs in the released task before the promise resolves, as
+  // on record; the platform is not given it.
+  const Notification = (w as unknown as Record<string, Proto | undefined>)
+    .Notification;
+  wrapMethod(
+    Notification,
+    "requestPermission",
+    (original) =>
+      function (this: unknown, ...args: unknown[]) {
+        const callback =
+          typeof args[0] === "function"
+            ? (args[0] as (p: unknown) => void)
+            : undefined;
+        ignore(ctx, original.call(this));
+        return replayPlatformOutcome(
+          ctx,
+          src,
+          "Notification.requestPermission",
+          asIs,
+          callback === undefined
+            ? undefined
+            : (v) => callback.call(undefined, v),
+        );
+      },
+  );
+
+  // The promises that are attributes (seams-environment.ts): every read
+  // reads which promise the visitor's page was handed, a new one (its
+  // platform task is registered here) or one it had (`ArgumentMismatch`
+  // when the replay never handed it), so the page compares them by
+  // identity as on record. Both settle with the object they belong to.
   for (const [iface, name, query] of [
     ["FontFaceSet", "ready", () => "document.fonts.ready"],
     ["FontFace", "loaded", (self: unknown) => fontQuery("loaded", self)],
@@ -379,13 +495,35 @@ function replayPlatformOutcomes(ctx: ReplayContext): void {
     const d = proto && Object.getOwnPropertyDescriptor(proto, name);
     if (proto === undefined || d?.get === undefined) continue;
     const get = d.get;
+    const handed = new Map<bigint, Promise<unknown>>();
     replaceAccessor(
       proto,
       name,
       function (this: unknown) {
         ignore(ctx, get.call(this));
-        // Both settle with the object they belong to.
-        return replayPlatformOutcome(ctx, src, query(this), () => this);
+        const q = query(this);
+        const record = replay.next("PlatformValue", {
+          src: PLATFORM_VALUE_SRC.platformState,
+          task_id: 0n,
+          query: q,
+        });
+        const id = promiseIdentityOf(record.value);
+        if (id === undefined) {
+          const made = replayPlatformOutcomeTask(ctx, src, q, () => this);
+          handed.set(made.taskId, made.promise);
+          return made.promise;
+        }
+        const had = id === null ? undefined : handed.get(id);
+        if (had === undefined) {
+          return replay.fail(
+            "ArgumentMismatch",
+            `${q} handed the promise of platform task ${record.value} on record; the replay handed the page no such promise`,
+            record.value,
+            [...handed.keys()].join(","),
+            String(record.seq),
+          );
+        }
+        return had;
       },
       d.set,
     );
@@ -464,6 +602,9 @@ function replayEnvironmentRefusals(ctx: ReplayContext): void {
   }
   refused(protoOf(w, "Permissions"), "query");
   refused(protoOf(w, "StorageManager"), "getDirectory");
+  for (const { iface, names } of REFUSED_DEVICE_CALLS) {
+    for (const name of names) refused(protoOf(w, iface), name);
+  }
 
   // The replay browser's own events at these objects are not the
   // visitor's: they never reach the page. Where the visitor's reached a

@@ -34,6 +34,23 @@ export interface ReplayContext {
    * installer, before any seam.
    */
   trusted: TrustedEvents;
+  /**
+   * The `MediaQueryList`s the page made with `matchMedia`, by their target
+   * (`mql:<n>`, seams-dom.ts `mediaQueryTarget`), for the injector.
+   */
+  mediaQueries: Map<string, MediaQueryList>;
+  /**
+   * The input replay is dispatching (`event`, undefined between inputs) and
+   * the JavaScript stack depth its own listeners run at (`depth`, Infinity
+   * until measured), which tells a trusted event the page's listener caused
+   * from the platform's reaction to the injected one (replay/dom.ts,
+   * `replayInput`). The shim's first listener on every target an input can
+   * be injected at measures it: the window's capture listeners for a node,
+   * and the listeners the shim puts on a `MediaQueryList` (replayLayout's
+   * `matchMedia`) and on the visual viewport, which no event at the window
+   * passes.
+   */
+  injection: { event: Event | undefined; depth: number };
 }
 
 export function newReplayContext(
@@ -64,6 +81,8 @@ export function newReplayContext(
         throw new Error("the replay shim's trusted dispatch is not installed");
       },
     },
+    mediaQueries: new Map(),
+    injection: { event: undefined, depth: Infinity },
   };
 }
 

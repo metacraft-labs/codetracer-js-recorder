@@ -64,10 +64,26 @@ export interface ShimOriginals {
   eventTimeStamp: CapturedGetter | undefined;
   cookie: CapturedGetter | undefined;
   getBoundingClientRect: Element["getBoundingClientRect"];
-  /** The `offset*`, `client*` and `scroll*` getters, by property name. */
+  /**
+   * The `offset*`, `client*` and `scroll*` getters of elements and the
+   * window's viewport and position getters ({@link WINDOW_LAYOUT_PROPS}),
+   * by property name.
+   */
   layoutGetters: Map<string, CapturedGetter>;
   getComputedStyle: typeof getComputedStyle;
   matchMedia: typeof matchMedia | undefined;
+  /**
+   * `MediaQueryList.prototype.matches`: the shim's own reads of it (`Env`'s
+   * colour scheme) are none of the page's.
+   */
+  mediaQueryMatches: CapturedGetter | undefined;
+  /**
+   * `Document.prototype.visibilityState`, which the upload transport and the
+   * `__ct` runtime read to flush when the page is hidden: through the
+   * original, so neither read is logged (record) or answered from the log
+   * (replay) as the page's.
+   */
+  visibilityState: CapturedGetter | undefined;
   IntersectionObserver: typeof IntersectionObserver | undefined;
   ResizeObserver: typeof ResizeObserver | undefined;
   MutationObserver: typeof MutationObserver | undefined;
@@ -108,6 +124,30 @@ export const LAYOUT_PROPS: readonly (readonly [string, readonly string[]])[] = [
   ],
 ];
 
+/**
+ * The window's viewport, scale and position getters, logged as
+ * `LayoutRead`s of target `win` where the page reads them (§10.1): the
+ * visitor resizes, zooms, moves and scrolls the window, and the replay
+ * browser's are its own. In Chromium they are own accessors of the window
+ * (WebIDL puts a `[Global]` interface's attributes on the object itself), so
+ * they are found on its prototype chain ({@link getterOnChain}).
+ */
+export const WINDOW_LAYOUT_PROPS: readonly string[] = [
+  "devicePixelRatio",
+  "innerHeight",
+  "innerWidth",
+  "outerHeight",
+  "outerWidth",
+  "pageXOffset",
+  "pageYOffset",
+  "screenLeft",
+  "screenTop",
+  "screenX",
+  "screenY",
+  "scrollX",
+  "scrollY",
+];
+
 /** The `Response` accessors a constructed response must answer for. */
 export const RESPONSE_GETTERS = ["url", "redirected", "type", "statusText"];
 /** The `Headers` methods that change a header list. */
@@ -126,6 +166,10 @@ export function captureOriginals(w: Window & typeof globalThis): ShimOriginals {
       const g = getter(ctor?.prototype, name);
       if (g !== undefined) layoutGetters.set(name, g);
     }
+  }
+  for (const name of WINDOW_LAYOUT_PROPS) {
+    const g = getterOnChain(w, name);
+    if (g !== undefined) layoutGetters.set(name, g);
   }
   const responseGetters = new Map<string, CapturedGetter>();
   for (const name of RESPONSE_GETTERS) {
@@ -197,6 +241,8 @@ export function captureOriginals(w: Window & typeof globalThis): ShimOriginals {
     layoutGetters,
     getComputedStyle: w.getComputedStyle,
     matchMedia: w.matchMedia,
+    mediaQueryMatches: getter(w.MediaQueryList?.prototype, "matches"),
+    visibilityState: getter(w.Document.prototype, "visibilityState"),
     IntersectionObserver: w.IntersectionObserver,
     ResizeObserver: w.ResizeObserver,
     MutationObserver: w.MutationObserver,

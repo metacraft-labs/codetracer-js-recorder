@@ -34,6 +34,7 @@ import {
   logBytes,
   replaySession,
   seqAt,
+  withRecordBefore,
   withRecordReplaced,
 } from "../../packages/boundary-replay/src/index.js";
 import { FIXTURES, type FixtureServer, startFixtureServer } from "./harness.js";
@@ -256,6 +257,63 @@ export function replaced<K extends BoundaryRecord["record"]>(
     ...(records[at] as RecordOf<K>),
     ...change,
   } as BoundaryRecord);
+}
+
+/**
+ * `records` with inputs the browser dispatched written in before the final
+ * checkpoint, for the events headless Chromium never dispatches (it never
+ * hides, freezes or resumes a page, nor changes its languages): each input's
+ * `Task{kind 5}` with the next task id the log would have minted, its
+ * `Input` (no properties), and the `PlatformValue{src 8}` reads its
+ * listeners make, as the shim writes them (seams-dom.ts `recordInput`,
+ * seams-environment.ts). Renumbered, so the log still decodes strictly.
+ */
+export function withInputsBeforeEnd(
+  records: BoundaryRecord[],
+  inputs: {
+    type: string;
+    target: string;
+    reads: [query: string, value: string][];
+  }[],
+): BoundaryRecord[] {
+  let nextTask = 1n;
+  for (const r of records) {
+    if (
+      (r.record === "Task" || r.record === "TaskReg") &&
+      r.task_id >= nextTask
+    ) {
+      nextTask = r.task_id + 1n;
+    }
+  }
+  let at = records.map((r) => r.record).lastIndexOf("Checkpoint");
+  let out = records;
+  const put = (r: BoundaryRecord) => {
+    out = withRecordBefore(out, at++, r);
+  };
+  for (const { type, target, reads } of inputs) {
+    const task_id = nextTask++;
+    put({ record: "Task", seq: 0n, task_id, kind: 5 });
+    put({
+      record: "Input",
+      seq: 0n,
+      task_id,
+      type,
+      target,
+      props: "{}",
+      label: "",
+    });
+    for (const [query, value] of reads) {
+      put({
+        record: "PlatformValue",
+        seq: 0n,
+        src: 8,
+        task_id: 0n,
+        query,
+        value,
+      });
+    }
+  }
+  return out;
 }
 
 /** The UTF-8 text of an inline `blobref`. */

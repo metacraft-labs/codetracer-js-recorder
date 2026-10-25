@@ -1399,6 +1399,50 @@ describe("the batched upload transport", () => {
   );
 
   it(
+    "transport_reads_the_page_visibility_without_logging_it_as_the_page",
+    async () => {
+      // The page's reads of `document.visibilityState` are logged (§10.1);
+      // the transport reads it too, at every `visibilitychange`, to send
+      // what waits when the page is hidden, and its read is none of the
+      // page's: through the captured original it writes no record.
+      const ingest = await stub();
+      const server = await site(ingest);
+      const context = await browser.newContext();
+      try {
+        const page = await context.newPage();
+        await page.goto(`${server.origin}/transport.html`);
+        await until(() => status(page), idle, "the transport did not go idle");
+        // The page reads the state once, then a `visibilitychange` reaches
+        // the transport's listener (dispatched by the page: headless
+        // Chromium never hides a page, and the transport reacts to any).
+        await page.evaluate(() => {
+          void document.visibilityState;
+          document.dispatchEvent(new Event("visibilitychange"));
+          document.dispatchEvent(new Event("visibilitychange"));
+        });
+        await page.goto(`${server.origin}/transport-consent.html`);
+        await until(
+          async () => ingest.batches.some((b) => b.parsed.envelope.final),
+          (f) => f,
+          "the final batch did not arrive",
+        );
+      } finally {
+        await context.close();
+      }
+      const records = assemble(ingest.batches.map((b) => b.body));
+      const reads = records.filter(
+        (r) =>
+          r.record === "PlatformValue" &&
+          r.query === "document.visibilityState",
+      );
+      // The page's one read, and none of the transport's two.
+      expect(reads).toHaveLength(1);
+      expect(records[records.length - 1].record).toBe("End");
+    },
+    TIMEOUT,
+  );
+
+  it(
     "transport_leaves_back_forward_cache_eligibility_unchanged",
     async () => {
       // Chromium reports why a page was not restored from the back/forward

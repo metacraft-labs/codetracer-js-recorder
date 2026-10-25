@@ -176,7 +176,25 @@ This is a monorepo managed with npm workspaces:
   clamps when nested), both in `seams-environment.ts` and
   `replay/environment.ts`, one table of reads for both sides; what cannot be
   recorded faithfully there (a canvas read back, the clipboard's contents,
-  the Cache API, a permission's status) is refused. Each such value is pinned by `tests/boundary/replay-values.test.ts`,
+  the Cache API, a permission's status, a battery, the visitor's position, a
+  camera's stream) is refused. The page's visibility, focus and viewport
+  state are read the same way (src 8, and the window's geometry and each
+  read of a media query list's `matches` as `LayoutRead`s), and the events
+  that report their changes are input (`seams-dom.ts` `INPUT_EVENT_TYPES`; a
+  media query list's `change` at target `mql:<n>`, the visual viewport's at
+  `visualViewport`). A trusted event the page's own code dispatches inside
+  a call (`focus()`, `requestSubmit()`) is never input: script lies below
+  its listener (`dispatchedFromScript`), and replay lets it through by the
+  same test (`jsStackDepth` in `replay/dom.ts`, measured against the depth
+  of the injected event's listeners, which the shim's first listener on
+  every injectable target records: `ReplayContext.injection`). Both read
+  the stack through the realm's own `Error`, captured before page code
+  (`NativeError` in `seams-dom.ts`): a page that replaces the global
+  `Error` must not make every event look dispatched from script. `document.fonts.ready` and
+  `FontFace.loaded` keep their identity across reads: each read logs which
+  promise it handed. The upload transport and the `__ct` runtime read
+  `document.visibilityState` through the captured original
+  (`originals.visibilityState`), never as the page. Each such value is pinned by `tests/boundary/replay-values.test.ts`,
   which records a fixture case, replays it to `End`, and replays it again with
   the value edited, which must diverge. A `.ct` is read through the native addon's `readCtfsMember` (the
   canonical CTFS reader), never a second container decoder. The conformance

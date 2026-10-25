@@ -20,7 +20,16 @@
  */
 
 import { replaceAccessor, replaceValue } from "../context.js";
-import { INPUT_EVENT_TYPES, dispatchedFromScript } from "../seams-dom.js";
+import {
+  INPUT_EVENT_TYPES,
+  dispatchedFromScript,
+  isInputEvent,
+  jsStackDepth,
+  mediaQueryProp,
+  mediaQueryTarget,
+  VISUAL_VIEWPORT_EVENT_TYPES,
+  VISUAL_VIEWPORT_TARGET,
+} from "../seams-dom.js";
 import { patchStorageEvents } from "../seams-storage.js";
 import { resolveTarget, targetOf } from "../targets.js";
 import type { RecordOf } from "@codetracer/boundary-format";
@@ -214,7 +223,13 @@ function replayStorage(ctx: ReplayContext): void {
   }
 }
 
-function replayLayout({ w, replay, orig }: ReplayContext): void {
+function replayLayout({
+  w,
+  replay,
+  orig,
+  mediaQueries,
+  injection,
+}: ReplayContext): void {
   const read = (target: unknown, prop: string): unknown =>
     JSON.parse(
       replay.next("LayoutRead", { target: targetOf(target), prop }).value,
@@ -278,6 +293,11 @@ function replayLayout({ w, replay, orig }: ReplayContext): void {
     },
   );
 
+  // The lists `matchMedia` makes (seams-dom.ts `patchMediaQueries`): each
+  // read of `matches` answers from the log; each list is numbered as on
+  // record, so an injected `change` finds it (`mql:<n>`), and the replay
+  // browser's own `change`s, which are not the visitor's, never reach the
+  // page.
   const origMatch = orig.matchMedia;
   if (origMatch !== undefined) {
     replaceValue(
@@ -285,15 +305,31 @@ function replayLayout({ w, replay, orig }: ReplayContext): void {
       "matchMedia",
       function matchMedia(query: string): MediaQueryList {
         const m = origMatch.call(w, query);
-        const v = read(w, "matchMedia:" + String(query)) as {
-          matches: boolean;
-        };
-        Object.defineProperty(m, "matches", {
-          get: () => v.matches,
-          configurable: true,
+        mediaQueries.set(mediaQueryTarget(mediaQueries.size + 1), m);
+        orig.addEventListener.call(m, "change", (ev: Event) => {
+          // An injected `change` passes no window listener: its depth is
+          // measured here, first on the list (ReplayContext.injection).
+          if (ev === injection.event) {
+            injection.depth = jsStackDepth();
+            return;
+          }
+          if (ev.isTrusted) ev.stopImmediatePropagation();
         });
         return m;
       },
+    );
+  }
+  const matches = orig.mediaQueryMatches;
+  if (matches !== undefined) {
+    const get = matches.descriptor.get!;
+    replaceAccessor(
+      matches.owner,
+      "matches",
+      function (this: unknown) {
+        get.call(this); // the platform's receiver check, as on record
+        return (read(w, mediaQueryProp(this)) as { matches: boolean }).matches;
+      },
+      matches.descriptor.set,
     );
   }
 }
@@ -368,6 +404,13 @@ interface EventShape {
   ctor: string;
   bubbles: boolean;
   cancelable: boolean;
+  /**
+   * Whether the event crosses shadow boundaries; the UI events are, the
+   * events the platform fires at the window, the document or a
+   * `MediaQueryList` are not (DOM, "fire an event": `composed` defaults to
+   * false). Absent means composed unless the type is `change` or `submit`.
+   */
+  composed?: boolean;
 }
 
 const POINTER: EventShape = {
@@ -453,6 +496,59 @@ const SHAPES: Record<string, EventShape> = {
   // HTML, "online and offline events": plain events at the window.
   online: { ctor: "Event", bubbles: false, cancelable: false },
   offline: { ctor: "Event", bubbles: false, cancelable: false },
+  // CSSOM View, "run the resize steps": a plain `resize` at the window.
+  resize: { ctor: "Event", bubbles: false, cancelable: false, composed: false },
+  // HTML, "language preferences": a plain `languagechange` at the window.
+  languagechange: {
+    ctor: "Event",
+    bubbles: false,
+    cancelable: false,
+    composed: false,
+  },
+  // HTML, "checking if unloading is canceled": a cancelable
+  // `BeforeUnloadEvent` at the window, which script cannot construct
+  // (`document.createEvent` makes one, DOM's legacy table).
+  beforeunload: {
+    ctor: "BeforeUnloadEvent",
+    bubbles: false,
+    cancelable: true,
+    composed: false,
+  },
+  // HTML, "update the visibility state": `visibilitychange` at the document
+  // bubbles.
+  visibilitychange: {
+    ctor: "Event",
+    bubbles: true,
+    cancelable: false,
+    composed: false,
+  },
+  // Page Lifecycle, "freeze steps" and "resume steps": plain events at the
+  // document.
+  freeze: { ctor: "Event", bubbles: false, cancelable: false, composed: false },
+  resume: { ctor: "Event", bubbles: false, cancelable: false, composed: false },
+};
+
+/**
+ * A `MediaQueryList`'s `change` (CSSOM View, "evaluate media queries and
+ * report changes"): a `MediaQueryListEvent` with the list's `matches` and
+ * `media`, which does not bubble.
+ */
+const MEDIA_QUERY_CHANGE: EventShape = {
+  ctor: "MediaQueryListEvent",
+  bubbles: false,
+  cancelable: false,
+  composed: false,
+};
+
+/**
+ * An event at the visual viewport (CSSOM View, "run the resize steps" and
+ * "run the scroll steps"): a plain event that does not bubble.
+ */
+const VISUAL_VIEWPORT_EVENT: EventShape = {
+  ctor: "Event",
+  bubbles: false,
+  cancelable: false,
+  composed: false,
 };
 
 /** `DomEffect.effect` (§5.2). */
@@ -482,20 +578,63 @@ export function replayInput(ctx: ReplayContext): ReplayInjector {
   const OrigFile = w.File;
   const OrigBlob = w.Blob;
   const OrigDataTransfer = w.DataTransfer;
-  let injecting: Event | undefined;
+  // The input being dispatched and the stack depth its own listeners run
+  // at (ReplayContext.injection), and whether replay is applying an input's
+  // effects (see the stopper below).
+  const injection = ctx.injection;
+  let applying = false;
 
   for (const type of INPUT_EVENT_TYPES) {
     ctx.orig.addEventListener.call(
       w,
       type,
       (ev: Event) => {
-        if (ev.isTrusted && ev !== injecting) {
-          ev.stopImmediatePropagation();
-          if (ev.cancelable) ev.preventDefault();
+        if (ev === injection.event) {
+          // The depth the injected event's own listeners run at.
+          injection.depth = jsStackDepth();
+          return;
         }
+        if (!ev.isTrusted || !isInputEvent(w, ev)) return;
+        // A trusted event the page's own replayed code dispatches inside a
+        // call (`focus()`, `requestSubmit()`, a navigation's
+        // `beforeunload`) is the one the visitor's page saw there, which
+        // the recorder did not log as input (seams-dom.ts,
+        // `listenForPageEvents`), and reaches the page. Script lies below
+        // its listener: outside an injection any; inside one, more than
+        // below the injected event's own listeners, since the page's
+        // listener made the call. What the platform dispatches in reaction
+        // to an injected event (a checkbox's `input` and `change` after
+        // its `click`) runs at the injected event's own depth, and what it
+        // dispatches as an effect is applied (`focus()` for a focus effect)
+        // is replay's own: each was recorded as input of its own, and is
+        // injected from the log in its turn.
+        if (!applying) {
+          const depth = jsStackDepth();
+          const pageCaused =
+            injection.event === undefined ? depth > 1 : depth > injection.depth;
+          if (pageCaused) return;
+        }
+        ev.stopImmediatePropagation();
+        if (ev.cancelable) ev.preventDefault();
       },
       { capture: true },
     );
+  }
+  // The visual viewport's own events on replay are not the visitor's: they
+  // never reach the page, and the visitor's are injected from the log.
+  const vv = w.visualViewport;
+  if (vv !== null && vv !== undefined) {
+    for (const type of VISUAL_VIEWPORT_EVENT_TYPES) {
+      ctx.orig.addEventListener.call(vv, type, (ev: Event) => {
+        // An injected one passes no window listener: its depth is measured
+        // here, first on the viewport (ReplayContext.injection).
+        if (ev === injection.event) {
+          injection.depth = jsStackDepth();
+          return;
+        }
+        if (ev.isTrusted) ev.stopImmediatePropagation();
+      });
+    }
   }
   // The replay browser's own navigation events: a traversal's `popstate`,
   // a link's (an injected click activates it, where the visitor's click
@@ -510,7 +649,8 @@ export function replayInput(ctx: ReplayContext): ReplayInjector {
       type,
       (ev: Event) => {
         if (!ev.isTrusted) return;
-        const fromPage = dispatchedFromScript() && injecting === undefined;
+        const fromPage =
+          dispatchedFromScript() && injection.event === undefined;
         if (type === "popstate" && fromPage) return;
         ev.stopImmediatePropagation();
       },
@@ -637,31 +777,72 @@ export function replayInput(ctx: ReplayContext): ReplayInjector {
     return parts;
   };
 
+  /**
+   * An event of `shape`'s interface. A `BeforeUnloadEvent` has no
+   * constructor (HTML: it is created only by the platform), so it is made by
+   * `document.createEvent`, whose legacy table has it
+   * (https://dom.spec.whatwg.org/#dom-document-createevent), and initialised
+   * with the type and flags; it carries no recorded property.
+   */
+  const newEvent = (shape: EventShape, type: string, init: EventInit) => {
+    if (shape.ctor === "BeforeUnloadEvent") {
+      const ev = doc.createEvent("BeforeUnloadEvent");
+      ev.initEvent(type, init.bubbles, init.cancelable);
+      return ev;
+    }
+    const Ctor =
+      ((w as unknown as Record<string, typeof Event | undefined>)[
+        shape.ctor
+      ] as typeof Event | undefined) ?? w.Event;
+    return new Ctor(type, init);
+  };
+
   return {
     inject(input, effects) {
       ctx.claimTaskId(input.task_id);
-      for (const e of effects) {
-        const problem = apply(e);
-        if (problem !== undefined) return problem;
+      applying = true;
+      try {
+        for (const e of effects) {
+          const problem = apply(e);
+          if (problem !== undefined) return problem;
+        }
+      } finally {
+        applying = false;
       }
-      const target = resolveTarget(input.target, doc);
+      // A `MediaQueryList` the page made (`mql:<n>`) is no node: it is
+      // found among the lists, and only its `change` is input.
+      // So is the visual viewport (`visualViewport`), whose events are
+      // plain ones.
+      const isList = input.target.startsWith("mql:");
+      const isViewport = input.target === VISUAL_VIEWPORT_TARGET;
+      const target: EventTarget | null = isList
+        ? (ctx.mediaQueries.get(input.target) ?? null)
+        : isViewport
+          ? (w.visualViewport ?? null)
+          : resolveTarget(input.target, doc);
       if (target === null) return `target ${input.target} does not resolve`;
-      const shape = SHAPES[input.type];
+      const shape = isList
+        ? input.type === "change"
+          ? MEDIA_QUERY_CHANGE
+          : undefined
+        : isViewport
+          ? VISUAL_VIEWPORT_EVENT_TYPES.includes(input.type)
+            ? VISUAL_VIEWPORT_EVENT
+            : undefined
+          : SHAPES[input.type];
       if (shape === undefined)
         return `event type ${input.type} is not captured`;
       const props = JSON.parse(input.props) as Record<string, unknown>;
       delete props.touches;
       delete props.changedTouches;
-      const Ctor =
-        ((w as unknown as Record<string, typeof Event | undefined>)[
-          shape.ctor
-        ] as typeof Event | undefined) ?? w.Event;
       const bubbles = input.type === "scroll" ? target === doc : shape.bubbles;
-      const ev = new Ctor(input.type, {
+      const ev = newEvent(shape, input.type, {
         ...props,
         bubbles,
         cancelable: shape.cancelable,
-        composed: input.type !== "change" && input.type !== "submit",
+        composed:
+          shape.composed ??
+          (input.type !== "change" && input.type !== "submit"),
         view: w,
       } as EventInit);
       // A synthetic click on a checkbox or radio toggles it before the
@@ -682,11 +863,14 @@ export function replayInput(ctx: ReplayContext): ReplayInjector {
           el.checked = el.type === "checkbox" ? !checked : false;
         }
       }
-      injecting = ev;
+      // Until the injected event's own listener measures it, every trusted
+      // event of a captured type is the platform's reaction.
+      injection.depth = Infinity;
+      injection.event = ev;
       try {
         dispatch.call(target, ev);
       } finally {
-        injecting = undefined;
+        injection.event = undefined;
       }
       return "ok";
     },
