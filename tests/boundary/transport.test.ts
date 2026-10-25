@@ -23,12 +23,18 @@
  *   `navigator.doNotTrack` `null`, measured 2026-10-23), and Chromium has no
  *   GPC setting at all: browsers and extensions that send GPC define the
  *   property exactly so. The shim reads only the property.
- * - **The flush-deadline test wraps `fetch` in an init script** that runs
+ * - **The flush-deadline tests wrap `fetch` in an init script** that runs
  *   before the shim, so the shim captures the wrapper as the original and
  *   the transport's requests pass through it: it notes the browser time of
- *   each batch request and calls the real `fetch`. Nothing else observes
- *   when a batch leaves the page in browser time. The timer-spin test
- *   wraps `setTimeout` the same way, only to count the transport's timers.
+ *   each batch request (and the deadline the transport reports then) and
+ *   calls the real `fetch`. Nothing else observes when a batch leaves the
+ *   page in browser time. The timer-spin test wraps `setTimeout` the same
+ *   way, only to count the transport's timers.
+ * - **The cookie test sets the ingest's cookie with Playwright's
+ *   `addCookies`**, as a visitor's earlier visit to the ingest's host would
+ *   have: a `SameSite=None; Secure` cookie on `localhost`, the stub's host,
+ *   while the page is served from `127.0.0.1`, another site. The stub
+ *   records the `Cookie` header of every request.
  *
  * Not mocks, but departures from the default browser: the back/forward
  * cache test launches Chromium without Playwright's
@@ -70,6 +76,12 @@ const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const WORKSPACE = path.dirname(REPO_ROOT);
 const CLI = path.join(REPO_ROOT, "packages", "cli", "dist", "index.js");
 const TIMEOUT = 240_000;
+/** The transport's initial flush deadline, its fast batches and its cap (§11.1). */
+const DEADLINE_MS = 50;
+const FAST_BATCHES = 8;
+const DEADLINE_MAX_MS = 2000;
+/** The keepalive budget a batch is cut to, less the envelope allowance. */
+const FULL_BATCH_BYTES = 64 * 1024 - 1024;
 /** A canonical UUIDv7, the recording id the assembler requires. */
 const RECORDING_ID = "01890a5d-ac96-774b-bcce-b302099a8057";
 
@@ -90,6 +102,16 @@ interface TCdpSession {
 }
 interface TContext {
   newPage(): Promise<TPage>;
+  addCookies(
+    cookies: {
+      name: string;
+      value: string;
+      domain: string;
+      path: string;
+      secure: boolean;
+      sameSite: "None" | "Lax" | "Strict";
+    }[],
+  ): Promise<void>;
   newCDPSession(page: TPage): Promise<TCdpSession>;
   close(): Promise<void>;
 }
@@ -177,7 +199,7 @@ async function site(
 
 async function stub(
   config: unknown = { enabled: true },
-  options: { noStore?: boolean } = {},
+  options: { noStore?: boolean; host?: "127.0.0.1" | "localhost" } = {},
 ): Promise<StubIngest> {
   const s = await startStubIngest(config, options);
   servers.push(s);
@@ -257,6 +279,166 @@ function assemble(
 /** A double from a `Random{src: 1}` record's 8 bytes (little-endian). */
 const randomValue = (bytes: Uint8Array): number =>
   Buffer.from(bytes).readDoubleLE(0);
+
+/** One batch request the page made: when, its body, and the deadline then. */
+interface Send {
+  t: number;
+  body: number[];
+  deadline: number;
+}
+
+/**
+ * An init script, run before the shim, wrapping `fetch`: the shim captures
+ * the wrapper as the original, so every batch request of the transport
+ * passes through it, and it notes the browser time, the body and the flush
+ * deadline the transport reports at that moment (the deadline that governed
+ * the batch: the transport adapts it only after sending).
+ */
+const SEND_RECORDER =
+  "(() => { const real = window.fetch; " +
+  "const now = performance.now.bind(performance); " +
+  "window.__ctSends = []; " +
+  "window.fetch = function (input, init) { " +
+  "if (String(input).endsWith('/batches') && init && init.body) { " +
+  "const shim = window.__ctBoundaryShim; " +
+  "const s = shim && shim.uploadStatus ? shim.uploadStatus() : undefined; " +
+  "window.__ctSends.push({ t: now(), body: Array.from(init.body), " +
+  "deadline: s ? s.flushDeadlineMs : -1 }); } " +
+  "return real.apply(this, arguments); }; })();";
+
+async function sendsOf(page: TPage): Promise<Send[]> {
+  return page.evaluate(
+    () => (globalThis as unknown as { __ctSends: Send[] }).__ctSends,
+  );
+}
+
+/**
+ * The flush deadline each batch was due under, by §11.1's rule, worked out
+ * from the batches alone: 50 ms; after the first 8 batches, every batch the
+ * deadline cut (fewer than 256 records, under the byte bound, not final)
+ * doubles it, up to 2 s. Batch 0 is sent when the configuration arrives,
+ * not by the deadline, but it is one of the first 8 either way.
+ */
+function deadlineSchedule(
+  batches: { body: Uint8Array; parsed: ParsedBatch }[],
+): Map<number, number> {
+  const out = new Map<number, number>();
+  let d = DEADLINE_MS;
+  for (const { body, parsed } of [...batches].sort(
+    (a, b) => a.parsed.envelope.batch_seq - b.parsed.envelope.batch_seq,
+  )) {
+    const seq = parsed.envelope.batch_seq;
+    out.set(seq, d);
+    const full = parsed.records.length >= 256 || body.length > FULL_BATCH_BYTES;
+    if (!full && !parsed.envelope.final && seq + 1 >= FAST_BATCHES) {
+      d = Math.min(DEADLINE_MAX_MS, d * 2);
+    }
+  }
+  return out;
+}
+
+/**
+ * Check that no timed record waited longer than its batch's deadline.
+ * The page's ticks read `performance.now()`; such a read's value is the
+ * browser time it was made, so its wait is its batch's send time minus its
+ * value. Returns each batch's oldest wait and how many batches were excused
+ * by a stalled renderer.
+ *
+ * The bound is browser time in which the page runs. When the operating
+ * system does not schedule the renderer (seen under a 32-way CPU load: a
+ * batch sent 64 ms after its oldest read, its window holding 9 of the
+ * page's 5 ms ticks where 14 fit), nothing in the page runs, the transport
+ * included, and the batch goes the moment the page runs again. So a wait
+ * over the deadline passes only when the page's own ticks show that stall:
+ * none ran between the flush timer's aim (10 ms before the deadline) and
+ * the send (bar the one an overdue interval runs first, within 3 ms of it),
+ * and the ticks either side of the aim are at least three intervals apart.
+ * A transport that sends late while the page runs still fails.
+ *
+ * A short stall need not show in the ticks: under the same load the flush
+ * timer ran 10 to 19 ms past its aim with no tick in between, on a 25 ms
+ * page (no tick was due), after the page's ticks had ended, and on a 5 ms
+ * page with the ticks around the aim 12 ms apart (one tick late, not
+ * three). So a batch whose wait exceeds its deadline by at most
+ * {@link LATE_TIMER_SLACK_MS}, with no tick run between the aim and the
+ * send, also passes; it is counted in `unseen`. A longer overshoot needs
+ * the stall in the ticks, and a tick run after the aim fails either way: a
+ * transport whose timer is aimed late lets the page run first.
+ */
+function checkWaits(
+  got: ParsedBatch[],
+  sentAt: Map<number, number>,
+  deadlineOf: (batch: number) => number,
+  intervalAt: (t: number) => number,
+): {
+  oldestWait: Map<number, number>;
+  stalls: number;
+  unseen: number;
+  timed: number;
+} {
+  const bits = Buffer.alloc(8);
+  const waits: { batch: number; wait: number }[] = [];
+  for (const b of got) {
+    const t = sentAt.get(b.envelope.batch_seq)!;
+    for (const r of b.records) {
+      if (r.record === "Clock" && r.src === 2) {
+        bits.writeBigUInt64LE(r.bits);
+        waits.push({
+          batch: b.envelope.batch_seq,
+          wait: t - bits.readDoubleLE(0),
+        });
+      }
+    }
+  }
+  const ticks = waits
+    .map((w) => sentAt.get(w.batch)! - w.wait)
+    .sort((a, b) => a - b);
+  const oldestWait = new Map<number, number>();
+  for (const w of waits) {
+    expect(w.wait, `batch ${w.batch}`).toBeGreaterThanOrEqual(0);
+    oldestWait.set(w.batch, Math.max(oldestWait.get(w.batch) ?? 0, w.wait));
+  }
+  let stalls = 0;
+  let unseen = 0;
+  for (const [batch, wait] of oldestWait) {
+    const deadline = deadlineOf(batch);
+    if (wait <= deadline) continue;
+    const sent = sentAt.get(batch)!;
+    const aim = sent - wait + deadline - 10;
+    const ranMeanwhile = ticks.filter((v) => v > aim && v < sent - 3);
+    const before = ticks.filter((v) => v <= aim).pop();
+    const after = ticks.find((v) => v > aim);
+    const detail = `batch ${batch}: waited ${wait} ms, deadline ${deadline} ms; ticks ${JSON.stringify(ranMeanwhile)} ran after the aim ${aim}`;
+    expect(ranMeanwhile, detail).toEqual([]);
+    expect(before, detail).toBeDefined();
+    if (wait - deadline <= LATE_TIMER_SLACK_MS) {
+      unseen += 1;
+      continue;
+    }
+    expect(after, detail).toBeDefined();
+    expect(after! - before!, detail).toBeGreaterThanOrEqual(
+      3 * intervalAt(aim),
+    );
+    stalls += 1;
+  }
+  return { oldestWait, stalls, unseen, timed: waits.length };
+}
+
+/**
+ * How far past its deadline a batch may leave, with no page task run in
+ * between, without the ticks showing a stall (see {@link checkWaits}).
+ */
+const LATE_TIMER_SLACK_MS = 15;
+
+/** When each batch first left the page, in browser time, by batch_seq. */
+function sendTimes(sends: Send[]): Map<number, Send> {
+  const out = new Map<number, Send>();
+  for (const s of sends) {
+    const b = parseBatch(Uint8Array.from(s.body));
+    if (!out.has(b.envelope.batch_seq)) out.set(b.envelope.batch_seq, s);
+  }
+  return out;
+}
 
 beforeAll(async () => {
   const fromEnv = process.env.CT_JSBOUND;
@@ -718,21 +900,12 @@ describe("the batched upload transport", () => {
       const ingest = await stub();
       const server = await site(ingest);
       const context = await browser.newContext();
-      let sends: { t: number; body: number[] }[];
+      let sends: Send[];
       try {
         const page = await context.newPage();
         // Before the shim: the shim captures this wrapper as `fetch`, so the
         // transport's requests pass through it (see the header).
-        await page.addInitScript({
-          content:
-            "(() => { const real = window.fetch; " +
-            "const now = performance.now.bind(performance); " +
-            "window.__ctSends = []; " +
-            "window.fetch = function (input, init) { " +
-            "if (String(input).endsWith('/batches') && init && init.body) " +
-            "window.__ctSends.push({ t: now(), body: Array.from(init.body) }); " +
-            "return real.apply(this, arguments); }; })();",
-        });
+        await page.addInitScript({ content: SEND_RECORDER });
         await page.goto(`${server.origin}/transport.html`);
         await until(() => status(page), idle, "the transport did not go idle");
         // A known rate: a 5 ms interval, each tick a Task and a Clock.
@@ -751,87 +924,53 @@ describe("the batched upload transport", () => {
           "the burst did not finish",
         );
         await until(() => status(page), idle, "the transport did not go idle");
-        sends = await page.evaluate(
-          () =>
-            (
-              globalThis as unknown as {
-                __ctSends: { t: number; body: number[] }[];
-              }
-            ).__ctSends,
-        );
+        sends = await sendsOf(page);
       } finally {
         await context.close();
       }
-      // When each batch left the page, in browser time, by batch_seq.
-      const sentAt = new Map<number, number>();
-      for (const s of sends) {
-        const b = parseBatch(Uint8Array.from(s.body));
-        if (!sentAt.has(b.envelope.batch_seq))
-          sentAt.set(b.envelope.batch_seq, s.t);
-      }
+      const sent = sendTimes(sends);
       const got = ingest.batches.map((b) => b.parsed);
-      expect(sentAt.size).toBe(got.length);
-      const bits = Buffer.alloc(8);
-      const waits: { batch: number; wait: number; size: number }[] = [];
+      expect(sent.size).toBe(got.length);
+      // At most 256 records per batch.
       for (const b of got) {
-        // At most 256 records per batch.
         expect(
           b.records.length,
           `batch ${b.envelope.batch_seq}`,
         ).toBeLessThanOrEqual(256);
-        const t = sentAt.get(b.envelope.batch_seq)!;
-        for (const r of b.records) {
-          // A performance.now() read's value is the browser time it was
-          // made, so its wait is the batch's send time minus its value.
-          if (r.record === "Clock" && r.src === 2) {
-            bits.writeBigUInt64LE(r.bits);
-            waits.push({
-              batch: b.envelope.batch_seq,
-              wait: t - bits.readDoubleLE(0),
-              size: b.records.length,
-            });
-          }
-        }
       }
+      // The deadline each batch was due under: 50 ms for the first 8, then
+      // doubled by each batch the deadline cut (§11.1). The transport
+      // reports the same deadline when it sends each batch.
+      const schedule = deadlineSchedule(ingest.batches);
+      for (const [seq, s] of sent) {
+        expect(s.deadline, `batch ${seq}`).toBe(schedule.get(seq));
+        if (seq < FAST_BATCHES) expect(s.deadline).toBe(DEADLINE_MS);
+      }
+      const sentAt = new Map([...sent].map(([k, s]) => [k, s.t]));
+      const { oldestWait, stalls, unseen, timed } = checkWaits(
+        got,
+        sentAt,
+        (b) => schedule.get(b)!,
+        () => 5,
+      );
+      // Most batches met their deadline outright.
+      expect(stalls + unseen, "batches excused").toBeLessThan(got.length / 2);
       // Vacuity guards: the ticks were timed, a batch was cut by the count
-      // (exactly 256 records), and one by the deadline (fewer records, its
-      // oldest timed record having waited a good part of the 50 ms).
-      expect(waits.length).toBeGreaterThanOrEqual(150);
+      // (exactly 256 records), and one of the first 8 by the 50 ms deadline
+      // (fewer records, its oldest timed record having waited a good part
+      // of the 50 ms), so the 50 ms bound was exercised; and the deadline
+      // grew past 50 ms in the run.
+      expect(timed).toBeGreaterThanOrEqual(150);
       expect(got.some((b) => b.records.length === 256)).toBe(true);
-      expect(waits.some((w) => w.size < 256 && w.wait >= 20)).toBe(true);
-      // The bound is browser time in which the page runs. When the operating
-      // system does not schedule the renderer (seen under a 32-way CPU
-      // load: a batch sent 64 ms after its oldest read, its window holding
-      // 9 of the page's 5 ms ticks where 14 fit), nothing in the page runs,
-      // the transport included, and the batch goes the moment the page runs
-      // again. So a wait over 50 ms passes only when the page's own ticks
-      // show that stall: none ran between the flush timer's aim (40 ms) and
-      // the send (bar the one an overdue interval runs first, within 3 ms
-      // of it), and the ticks either side of the aim are at least 15 ms
-      // apart. A transport that sends late while the page runs still fails.
-      const ticks = waits
-        .map((w) => sentAt.get(w.batch)! - w.wait)
-        .sort((a, b) => a - b);
-      const oldestWait = new Map<number, number>();
-      for (const w of waits) {
-        expect(w.wait, `batch ${w.batch}`).toBeGreaterThanOrEqual(0);
-        oldestWait.set(w.batch, Math.max(oldestWait.get(w.batch) ?? 0, w.wait));
-      }
-      let stalls = 0;
-      for (const [batch, wait] of oldestWait) {
-        if (wait <= 50) continue;
-        const sent = sentAt.get(batch)!;
-        const aim = sent - wait + 40;
-        const ranMeanwhile = ticks.filter((v) => v > aim && v < sent - 3);
-        const before = ticks.filter((v) => v <= aim).pop();
-        const after = ticks.find((v) => v > aim);
-        const detail = `batch ${batch}: waited ${wait} ms; ticks ${JSON.stringify(ranMeanwhile)} ran after the aim ${aim}`;
-        expect(ranMeanwhile, detail).toEqual([]);
-        expect(before, detail).toBeDefined();
-        expect(after, detail).toBeDefined();
-        expect(after! - before!, detail).toBeGreaterThanOrEqual(15);
-        stalls += 1;
-      }
+      expect(
+        got.some(
+          (b) =>
+            b.envelope.batch_seq < FAST_BATCHES &&
+            b.records.length < 256 &&
+            (oldestWait.get(b.envelope.batch_seq) ?? 0) >= 20,
+        ),
+      ).toBe(true);
+      expect(Math.max(...schedule.values())).toBeGreaterThan(DEADLINE_MS);
       expect(stalls, "batches excused by a stalled page").toBeLessThanOrEqual(
         2,
       );
@@ -852,6 +991,222 @@ describe("the batched upload transport", () => {
           (r) => r.record === "NetRequest" && r.url.startsWith(ingest.base),
         ),
       ).toEqual([]);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "transport_backs_off_its_flush_deadline_when_batches_are_cut_by_it",
+    async () => {
+      // A page that keeps writing a few records at a time must not make a
+      // request every 50 ms: the ingest allows 600 requests per client and
+      // site key a minute, and 4096 batches a session. First a steady 25 ms
+      // timer (80 records a second: every batch is cut by the deadline,
+      // which doubles after the first 8 batches up to its 2 s cap), then a
+      // steady 5 ms timer (400 records a second: batches are cut at 256
+      // records, which leaves the deadline as it is).
+      const ingest = await stub();
+      const server = await site(ingest);
+      const context = await browser.newContext();
+      let sends: Send[];
+      let fastFrom: number;
+      try {
+        const page = await context.newPage();
+        await page.addInitScript({ content: SEND_RECORDER });
+        await page.goto(`${server.origin}/transport.html`);
+        await until(() => status(page), idle, "the transport did not go idle");
+        await page.click("#steady-slow");
+        await until(
+          () => textOf(page, "steady-done"),
+          (t) => t === "480",
+          "the 25 ms ticks did not finish",
+          60_000,
+        );
+        await until(
+          () => status(page),
+          idle,
+          "the transport did not go idle",
+          10_000,
+        );
+        await page.evaluate(() => {
+          document.getElementById("steady-done")!.textContent = "";
+        });
+        fastFrom = await page.evaluate(() => performance.now());
+        await page.click("#steady-fast");
+        await until(
+          () => textOf(page, "steady-done"),
+          (t) => t === "2000",
+          "the 5 ms ticks did not finish",
+          60_000,
+        );
+        await until(
+          () => status(page),
+          idle,
+          "the transport did not go idle",
+          10_000,
+        );
+        sends = await sendsOf(page);
+      } finally {
+        await context.close();
+      }
+      const sent = sendTimes(sends);
+      const got = ingest.batches.map((b) => b.parsed);
+      expect(sent.size).toBe(got.length);
+      const schedule = deadlineSchedule(ingest.batches);
+      const order = [...sent.keys()].sort((a, b) => a - b);
+      // The transport's deadline is the rule's, batch by batch; the first 8
+      // batches are due at 50 ms; it never exceeds the cap, and reaches it.
+      for (const seq of order) {
+        const d = sent.get(seq)!.deadline;
+        expect(d, `batch ${seq}`).toBe(schedule.get(seq));
+        if (seq < FAST_BATCHES) expect(d, `batch ${seq}`).toBe(DEADLINE_MS);
+        expect(d).toBeLessThanOrEqual(DEADLINE_MAX_MS);
+      }
+      // The ramp: 50 ms x 8, then each deadline-cut batch doubles it.
+      const distinct = [...new Set(order.map((s) => sent.get(s)!.deadline))];
+      expect(distinct).toEqual([50, 100, 200, 400, 800, 1600, 2000]);
+      for (const b of got) {
+        expect(
+          b.records.length,
+          `batch ${b.envelope.batch_seq}`,
+        ).toBeLessThanOrEqual(256);
+      }
+      const sentAt = new Map([...sent].map(([k, s]) => [k, s.t]));
+      const { oldestWait, stalls, unseen } = checkWaits(
+        got,
+        sentAt,
+        (b) => schedule.get(b)!,
+        (t) => (t < fastFrom ? 25 : 5),
+      );
+      // Most batches met their deadline outright.
+      expect(stalls + unseen, "batches excused").toBeLessThan(got.length / 2);
+      expect(stalls, "batches excused by a stalled page").toBeLessThanOrEqual(
+        2,
+      );
+      // At the cap, in the slow phase: batches cut by the 2 s deadline,
+      // whose oldest record really waited most of it, sent about 2 s apart:
+      // 30 requests a minute.
+      const slowAtCap = order.filter(
+        (s) =>
+          sentAt.get(s)! < fastFrom &&
+          sent.get(s)!.deadline === DEADLINE_MAX_MS &&
+          got[s].records.length < 256,
+      );
+      expect(slowAtCap.length).toBeGreaterThanOrEqual(2);
+      for (const s of slowAtCap) {
+        expect(oldestWait.get(s) ?? 0, `batch ${s}`).toBeGreaterThanOrEqual(
+          1500,
+        );
+      }
+      for (let i = 1; i < slowAtCap.length; i++) {
+        if (slowAtCap[i] !== slowAtCap[i - 1] + 1) continue;
+        expect(
+          sentAt.get(slowAtCap[i])! - sentAt.get(slowAtCap[i - 1])!,
+        ).toBeGreaterThanOrEqual(1900);
+      }
+      // The fast phase: full batches of 256 records, each sent long before
+      // the 2 s deadline, which they leave as it was.
+      const fast = order.filter((s) => sentAt.get(s)! >= fastFrom);
+      const full = fast.filter((s) => got[s].records.length === 256);
+      expect(full.length).toBeGreaterThanOrEqual(10);
+      for (const s of fast) {
+        expect(sent.get(s)!.deadline, `batch ${s}`).toBe(DEADLINE_MAX_MS);
+      }
+      for (const s of full) {
+        expect(oldestWait.get(s) ?? 0, `batch ${s}`).toBeLessThan(1500);
+      }
+      // Between the first full batch and the last batch of the run, every
+      // batch is full: none leaves before its oldest record's deadline (a
+      // flush timer armed for a record a full batch took is cancelled with
+      // it, or it would fire early and send a part batch).
+      for (const s of fast.filter(
+        (x) => x > full[0] && x < fast[fast.length - 1],
+      )) {
+        expect(got[s].records.length, `batch ${s}`).toBe(256);
+      }
+      // Every record arrived: one contiguous run of seqs, no drops.
+      const seqs = got.flatMap(seqsOf);
+      expect(seqs).toEqual(seqs.map((_, i) => i + 1));
+      expect(got.every((b) => b.envelope.dropped.length === 0)).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "transport_final_flush_carries_no_ingest_cookie",
+    async () => {
+      // The ingest's host on another site than the page (localhost against
+      // 127.0.0.1), holding a SameSite=None cookie: what a visitor signed in
+      // to the ingest's host elsewhere carries. A request with credentials
+      // sends it; the transport's final flush, at pagehide, must not.
+      const ingest = await stub({ enabled: true }, { host: "localhost" });
+      const server = await site(ingest);
+      const context = await browser.newContext();
+      await context.addCookies([
+        {
+          name: "ct_visitor",
+          value: "signed-in",
+          domain: "localhost",
+          path: "/",
+          secure: true,
+          sameSite: "None",
+        },
+      ]);
+      const isControl = (r: { path: string }) =>
+        r.path.endsWith("/control-beacon");
+      const batchRequests = () =>
+        ingest.requests.filter(
+          (r) => r.method === "POST" && r.path.endsWith("/batches"),
+        );
+      try {
+        const page = await context.newPage();
+        await page.goto(`${server.origin}/transport.html`);
+        await until(() => status(page), idle, "the transport did not go idle");
+        // Positive control: a beacon the page sends to the ingest carries
+        // the cookie (a beacon's credentials mode is always include), and
+        // the ingest refuses it.
+        // (Its own path, so the batches the shim uploads meanwhile, which
+        // record the page's beacon, are not mistaken for it.)
+        expect(
+          await page.evaluate(
+            (url: string) => navigator.sendBeacon(url, new Blob(["x"])),
+            `${ingest.base}/control-beacon`,
+          ),
+        ).toBe(true);
+        const control = (await until(
+          async () => ingest.requests.find(isControl),
+          (r) => r !== undefined && r.status !== undefined,
+          "the page's beacon did not arrive",
+        ))!;
+        expect(control.cookie).toBe("ct_visitor=signed-in");
+        expect(control.status).toBe(403);
+        // Records waiting at pagehide, then leave the page.
+        for (let i = 0; i < 3; i++) await page.click("#one");
+        await page.goto(`${server.origin}/transport-consent.html`);
+        await until(
+          async () => ingest.batches.some((b) => b.parsed.envelope.final),
+          (f) => f,
+          "the final batch did not arrive",
+        );
+      } finally {
+        await context.close();
+      }
+      // The final batch was accepted, carrying End, and no request of the
+      // transport carried the cookie: the page's beacon is the only one.
+      const final = ingest.batches.find((b) => b.parsed.envelope.final)!;
+      expect(final.parsed.records.some((r) => r.record === "End")).toBe(true);
+      const withCookie = ingest.requests.filter((r) => r.cookie !== undefined);
+      expect(withCookie.map(isControl), JSON.stringify(withCookie)).toEqual([
+        true,
+      ]);
+      expect(ingest.requests.filter((r) => r.status === 403).length).toBe(1);
+      // Vacuity guard: the transport made batch requests, every one after
+      // the cookie existed.
+      expect(batchRequests().length).toBeGreaterThanOrEqual(2);
+      // The whole session assembles without a Gap.
+      const records = assemble(ingest.batches.map((b) => b.body));
+      expect(records.filter((r) => r.record === "Gap")).toEqual([]);
+      expect(records[records.length - 1].record).toBe("End");
     },
     TIMEOUT,
   );

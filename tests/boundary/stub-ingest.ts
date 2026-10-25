@@ -35,6 +35,8 @@ export interface StubRequest {
   /** `performance.now()` of this process when the request ended. */
   at: number;
   status?: number;
+  /** The `Cookie` header it carried, if any (the stub refuses it, 403). */
+  cookie?: string;
 }
 
 export interface StubIngest {
@@ -65,10 +67,13 @@ export interface StubIngest {
  * Start a stub ingest answering `config` on a free loopback port. With
  * `noStore`, every answer carries `Cache-Control: no-store`, which the
  * ingest's do not: the positive control of the back/forward-cache test.
+ * `host` names the loopback host in its base URL (default `127.0.0.1`):
+ * `localhost` puts the ingest on another site than a page served from
+ * `127.0.0.1`, as a production ingest is, so that cookie rules apply.
  */
 export async function startStubIngest(
   config: unknown,
-  options: { noStore?: boolean } = {},
+  options: { noStore?: boolean; host?: "127.0.0.1" | "localhost" } = {},
 ): Promise<StubIngest> {
   const requests: StubRequest[] = [];
   const batches: { body: Uint8Array; parsed: ParsedBatch }[] = [];
@@ -112,6 +117,9 @@ export async function startStubIngest(
         method: req.method ?? "",
         path,
         at: performance.now(),
+        ...(req.headers.cookie === undefined
+          ? {}
+          : { cookie: req.headers.cookie }),
       };
       requests.push(entry);
       const origin = req.headers.origin;
@@ -196,6 +204,6 @@ export async function startStubIngest(
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as { port: number }).port;
-  stub.base = `http://127.0.0.1:${port}${STUB_SITE_PATH}`;
+  stub.base = `http://${options.host ?? "127.0.0.1"}:${port}${STUB_SITE_PATH}`;
   return stub;
 }

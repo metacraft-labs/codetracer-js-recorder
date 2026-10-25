@@ -6,7 +6,10 @@
 //   `Math.random()` reads in the same task, each value kept in
 //   `window.__randoms` so a test can tell which records reached the ingest;
 // - `#ticks`: a 5 ms `setInterval` whose 150 ticks each read
-//   `performance.now()`.
+//   `performance.now()`; `#steady-slow` (480 ticks of 25 ms) and
+//   `#steady-fast` (2000 ticks of 5 ms) do the same at the interval and
+//   count in their `data-interval` and `data-n`, each reporting in its own
+//   `data-done` element.
 //
 // `?consent=yes|no`, or `data-consent` on the root element (as in
 // `transport-consent.html`, for a session that is replayed: the recorded
@@ -42,16 +45,22 @@
   document.getElementById("burst").addEventListener("click", burst);
   document.getElementById("burst-600").addEventListener("click", burst);
 
-  document.getElementById("ticks").addEventListener("click", function (e) {
-    var n = Number(e.currentTarget.getAttribute("data-n"));
+  function ticks(e) {
+    var button = e.currentTarget;
+    var n = Number(button.getAttribute("data-n"));
+    var interval = Number(button.getAttribute("data-interval") || "5");
+    var done = button.getAttribute("data-done") || "ticks-done";
     var seen = 0;
     var timer = setInterval(function () {
       performance.now();
       seen += 1;
       if (seen === n) {
         clearInterval(timer);
-        document.getElementById("ticks-done").textContent = String(n);
+        document.getElementById(done).textContent = String(n);
       }
-    }, 5);
-  });
+    }, interval);
+  }
+  document.getElementById("ticks").addEventListener("click", ticks);
+  document.getElementById("steady-slow").addEventListener("click", ticks);
+  document.getElementById("steady-fast").addEventListener("click", ticks);
 })();

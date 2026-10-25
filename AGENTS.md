@@ -77,9 +77,12 @@ This is a monorepo managed with npm workspaces:
   dev shell provides (`PLAYWRIGHT_CORE_PATH`, `PLAYWRIGHT_BROWSERS_PATH`).
 * `packages/runtime-browser/src/batch-transport.ts` — `HttpBatchTransport`,
   the batched upload transport of boundary recording: a capped ring with
-  drop accounting, batches of at most 256 records or 50 ms with the
-  Boundary-Ingest envelope (`encodeBatch` from `packages/boundary-format`,
-  never a second codec), `sendBeacon` at `pagehide`/hidden, and the consent
+  drop accounting, batches of at most 256 records or the flush deadline (50 ms
+  for a session's first 8 batches, then doubled by each batch it cuts, up to
+  2 s) with the Boundary-Ingest envelope (`encodeBatch` from
+  `packages/boundary-format`, never a second codec), a `keepalive` fetch
+  without credentials at `pagehide`/hidden (`sendBeacon` only as its
+  fallback: a beacon always sends cookies), and the consent
   gates (DNT, GPC, the page's consent callback, the ingest's `config`). The
   shim uses it when installed with `boundary-shim --ingest <url>` and imports
   it by its subpath (`@codetracer/runtime-browser/dist/batch-transport.js`)

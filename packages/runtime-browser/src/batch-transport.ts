@@ -12,20 +12,31 @@
  * batch's `dropped`, so the assembler turns it into a `Gap`:
  *
  * - **Batches.** A batch is sent once 256 records are waiting, or once the
- *   oldest waiting record has waited (almost) 50 ms, whichever comes
- *   first, with `fetch(…, {keepalive: true})`. One request is in flight at
- *   a time, so batches arrive in `batch_seq` order; a batch holds at most
- *   256 records and, so that `keepalive` applies to it, at most 64 KiB
- *   unless a single frame is larger.
+ *   oldest waiting record has waited (almost) the flush deadline, whichever
+ *   comes first, with `fetch(…, {keepalive: true})`. One request is in
+ *   flight at a time, so batches arrive in `batch_seq` order; a batch holds
+ *   at most 256 records and, so that `keepalive` applies to it, at most
+ *   64 KiB unless a single frame is larger.
+ * - **The deadline adapts.** It is 50 ms for the first 8 batches of a
+ *   session. After those, every batch the deadline cut (rather than the
+ *   record or byte bound) doubles it, up to 2 s, so a page that keeps
+ *   writing a few records at a time settles at one request every 2 s
+ *   instead of one every 50 ms: about 30 requests a minute per tab, inside
+ *   the ingest's per-client request rate with room for many tabs, and far
+ *   from its per-session batch cap. A batch cut by the record or byte bound
+ *   leaves the deadline as it is.
  * - **The ring.** Unsent frames are capped (default 4 MiB). When the cap is
  *   reached and a batch can be sent, it is sent; when it cannot (a request
  *   is in flight, or the gates below are still closed), the oldest unsent
  *   frames are dropped. `Header` and `Env`, which the first batch must
  *   begin with, and `End` are never dropped.
  * - **Leaving the page.** At `pagehide` and when the document becomes
- *   hidden every waiting frame is sent at once with `navigator.sendBeacon`
- *   (falling back to a `keepalive` fetch when the browser refuses the
- *   beacon), since the page may never run again.
+ *   hidden every waiting frame is sent at once, since the page may never
+ *   run again: with a `keepalive` fetch without credentials, and with
+ *   `navigator.sendBeacon` only where such a fetch is unavailable or
+ *   refused (over the document's keepalive budget). A beacon's credentials
+ *   mode is always `include`, so it would carry the ingest host's
+ *   `SameSite=None` cookies, which the ingest refuses.
  * - **Gates (§11.2).** No request at all is made when the browser sends Do
  *   Not Track (`navigator.doNotTrack == "1"`) or Global Privacy Control
  *   (`navigator.globalPrivacyControl === true`); when the page requires
@@ -68,8 +79,19 @@ export const MIN_RING_BYTES = 1024;
 export const MAX_RING_BYTES = 64 * 1024 * 1024;
 /** A batch is sent once this many records wait, and holds at most this many (§11.1). */
 export const FLUSH_RECORDS = 256;
-/** No record waits longer than this, in ms of browser time, before its batch is sent (§11.1). */
+/**
+ * No record of the first {@link FLUSH_FAST_BATCHES} batches waits longer
+ * than this, in ms of browser time, before its batch is sent (§11.1).
+ */
 export const FLUSH_DEADLINE_MS = 50;
+/** How many batches of a session the initial deadline holds for, unchanged. */
+export const FLUSH_FAST_BATCHES = 8;
+/**
+ * The longest the deadline grows to: after the first
+ * {@link FLUSH_FAST_BATCHES} batches each batch cut by the deadline doubles
+ * it, up to this.
+ */
+export const FLUSH_DEADLINE_MAX_MS = 2000;
 /**
  * How far ahead of the deadline the flush timer is aimed. A timer fires no
  * earlier than asked and, on a busy page, some milliseconds later; aiming
@@ -293,6 +315,8 @@ export interface TransportStatus {
   bufferedBytes: number;
   /** The ring's cap now. */
   ringBytes: number;
+  /** The flush deadline now, in ms: what the next batch waits at most. */
+  flushDeadlineMs: number;
 }
 
 export interface HttpBatchTransportOptions {
@@ -313,8 +337,13 @@ export interface HttpBatchTransportOptions {
   ringBytes?: number;
   /** A batch is sent once this many records wait (default 256). */
   flushRecords?: number;
-  /** The longest a record waits before its batch is sent, in ms (default 50). */
+  /**
+   * The longest a record of the first {@link FLUSH_FAST_BATCHES} batches
+   * waits before its batch is sent, in ms (default 50).
+   */
   flushDeadlineMs?: number;
+  /** The longest the adapting deadline grows to, in ms (default 2000). */
+  flushDeadlineMaxMs?: number;
   /** Platform functions to use instead of the resolved originals. */
   originals?: Partial<TransportOriginals>;
   /** The window whose navigator, document and location are read (default `globalThis`). */
@@ -349,6 +378,8 @@ interface Batch {
   hasHeader: boolean;
   final: boolean;
   attempts: number;
+  /** The record or byte bound cut it (more frames were waiting behind it). */
+  full: boolean;
 }
 
 /**
@@ -462,7 +493,11 @@ export class HttpBatchTransport {
   private readonly orig: TransportOriginals;
   private readonly win: Window;
   private readonly flushRecords: number;
-  private readonly flushDeadlineMs: number;
+  /** The flush deadline now; it grows, never shrinks (see the module notes). */
+  private flushDeadlineMs: number;
+  private readonly flushDeadlineMaxMs: number;
+  /** Bytes of this document's `keepalive` requests not yet settled. */
+  private keepaliveBytes = 0;
   private readonly onDisabled: ((reason: string) => void) | undefined;
   private readonly sessionId: string;
   private readonly buildHash: string;
@@ -508,6 +543,10 @@ export class HttpBatchTransport {
     this.flushDeadlineMs = Math.max(
       0,
       options.flushDeadlineMs ?? FLUSH_DEADLINE_MS,
+    );
+    this.flushDeadlineMaxMs = Math.max(
+      this.flushDeadlineMs,
+      options.flushDeadlineMaxMs ?? FLUSH_DEADLINE_MAX_MS,
     );
     this.onDisabled = options.onDisabled;
     this.sessionId = options.sessionId;
@@ -592,8 +631,8 @@ export class HttpBatchTransport {
   /**
    * The session ended. `endFrame`, when given, is its `End` frame, taken
    * as the last frame; without it `End` must already have been appended.
-   * Sends what is left, the last batch `final`, by beacon when `unloading`
-   * (the page is going away). Resolves once the final batch is answered,
+   * Sends what is left, the last batch `final`, at once when `unloading`
+   * (the page is going away, {@link sendLeaving}). Resolves once the final batch is answered,
    * or the transport is off.
    */
   end(unloading = false, endFrame?: Uint8Array): Promise<void> {
@@ -602,7 +641,7 @@ export class HttpBatchTransport {
       // Ended before End is taken, so no batch carries End without `final`.
       this.ended = true;
       if (endFrame !== undefined) this.enqueue(endFrame, undefined);
-      if (unloading) this.drainByBeacon();
+      if (unloading) this.drainNow();
       else this.pump();
     });
     return this.settled;
@@ -671,6 +710,7 @@ export class HttpBatchTransport {
       bufferedFrames: this.queuedRecords,
       bufferedBytes: this.queuedBytes,
       ringBytes: this.ringBytes,
+      flushDeadlineMs: this.flushDeadlineMs,
     };
   }
 
@@ -779,6 +819,18 @@ export class HttpBatchTransport {
   /** Send one batch when a batch can be sent and there is one to send. */
   private pump(): void {
     if (!this.canSend()) return;
+    // Whether the deadline is what sends this batch: its oldest record has
+    // reached the flush timer's aim (less a millisecond, for a timer whose
+    // delay the browser rounded), and the batch is not cut by the record or
+    // byte bound (known once it is built). A batch sent before its oldest
+    // record's aim (the configuration just arrived, or a timer armed for a
+    // record a full batch already took) does not count.
+    const oldest = this.oldestAt();
+    const deadlineReached =
+      !this.ended &&
+      !this.halted &&
+      oldest !== undefined &&
+      this.now() - oldest >= this.flushDeadlineMs - FLUSH_TIMER_LEAD_MS - 1;
     // At most what `keepalive` can carry, so that a batch in flight when
     // the page goes away is still delivered (a larger frame goes alone).
     const batch = this.takeBatch(KEEPALIVE_BODY_LIMIT);
@@ -789,6 +841,26 @@ export class HttpBatchTransport {
       return;
     }
     this.send(batch, false);
+    // Not armed while a batch is in flight: the answer re-arms it, for the
+    // record then oldest. A timer armed for a record this batch took would
+    // otherwise fire before the next record's deadline and send early.
+    this.cancelTimer("flushTimer");
+    if (deadlineReached && !batch.full) this.cutByDeadline(batch.batchSeq);
+  }
+
+  /**
+   * Batch `batchSeq` was cut by the deadline: once the first
+   * {@link FLUSH_FAST_BATCHES} batches have gone, double the deadline, up to
+   * its maximum. A page that keeps writing a few records at a time would
+   * otherwise make a request every 50 ms, more than the ingest's
+   * per-client request rate allows (JS-Boundary-Recording §11.1).
+   */
+  private cutByDeadline(batchSeq: number): void {
+    if (batchSeq + 1 < FLUSH_FAST_BATCHES) return;
+    this.flushDeadlineMs = Math.min(
+      this.flushDeadlineMaxMs,
+      Math.max(1, this.flushDeadlineMs * 2),
+    );
   }
 
   /**
@@ -805,6 +877,7 @@ export class HttpBatchTransport {
     let firstSeq: number | undefined;
     let lastSeq: number | undefined;
     let hasHeader = false;
+    let full = false;
     while (this.queue.length > 0) {
       const e = this.queue.at(0)!;
       if (e.kind === "drop") {
@@ -814,8 +887,13 @@ export class HttpBatchTransport {
         this.queue.shift();
         continue;
       }
-      if (records >= this.flushRecords) break;
-      if (records > 0 && bytes + e.bytes.length > limit) break;
+      if (
+        records >= this.flushRecords ||
+        (records > 0 && bytes + e.bytes.length > limit)
+      ) {
+        full = true;
+        break;
+      }
       this.queue.shift();
       this.queuedBytes -= e.bytes.length;
       this.queuedRecords -= 1;
@@ -870,6 +948,7 @@ export class HttpBatchTransport {
       hasHeader,
       final,
       attempts: 0,
+      full: full || records >= this.flushRecords,
     };
   }
 
@@ -877,9 +956,9 @@ export class HttpBatchTransport {
    * The session ended with nothing left to send but no batch was `final`
    * (a recorder that appended `End` before calling {@link end}, whose
    * batch had already left): a final batch of no frames, carrying any
-   * drops still to report. Sent by beacon when the page is going away.
+   * drops still to report. Sent at once when the page is going away.
    */
-  private sendFinalEmpty(beacon = false): void {
+  private sendFinalEmpty(leaving = false): void {
     const dropped: [number, number][] = [];
     while (this.queue.length > 0) {
       const e = this.queue.shift()!;
@@ -909,22 +988,27 @@ export class HttpBatchTransport {
         hasHeader: false,
         final: true,
         attempts: 0,
+        full: false,
       },
-      beacon,
+      leaving,
     );
-    if (beacon) this.finish();
+    if (leaving) this.finish();
   }
 
   private hasFrames(): boolean {
     return this.queuedRecords > 0;
   }
 
-  /** Send `batch` with fetch (`keepalive` when it fits), or by beacon. */
-  private send(batch: Batch, beacon: boolean): void {
+  /**
+   * Send `batch` with fetch (`keepalive` when it fits), or, when the page
+   * is `leaving`, without waiting for an answer ({@link sendLeaving}).
+   */
+  private send(batch: Batch, leaving: boolean): void {
     const routes = this.routes!;
     this.batchesSent += 1;
-    if (beacon && this.beacon(routes.batches, batch.body)) return;
-    const keepalive = batch.body.length <= KEEPALIVE_BODY_LIMIT;
+    if (leaving) return this.sendLeaving(routes.batches, batch.body);
+    const keepalive =
+      batch.body.length <= KEEPALIVE_BODY_LIMIT - this.keepaliveBytes;
     let request: Promise<Response>;
     try {
       const init: RequestInit = {
@@ -939,26 +1023,89 @@ export class HttpBatchTransport {
       const timeout = (
         AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal }
       ).timeout;
-      if (!beacon && typeof timeout === "function") {
+      if (typeof timeout === "function") {
         init.signal = timeout.call(AbortSignal, REQUEST_TIMEOUT_MS);
       }
       request = this.orig.fetch!.call(this.win, routes.batches, init);
     } catch {
       // A keepalive fetch over the document's budget throws synchronously.
-      if (!beacon) this.failed(batch, undefined);
+      this.failed(batch, undefined);
       return;
     }
-    if (beacon) {
-      // The page is going away: nothing will read the answer.
-      this.then(request, undefined, () => undefined);
-      return;
-    }
+    if (keepalive) this.holdKeepalive(request, batch.body.length);
     this.inFlight = batch;
     this.then(
       request,
       (res: Response) => this.guard(() => this.answered(batch, res)),
       () => this.guard(() => this.failed(batch, undefined)),
     );
+  }
+
+  /**
+   * Send `body` as the page goes away, reading no answer: with a
+   * `keepalive` fetch without credentials, and by `sendBeacon` only when
+   * that fetch is unavailable, would exceed the document's keepalive
+   * budget, or throws. Not when its promise is rejected: leaving the page
+   * rejects the promise of a `keepalive` fetch the browser still delivers
+   * (measured in Chromium 141), and a beacon then would send the batch a
+   * second time, with cookies. A beacon's credentials mode is always
+   * `include` (https://w3c.github.io/beacon/#sec-processing-model), so it
+   * carries any cookie the ingest's host set `SameSite=None`; the ingest
+   * refuses such a request, so the fallback fails safe. No `Content-Type`
+   * is sent, as for a beacon: a request that needs a CORS preflight is a
+   * second round trip the leaving page may not get.
+   */
+  private sendLeaving(url: string, body: Uint8Array): void {
+    if (
+      this.keepaliveAvailable() &&
+      body.length <= KEEPALIVE_BODY_LIMIT - this.keepaliveBytes
+    ) {
+      let request: Promise<Response> | undefined;
+      try {
+        request = this.orig.fetch!.call(this.win, url, {
+          method: "POST",
+          credentials: "omit",
+          mode: "cors",
+          keepalive: true,
+          body: body as unknown as BodyInit,
+        });
+      } catch {
+        request = undefined;
+      }
+      if (request !== undefined) {
+        this.holdKeepalive(request, body.length);
+        return;
+      }
+    }
+    this.beacon(url, body);
+  }
+
+  /** Whether this browser's `fetch` takes `keepalive`. */
+  private keepaliveAvailable(): boolean {
+    try {
+      const R = (this.win as unknown as { Request?: { prototype: object } })
+        .Request;
+      return (
+        typeof this.orig.fetch === "function" &&
+        R !== undefined &&
+        "keepalive" in R.prototype
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Count `bytes` against the document's keepalive budget (64 KiB of
+   * in-flight `keepalive` bodies, beacons included in Chromium) until
+   * `request` settles.
+   */
+  private holdKeepalive(request: Promise<Response>, bytes: number): void {
+    this.keepaliveBytes += bytes;
+    const release = () => {
+      this.keepaliveBytes -= bytes;
+    };
+    this.then(request, release, release);
   }
 
   /** `sendBeacon`; `false` when the browser would not queue it. */
@@ -1070,23 +1217,22 @@ export class HttpBatchTransport {
     // Listeners of our own on the window and the document, added through the
     // original addEventListener: the page cannot see them, and the shim's
     // pagehide listener (added at install, earlier) has written End first.
-    add.call(this.win, "pagehide", () =>
-      this.guard(() => this.drainByBeacon()),
-    );
+    add.call(this.win, "pagehide", () => this.guard(() => this.drainNow()));
     if (doc !== undefined) {
       add.call(doc, "visibilitychange", () =>
         this.guard(() => {
-          if (doc.visibilityState === "hidden") this.drainByBeacon();
+          if (doc.visibilityState === "hidden") this.drainNow();
         }),
       );
     }
   }
 
   /**
-   * Send everything waiting now, by beacon, without waiting for a batch in
-   * flight: the page may never run again. Only once the gates are open.
+   * Send everything waiting now ({@link sendLeaving}), without waiting for
+   * a batch in flight: the page may never run again. Only once the gates
+   * are open.
    */
-  private drainByBeacon(): void {
+  private drainNow(): void {
     if (this.state !== "open") return;
     // A batch waiting for its retry would otherwise be lost with the page.
     if (this.inFlight !== undefined && this.retryTimer !== undefined) {
