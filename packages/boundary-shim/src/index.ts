@@ -62,6 +62,7 @@ export type {
   CtReplay,
   DivergenceKind,
   DivergenceReport,
+  MatchedCheckpoint,
   RecordView,
   ReplayConfig,
   ReplayHooks,

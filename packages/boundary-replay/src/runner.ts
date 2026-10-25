@@ -22,7 +22,22 @@
  *    generic shim in replay mode, then the `__ct` stub.
  * 6. The runner waits for the in-page scheduler to reach `End` or diverge.
  *    On divergence **no trace is written**: the report carries the
- *    `DivergenceError` (§7.2). On success the trace is moved to the output.
+ *    `DivergenceError` (§7.2) and the last checkpoint that matched. On
+ *    success the trace is moved to the output.
+ *
+ * **Range materialisation** (§12). A browser heap cannot be restored, so a
+ * range `seqFrom..seqTo` is a replay from the start with `__ct` emission
+ * off until the last checkpoint at or before `seqFrom`, on from there, and
+ * stopped at the first checkpoint at or after `seqTo`: the trace starts and
+ * ends at quiescent points, which the runner finds in the recording's
+ * checkpoint index (`jsbound.chk`, §5.5). With no checkpoint before
+ * `seqFrom` the trace starts with the session; with none after `seqTo` it
+ * goes on to `End`. A bound is only ever a checkpoint where no instrumented
+ * frame is open (an `async` function or a generator suspended across it
+ * would be cut): the in-page runtime counts the frames, the replay stops at
+ * the first checkpoint at or after `seqTo` with none, and a `from` with
+ * frames open is moved to the last earlier checkpoint with none, by
+ * replaying again (`quiescentBounds`).
  *
  * A Chromium major version other than `Env.ua_major` is reported in the
  * report and in the trace's metadata (its `args`), never refused (§7.4).
@@ -50,7 +65,11 @@ import {
 import { RECORDER_VERSION } from "@codetracer/instrumenter";
 import { instrumentTree } from "@codetracer/cli/dist/instrument-cmd.js";
 
-import type { ReplayStatus } from "./browser/runtime.js";
+import type {
+  CheckpointTrace,
+  ReplayStatus,
+  TracePosition,
+} from "./browser/runtime.js";
 import {
   documentPlan,
   GATE_PATH,
@@ -60,6 +79,7 @@ import {
   parserScriptUrls,
 } from "./gates.js";
 import { type LoadedLog, loadBoundaryLog } from "./log.js";
+import type { CheckpointRow } from "@codetracer/boundary-format";
 import {
   type Browser,
   type BrowserContext,
@@ -101,7 +121,107 @@ export interface ReplayOptions {
    * keeps the recorded order anyway. Never set in production.
    */
   responseDelayMs?: (url: string) => number;
+  /**
+   * Range materialisation (§12): the first `seq` the trace is to cover. The
+   * trace starts at the last checkpoint at or before it (the session's start
+   * when there is none). Default 1.
+   */
+  seqFrom?: bigint;
+  /**
+   * Range materialisation (§12): the last `seq` the trace is to cover. The
+   * replay stops at the first checkpoint at or after it (and after the
+   * start's), or goes on to `End` when there is none. Default the log's
+   * last `seq`.
+   */
+  seqTo?: bigint;
+  /**
+   * Test seam: the generic shim's replay-mode bundle to install instead of
+   * the shipped `dist/boundary-shim-replay.iife.js`, so a test can replay
+   * with a deliberately altered build (one that misses a seam, as its
+   * recording did). Never set in production.
+   */
+  shimReplayBundle?: string;
 }
+
+/** A checkpoint of the recording, as its index (`jsbound.chk`) has it. */
+export interface CheckpointRef {
+  ordinal: number;
+  /** Its `seq` (decimal). */
+  seq: string;
+  /** The byte offset of its frame in `jsbound.log` (§5.5). */
+  logOffset: number;
+}
+
+/** The quiescent points a range materialisation is bounded at (§12). */
+export interface RangeBounds {
+  /** The checkpoint emission starts at; `undefined`: the session's start. */
+  from: CheckpointRow | undefined;
+  /** The checkpoint the replay stops at; `undefined`: `End`. */
+  to: CheckpointRow | undefined;
+}
+
+/** A range the log cannot serve (outside it, or empty). */
+export class ReplayRangeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BoundaryReplayRangeError";
+  }
+}
+
+/**
+ * The checkpoints that bound the range `seqFrom..seqTo` (§12), found in the
+ * recording's checkpoint index `rows` (in log order, so in `seq` order) by
+ * binary search: `from` is the last checkpoint at or before `seqFrom`, `to`
+ * the first at or after `seqTo` and after `from`. A range outside the log
+ * (`seqFrom < 1`, `seqTo` past `lastSeq`) or reversed is refused, never
+ * clamped: a clamped range would be a different range than the one asked for.
+ */
+export function rangeBounds(
+  rows: readonly CheckpointRow[],
+  lastSeq: bigint,
+  seqFrom: bigint = 1n,
+  seqTo: bigint = lastSeq,
+): RangeBounds {
+  if (seqFrom < 1n) {
+    throw new ReplayRangeError(
+      `--seq-from ${seqFrom} is before the log's first seq, 1`,
+    );
+  }
+  if (seqTo < seqFrom) {
+    throw new ReplayRangeError(
+      `--seq-to ${seqTo} is before --seq-from ${seqFrom}`,
+    );
+  }
+  if (seqTo > lastSeq) {
+    throw new ReplayRangeError(
+      `--seq-to ${seqTo} is past the log's last seq, ${lastSeq}`,
+    );
+  }
+  // The first row whose seq is greater than `seq` (rows.length if none).
+  const firstAfter = (seq: bigint): number => {
+    let lo = 0;
+    let hi = rows.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (rows[mid].seq <= seq) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+  const fromIndex = firstAfter(seqFrom) - 1;
+  const from = fromIndex >= 0 ? rows[fromIndex] : undefined;
+  // The first row at or after seqTo, and after `from`.
+  let toIndex = firstAfter(seqTo - 1n);
+  if (toIndex <= fromIndex) toIndex = fromIndex + 1;
+  const to = toIndex < rows.length ? rows[toIndex] : undefined;
+  return { from, to };
+}
+
+const refOf = (row: CheckpointRow): CheckpointRef => ({
+  ordinal: row.ordinal,
+  seq: row.seq.toString(),
+  logOffset: row.logOffset,
+});
 
 /** What a replay found. */
 export interface ReplayReport {
@@ -142,6 +262,27 @@ export interface ReplayReport {
    * ({@link materialisedRecordingId}), when a trace was asked for.
    */
   traceRecordingId?: string;
+  /**
+   * A range materialisation (§12): the range asked for and the checkpoints
+   * that bound it (`null`: the session's start, or `End`). `widened` when
+   * the checkpoints the index alone gives had instrumented frames open, so
+   * the range was moved out to the nearest ones that had none: `from` and
+   * `to` are always the bounds the trace has.
+   */
+  range?: {
+    seqFrom: string;
+    seqTo: string;
+    from: CheckpointRef | null;
+    to: CheckpointRef | null;
+    widened: boolean;
+  };
+  /**
+   * When a trace was written: what it holds ({@link TracePosition}), and
+   * where it was at each checkpoint the replay matched, the positions a
+   * full materialisation's trace can be cut at to compare it with a range.
+   */
+  trace?: TracePosition;
+  checkpointTrace?: CheckpointTrace[];
 }
 
 const CONTENT_TYPES: Record<string, string> = {
@@ -326,6 +467,11 @@ export interface MaterialisedIdentity {
   recorderVersion: string;
   /** The replay browser's full version (§7.4). */
   browserVersion: string;
+  /**
+   * A range materialisation's bounds (§12), `<from>..<to>` with each bound a
+   * checkpoint's seq, `start` or `end`; absent for a full one.
+   */
+  range?: string;
 }
 
 /**
@@ -343,7 +489,10 @@ export interface MaterialisedIdentity {
  * bits are the first bits of the SHA-256 of
  * `codetracer-js-boundary-materialised/1`, the source (its recording id,
  * or `session:<session_id>` for a bare log), the build hash, the recorder
- * version and the replay browser's version, each ended by a newline.
+ * version and the replay browser's version, each ended by a newline; for a
+ * range materialisation, then `range:<from>..<to>` and a newline, so a
+ * range's trace never shares the full trace's id (a full materialisation's
+ * input is unchanged by it).
  */
 export function materialisedRecordingId(id: MaterialisedIdentity): string {
   const source =
@@ -358,6 +507,7 @@ export function materialisedRecordingId(id: MaterialisedIdentity): string {
         id.buildHash,
         id.recorderVersion,
         id.browserVersion,
+        ...(id.range === undefined ? [] : [`range:${id.range}`]),
         "",
       ].join("\n"),
       "utf-8",
@@ -392,14 +542,102 @@ export function programOf(url: string): string {
   return cut < 0 ? url : url.slice(0, cut);
 }
 
+/**
+ * What a range replay observed of the checkpoints it reached (§12): the
+ * frames open at each, whether its `from` checkpoint had frames open, and
+ * where it stopped.
+ */
+export interface RangeObservation {
+  checkpointTrace: readonly Pick<CheckpointTrace, "seq" | "open">[];
+  fromNotQuiescent?: boolean;
+  stoppedAt?: string;
+}
+
+/**
+ * The bounds a range replay planned at `planned` actually has, from what it
+ * observed (§12): a range is bounded only at a checkpoint where no
+ * instrumented frame is open, so a `from` with frames open moves to the last
+ * earlier checkpoint with none (the session's start when there is none), and
+ * the replay itself stops at the first checkpoint at or after `to` with none
+ * (`End` when there is none). The rows are the recording's checkpoint index.
+ */
+export function quiescentBounds(
+  planned: RangeBounds,
+  observed: RangeObservation,
+  rows: readonly CheckpointRow[],
+): RangeBounds {
+  const rowOf = (seq: bigint): CheckpointRow => {
+    const row = rows.find((r) => r.seq === seq);
+    if (row === undefined) {
+      throw new Error(
+        `the replay reported checkpoint seq ${seq}, which the recording's jsbound.chk does not have`,
+      );
+    }
+    return row;
+  };
+  let from = planned.from;
+  if (from !== undefined && observed.fromNotQuiescent === true) {
+    const before = observed.checkpointTrace
+      .filter((c) => BigInt(c.seq) < from!.seq && c.open === 0)
+      .pop();
+    from = before === undefined ? undefined : rowOf(BigInt(before.seq));
+  }
+  const to =
+    observed.stoppedAt === undefined
+      ? undefined
+      : rowOf(BigInt(observed.stoppedAt));
+  return { from, to };
+}
+
+const sameBounds = (a: RangeBounds, b: RangeBounds): boolean =>
+  a.from?.seq === b.from?.seq && a.to?.seq === b.to?.seq;
+
 /** Replay `options.log` and report (see the module comment). */
 export async function replaySession(
   options: ReplayOptions,
 ): Promise<ReplayReport> {
   const loaded = loadBoundaryLog(options.log);
+  const ranged = options.seqFrom !== undefined || options.seqTo !== undefined;
+  if (!ranged) return (await replayOnce(options, loaded, undefined)).report;
+
+  // §12: a range is bounded at checkpoints found in the index, and only at
+  // ones where no instrumented frame is open. Which those are only the
+  // replay can tell (the recorder does not see the instrumented build), so
+  // a range whose planned bound has frames open is replayed a second time
+  // at the bounds the first replay found; the second must find them again.
+  let planned: RangeBounds;
+  try {
+    planned = rangeBounds(
+      loaded.checkpoints,
+      loaded.lastSeq,
+      options.seqFrom,
+      options.seqTo,
+    );
+  } catch (e) {
+    if (!(e instanceof ReplayRangeError)) throw e;
+    const report = newReport(loaded, options);
+    report.error = e.message;
+    return report;
+  }
+  const first = await replayOnce(options, loaded, planned);
+  if (first.widened === undefined) return first.report;
+  const second = await replayOnce(options, loaded, first.widened);
+  if (second.widened !== undefined) {
+    second.report.status = "error";
+    second.report.error = `the replay did not stop at the same quiescent checkpoints twice: planned ${describeBounds(first.widened)}, found ${describeBounds(second.widened)}`;
+  }
+  if (second.report.range !== undefined) second.report.range.widened = true;
+  return second.report;
+}
+
+/** `<from>..<to>`, each a checkpoint's seq, `start` or `end` (§12). */
+const describeBounds = (b: RangeBounds): string =>
+  `${b.from?.seq.toString() ?? "start"}..${b.to?.seq.toString() ?? "end"}`;
+
+/** A report with nothing replayed yet. */
+function newReport(loaded: LoadedLog, options: ReplayOptions): ReplayReport {
   const { header, env } = loaded;
-  const build = path.resolve(options.build);
-  const report: ReplayReport = {
+  return {
     status: "error",
     session: {
       sessionId: header.session_id,
@@ -409,7 +647,7 @@ export async function replaySession(
       framework: header.framework,
       url: env.url,
     },
-    build: { dir: build },
+    build: { dir: path.resolve(options.build) },
     metadata: {
       recorderVersion: RECORDER_VERSION,
       recordedUaMajor: env.ua_major,
@@ -421,6 +659,31 @@ export async function replaySession(
     dispatchedDuringInject: [],
     pageErrors: [],
   };
+}
+
+/**
+ * One replay of `loaded`, a range one when `bounds` is given (§12). A range
+ * replay whose bounds turn out to have instrumented frames open returns the
+ * bounds it found (`widened`, {@link quiescentBounds}) and writes no trace.
+ */
+async function replayOnce(
+  options: ReplayOptions,
+  loaded: LoadedLog,
+  bounds: RangeBounds | undefined,
+): Promise<{ report: ReplayReport; widened?: RangeBounds }> {
+  const { header, env } = loaded;
+  const build = path.resolve(options.build);
+  const report = newReport(loaded, options);
+  if (bounds !== undefined) {
+    report.range = {
+      seqFrom: (options.seqFrom ?? 1n).toString(),
+      seqTo: (options.seqTo ?? loaded.lastSeq).toString(),
+      from: bounds.from === undefined ? null : refOf(bounds.from),
+      to: bounds.to === undefined ? null : refOf(bounds.to),
+      widened: false,
+    };
+  }
+  const rangeArg = bounds === undefined ? undefined : describeBounds(bounds);
 
   // §8: the build must be the one the session ran, before any page code.
   const { buildHash } = buildBundleManifest(build);
@@ -434,8 +697,9 @@ export async function replaySession(
       actual: buildHash,
       detail: `the build at ${build} hashes to ${buildHash}, not the session's Header.build_hash`,
       cause: "mismatch",
+      lastCheckpoint: null,
     };
-    return report;
+    return { report };
   }
 
   let origin: string;
@@ -443,7 +707,7 @@ export async function replaySession(
     origin = new URL(env.url).origin;
   } catch {
     report.error = `Env.url ${JSON.stringify(env.url)} is not a URL`;
-    return report;
+    return { report };
   }
 
   const work = fs.mkdtempSync(path.join(os.tmpdir(), "ct-boundary-replay-"));
@@ -473,6 +737,7 @@ export async function replaySession(
         `ua-major-mismatch=${env.ua_major}->${report.metadata.replayUaMajor ?? "unknown"}`,
       );
     }
+    if (rangeArg !== undefined) args.push(`seq-range=${rangeArg}`);
 
     if (options.out !== undefined) {
       const bin =
@@ -491,6 +756,7 @@ export async function replaySession(
         buildHash,
         recorderVersion: RECORDER_VERSION,
         browserVersion: browser.version(),
+        ...(rangeArg === undefined ? {} : { range: rangeArg }),
       });
       host = await startTraceHost(
         bin,
@@ -777,6 +1043,18 @@ export async function replaySession(
     const config: ReplayConfig = {
       log: Buffer.from(loaded.stream).toString("base64"),
       ...(plan.holds ? { binding: OPEN_BINDING } : {}),
+      ...(bounds === undefined
+        ? {}
+        : {
+            emit: {
+              ...(bounds.from === undefined
+                ? {}
+                : { from: bounds.from.seq.toString() }),
+              ...(bounds.to === undefined
+                ? {}
+                : { to: bounds.to.seq.toString() }),
+            },
+          }),
     };
     let preamble = `globalThis.${REPLAY_CONFIG_GLOBAL}=${JSON.stringify(config)};`;
     if (host !== undefined) {
@@ -790,8 +1068,17 @@ export async function replaySession(
     // origin's top-level document is replayed (a frame's document is the
     // build's, run as it comes: it is not the session's, §7.4).
     const scripts = [preamble, fs.readFileSync(RUNTIME_BUNDLE_PATH, "utf-8")];
-    if (header.protocol_level === 0) scripts.push(boundaryShimReplayBundle());
-    if (stub !== "") scripts.push(stub);
+    if (header.protocol_level === 0) {
+      scripts.push(options.shimReplayBundle ?? boundaryShimReplayBundle());
+    }
+    if (stub !== "") {
+      scripts.push(stub);
+      // §12: `__ct` emission under the replay's control (on and off at the
+      // range's checkpoints), and counted, right after the stub installs it.
+      scripts.push(
+        `if (globalThis.__ct) globalThis.${REPLAY_GLOBAL}.gateTrace(globalThis.__ct);`,
+      );
+    }
     for (const content of scripts) {
       await context.addInitScript({
         content: `if (globalThis.location && globalThis.top === globalThis && location.origin === ${JSON.stringify(origin)}) {\n${content}\n}`,
@@ -808,12 +1095,22 @@ export async function replaySession(
     report.pageErrors = status.pageErrors;
     if (status.state === "diverged") {
       report.status = "diverged";
-      report.divergence = status.divergence;
-      return report;
+      report.divergence = withIndexedCheckpoint(
+        status.divergence,
+        loaded.checkpoints,
+      );
+      return { report };
     }
     if (status.state !== "done") {
       report.error = `the replay did not finish within ${timeoutMs} ms (the scheduler is at seq ${status.cursor}, state ${status.state}; ${status.waiting ?? ""})`;
-      return report;
+      return { report };
+    }
+    if (bounds !== undefined) {
+      // §12: the bounds where no instrumented frame was open. When they are
+      // not the planned ones, this replay's trace is not the range's: the
+      // caller replays again at the bounds found.
+      const found = quiescentBounds(bounds, status, loaded.checkpoints);
+      if (!sameBounds(found, bounds)) return { report, widened: found };
     }
 
     if (host !== undefined && options.out !== undefined) {
@@ -847,13 +1144,15 @@ export async function replaySession(
       fs.copyFileSync(trace, out + ".partial");
       fs.renameSync(out + ".partial", out);
       report.output = out;
+      report.trace = status.trace;
+      report.checkpointTrace = status.checkpointTrace;
     }
     report.status = "replayed";
-    return report;
+    return { report };
   } catch (e) {
     report.status = "error";
     report.error = (e as Error).message;
-    return report;
+    return { report };
   } finally {
     await context?.close().catch(() => undefined);
     if (options.browser === undefined)
@@ -861,6 +1160,27 @@ export async function replaySession(
     if (host !== undefined) await stopTraceHost(host);
     fs.rmSync(work, { recursive: true, force: true });
   }
+}
+
+/**
+ * `divergence` with its last matching checkpoint located in the recording's
+ * checkpoint index (`jsbound.chk`, §5.5): the byte offset of its frame, so
+ * a tool can read the log from there.
+ */
+function withIndexedCheckpoint(
+  divergence: DivergenceReport | undefined,
+  rows: readonly CheckpointRow[],
+): DivergenceReport | undefined {
+  const last = divergence?.lastCheckpoint;
+  if (divergence === undefined || last === null || last === undefined) {
+    return divergence;
+  }
+  const row = rows.find(
+    (r) => r.ordinal === last.ordinal && r.seq.toString() === last.seq,
+  );
+  return row === undefined
+    ? divergence
+    : { ...divergence, lastCheckpoint: { ...last, logOffset: row.logOffset } };
 }
 
 /** Poll the in-page scheduler until it is done, diverged, or out of time. */
@@ -896,6 +1216,9 @@ async function waitForReplay(
           tasks: 0,
           cursor: "",
           pageErrors: [],
+          emitting: false,
+          trace: { steps: 0, calls: 0, returns: 0 },
+          checkpointTrace: [],
         }
       );
     }

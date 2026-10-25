@@ -37,6 +37,10 @@ import {
   withRecordBefore,
   withRecordReplaced,
 } from "../../packages/boundary-replay/src/index.js";
+import {
+  htmlFilesUnder,
+  injectBoundaryShimIntoFiles,
+} from "../../packages/boundary-shim/src/index.js";
 import { FIXTURES, type FixtureServer, startFixtureServer } from "./harness.js";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
@@ -91,10 +95,13 @@ export interface RecordReplay {
  * Build the fixtures (`prepare` may add files first, before the build is
  * hashed), start their server and a browser. `importSeam` installs the shim
  * with the dynamic `import()` seam (`boundary-shim --import-seam`, §8.1).
+ * `bundleSource` installs a deliberately altered build of the shim instead of
+ * the shipped one, by the same injection the CLI step runs (a test-only
+ * build; the build hash is the page's either way, §8.1).
  */
 export async function startRecordReplay(
   prepare?: (build: string) => void,
-  options: { importSeam?: boolean } = {},
+  options: { importSeam?: boolean; bundleSource?: string } = {},
 ): Promise<RecordReplay> {
   const tmpDirs: string[] = [];
   const tmp = (prefix: string): string => {
@@ -114,18 +121,29 @@ export async function startRecordReplay(
     [RECORDER_CLI, "bundle-manifest", build],
     { encoding: "utf-8" },
   ).trim();
-  execFileSync(
-    process.execPath,
-    [
-      RECORDER_CLI,
-      "boundary-shim",
-      build,
-      "--build-hash",
-      hash,
-      ...(options.importSeam === true ? ["--import-seam"] : []),
-    ],
-    { stdio: "pipe" },
-  );
+  if (options.bundleSource === undefined) {
+    execFileSync(
+      process.execPath,
+      [
+        RECORDER_CLI,
+        "boundary-shim",
+        build,
+        "--build-hash",
+        hash,
+        ...(options.importSeam === true ? ["--import-seam"] : []),
+      ],
+      { stdio: "pipe" },
+    );
+  } else {
+    if (options.importSeam === true) {
+      throw new Error("bundleSource does not install the import seam");
+    }
+    injectBoundaryShimIntoFiles(
+      htmlFilesUnder(build),
+      { buildHash: hash },
+      { bundleSource: options.bundleSource },
+    );
+  }
   const server = await startFixtureServer(build);
   return {
     browser,

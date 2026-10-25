@@ -33,9 +33,6 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   type BoundaryRecord,
   decodeLog,
-  encodeBatch,
-  encodeFrame,
-  seqOf,
 } from "../../packages/boundary-format/src/index.js";
 import {
   type Browser,
@@ -59,9 +56,14 @@ import {
 } from "../../packages/boundary-conformance/src/index.js";
 import { type FixtureServer, FIXTURES, startFixtureServer } from "./harness.js";
 import { ctPrintFull, requireCtPrint } from "../helpers/ct-print.js";
+import {
+  assembleRecording,
+  ctJsboundPath,
+  RECORDING_ID,
+  sessionManagerPath,
+} from "./siblings.js";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
-const WORKSPACE = path.dirname(REPO_ROOT);
 const RECORDER_CLI = path.join(REPO_ROOT, "packages/cli/dist/index.js");
 const CONFORMANCE_CLI = path.join(
   REPO_ROOT,
@@ -70,19 +72,6 @@ const CONFORMANCE_CLI = path.join(
 const TIMEOUT = 300_000;
 /** Clicks on #go: each puts a checkpoint at the start of the next task. */
 const CLICKS = 12;
-/** A canonical UUIDv7, the recording id the assembler requires. */
-const RECORDING_ID = "01890a5d-ac96-774b-bcce-b302099a8057";
-
-/** A sibling binary: `env` when set, else the first candidate that exists. */
-function locate(env: string, candidates: string[], build: string): string {
-  const fromEnv = process.env[env];
-  if (fromEnv !== undefined && fromEnv !== "") return fromEnv;
-  for (const c of candidates) {
-    const p = path.join(WORKSPACE, c);
-    if (fs.existsSync(p)) return p;
-  }
-  throw new Error(`${candidates[0]} is not built: ${build} (or set ${env})`);
-}
 
 let SESSION_MANAGER: string;
 let CT_JSBOUND: string;
@@ -182,65 +171,17 @@ async function recordSession(): Promise<Recorded> {
 
 /**
  * Assemble `records` into a `.ct` with the real `ct-jsbound assemble`, as
- * the ingest would: uploaded as batches of 64 frames, or, with `omit`, as
- * three batches whose middle one (the records at `omit[0]..omit[1]`) never
- * arrives, which the assembler turns into a `Gap`.
+ * the ingest would (`assembleRecording`, `siblings.ts`); with `omit`, the
+ * batch of the records at `omit[0]..omit[1]` never arrives (a `Gap`).
  */
 function assemble(records: BoundaryRecord[], omit?: [number, number]): string {
-  const dir = tmp("ct-replay-batches-");
-  const header = records[0] as Extract<BoundaryRecord, { record: "Header" }>;
-  const ranges: [number, number][] = [];
-  if (omit === undefined) {
-    for (let i = 0; i < records.length; i += 64) {
-      ranges.push([i, Math.min(i + 64, records.length) - 1]);
-    }
-  } else {
-    ranges.push([0, omit[0] - 1], omit, [omit[1] + 1, records.length - 1]);
-  }
-  let lastSeq = 0;
-  ranges.forEach(([a, b], batchSeq) => {
-    const slice = records.slice(a, b + 1);
-    const seqs = slice
-      .map((r) => seqOf(r))
-      .filter((s): s is bigint => s !== undefined)
-      .map(Number);
-    const first = seqs.length > 0 ? seqs[0] : lastSeq + 1;
-    const last = seqs.length > 0 ? seqs[seqs.length - 1] : lastSeq;
-    lastSeq = last;
-    if (omit !== undefined && batchSeq === 1) return; // never arrives
-    const frames = slice.map(encodeFrame);
-    let size = 0;
-    for (const f of frames) size += f.length;
-    const run = new Uint8Array(size);
-    let at = 0;
-    for (const f of frames) {
-      run.set(f, at);
-      at += f.length;
-    }
-    const body = encodeBatch(
-      {
-        session_id: header.session_id,
-        batch_seq: batchSeq,
-        first_seq: first,
-        last_seq: last,
-        dropped: [],
-        build_hash: header.build_hash,
-        final: batchSeq === ranges.length - 1,
-      },
-      run,
-    );
-    fs.writeFileSync(path.join(dir, String(batchSeq)), body);
-  });
-  const out = path.join(tmp("ct-replay-ct-"), "session.ct");
-  const r = spawnSync(
+  return assembleRecording(
     CT_JSBOUND,
-    ["assemble", "--recording-id", RECORDING_ID, "--out", out, dir],
-    { encoding: "utf-8" },
+    records,
+    tmp("ct-replay-batches-"),
+    tmp("ct-replay-ct-"),
+    omit,
   );
-  if (r.status !== 0) {
-    throw new Error(`ct-jsbound assemble failed (${r.status}): ${r.stderr}`);
-  }
-  return out;
 }
 
 /** Replay `ct` against the recorded build, writing a trace to a new path. */
@@ -273,22 +214,8 @@ const indexOf = (
 };
 
 beforeAll(async () => {
-  SESSION_MANAGER = locate(
-    "CODETRACER_SESSION_MANAGER",
-    [
-      "codetracer/src/backend-manager/target/release/session-manager",
-      "codetracer/src/backend-manager/target/debug/session-manager",
-    ],
-    "cargo build --bin session-manager in codetracer/src/backend-manager",
-  );
-  CT_JSBOUND = locate(
-    "CT_JSBOUND",
-    [
-      "codetracer/libs/jsbound/target/release/ct-jsbound",
-      "codetracer/libs/jsbound/target/debug/ct-jsbound",
-    ],
-    "cargo build --bin ct-jsbound in codetracer/libs/jsbound",
-  );
+  SESSION_MANAGER = sessionManagerPath();
+  CT_JSBOUND = ctJsboundPath();
   requireCtPrint();
   browser = await loadPlaywright().chromium.launch({ headless: true });
   recorded = await recordSession();

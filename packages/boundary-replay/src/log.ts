@@ -11,6 +11,11 @@
  *
  * The log is decoded strictly (§5.3) and every `jsbound.blb` reference
  * resolved, so the page receives one self-contained stream.
+ *
+ * A container's `jsbound.chk` (§5.5) is checked against the index rebuilt
+ * from its `jsbound.log`, and a recording whose index disagrees is refused;
+ * a bare stream's index is rebuilt from the stream. The runner finds the
+ * quiescent points a range materialisation is bounded at in it (§12).
  */
 
 import { createHash } from "node:crypto";
@@ -21,11 +26,15 @@ import { createRequire } from "node:module";
 import {
   type BlobRef,
   type BoundaryRecord,
+  type CheckpointRow,
   CTBL_MAGIC,
   decodeLog,
+  deriveCheckpointIndex,
   encodeLog,
   type RecordOf,
+  seqOf,
   toHex,
+  verifyCheckpointIndex,
 } from "@codetracer/boundary-format";
 
 /** A recording, decoded and with its bodies inline. */
@@ -42,6 +51,28 @@ export interface LoadedLog {
    * container; a bare stream has none.
    */
   recordingId?: string;
+  /**
+   * The checkpoint index (§5.5): a container's `jsbound.chk`, checked against
+   * its log; a bare stream's, rebuilt from the stream.
+   */
+  checkpoints: CheckpointRow[];
+  /**
+   * The last `seq` the log accounts for: `End.last_seq`, or for a log
+   * without an `End` its last seq-bearing record's (or `Gap`'s) seq.
+   */
+  lastSeq: bigint;
+}
+
+/** The last `seq` `records` account for (see {@link LoadedLog.lastSeq}). */
+export function lastSeqOf(records: readonly BoundaryRecord[]): bigint {
+  let last = 0n;
+  for (const r of records) {
+    if (r.record === "End") return r.last_seq;
+    if (r.record === "Gap") last = r.last_seq;
+    const s = seqOf(r);
+    if (s !== undefined) last = s;
+  }
+  return last;
 }
 
 /** `meta.dat`'s magic, `"CTMD"`. */
@@ -195,8 +226,11 @@ export function loadBoundaryLog(file: string): LoadedLog {
   let records: BoundaryRecord[];
   let source: "ct" | "log";
   let recordingId: string | undefined;
+  let checkpoints: CheckpointRow[];
   if (isBareLog(raw)) {
-    records = decodeLog(new Uint8Array(raw), { inlineBodies: "batch" }).records;
+    const decoded = decodeLog(new Uint8Array(raw), { inlineBodies: "batch" });
+    records = decoded.records;
+    checkpoints = deriveCheckpointIndex(decoded);
     source = "log";
   } else {
     const log = readCtfsMember(file, "jsbound.log");
@@ -204,7 +238,18 @@ export function loadBoundaryLog(file: string): LoadedLog {
     const store = members.includes("jsbound.blb")
       ? parseBlobStore(readCtfsMember(file, "jsbound.blb"))
       : new Map<string, Uint8Array>();
-    records = resolveBlobs(decodeLog(log).records, store);
+    const decoded = decodeLog(log);
+    // A boundary recording has all four members (CTFS-Binary-Format.md
+    // §4.8); an index that is missing or disagrees with the log is refused
+    // (§5.5), never rebuilt in its place.
+    if (!members.includes("jsbound.chk")) {
+      throw new Error(`${file}: the container has no jsbound.chk member`);
+    }
+    checkpoints = verifyCheckpointIndex(
+      decoded,
+      readCtfsMember(file, "jsbound.chk"),
+    );
+    records = resolveBlobs(decoded.records, store);
     source = "ct";
     recordingId = metaRecordingId(readCtfsMember(file, "meta.dat"));
   }
@@ -220,5 +265,7 @@ export function loadBoundaryLog(file: string): LoadedLog {
     stream: encodeLog(records),
     source,
     recordingId,
+    checkpoints,
+    lastSeq: lastSeqOf(records),
   };
 }

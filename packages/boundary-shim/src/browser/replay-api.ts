@@ -43,6 +43,16 @@ export interface ReplayConfig {
    * holds nothing.
    */
   binding?: string;
+  /**
+   * Range materialisation (§12): where `__ct` emission is on. Each bound is
+   * the decimal `seq` of a `Checkpoint` record, a quiescent point the runner
+   * found through `jsbound.chk`. Emission is off from the start until the
+   * replay has compared the `from` checkpoint (on from the start when
+   * `from` is absent), and the replay stops once it has compared the `to`
+   * checkpoint (it goes on to `End` when `to` is absent). Absent: a full
+   * replay, emitting throughout.
+   */
+  emit?: { from?: string; to?: string };
 }
 
 /** The divergence kinds of §7.2. */
@@ -78,6 +88,28 @@ export interface DivergenceReport {
    * version observes no sensitive reads, so it is always `mismatch`.
    */
   cause: "mismatch" | "substituted-sensitive";
+  /**
+   * The last checkpoint the replay compared and matched before it diverged
+   * (§7.2, §12): the replay is known to agree with the recording up to it,
+   * so the cause lies between it and `seq`. `null` when none was (the
+   * divergence came before the first checkpoint, or before any page code).
+   */
+  lastCheckpoint: MatchedCheckpoint | null;
+}
+
+/** A `Checkpoint` record the replay compared and matched (§7.3). */
+export interface MatchedCheckpoint {
+  ordinal: number;
+  /** Its `seq` (decimal). */
+  seq: string;
+  scheme: string;
+  stateHash: string;
+  /**
+   * The byte offset of its frame in the recording's `jsbound.log`, from
+   * `jsbound.chk` (§5.5); the runner adds it, the in-page runtime does not
+   * know it.
+   */
+  logOffset?: number;
 }
 
 /** The record at the cursor, as {@link CtReplay.peek} shows it. */

@@ -74,6 +74,7 @@ import {
   type CtReplay,
   type DivergenceKind,
   type DivergenceReport,
+  type MatchedCheckpoint,
   type RecordView,
   REPLAY_CONFIG_GLOBAL,
   REPLAY_GLOBAL,
@@ -97,6 +98,35 @@ const SHIM_GLOBAL = "__ctBoundaryShim";
 interface ShimReplayControl {
   mode: "replay";
   inject(input: RecordOf<"Input">, effects: RecordOf<"DomEffect">[]): string;
+}
+
+/**
+ * How much of the materialised trace the replay's `__ct` calls have emitted
+ * (§12): trace steps (`step` and `write` calls; record-web writes one step
+ * for each), calls entered and calls returned. Counted only while emission
+ * is on, so a range materialisation's counts are its own trace's.
+ */
+export interface TracePosition {
+  steps: number;
+  calls: number;
+  returns: number;
+}
+
+/** Where the trace was when the replay matched a checkpoint (§12). */
+export interface CheckpointTrace extends TracePosition {
+  ordinal: number;
+  /** The checkpoint's `seq` (decimal). */
+  seq: string;
+  /**
+   * The instrumented frames open there: entered (`__ct.enter`) and not yet
+   * returned from (`__ct.ret`), counted whether emission is on or not. A
+   * checkpoint has no page code on the stack (§7.3), so each is a frame
+   * suspended across it (an `async` function at an `await`, a generator at
+   * a `yield`) or one an exception left without its return. A range is
+   * bounded only where this is 0 (§12): a bound inside such a frame would
+   * cut it, and the range would not equal the same range of a full trace.
+   */
+  open: number;
 }
 
 /** The replay's state as `__ctReplay.status()` reports it. */
@@ -124,6 +154,53 @@ export interface ReplayStatus {
   waiting?: string;
   /** Errors a page callback threw while the scheduler ran it. */
   pageErrors: string[];
+  /** Whether `__ct` emission is on (§12, range materialisation). */
+  emitting: boolean;
+  /**
+   * What the trace has emitted so far, once the runner attached the `__ct`
+   * runtime ({@link CtReplayRunner.gateTrace}); zeros otherwise.
+   */
+  trace: TracePosition;
+  /**
+   * For every checkpoint matched so far, where the trace was then: the
+   * positions a full materialisation's trace can be cut at (§12, a range of
+   * a full materialisation).
+   */
+  checkpointTrace: CheckpointTrace[];
+  /**
+   * The `seq` of the checkpoint a range replay stopped at: the first at or
+   * after `emit.to` with no instrumented frame open (§12); absent for a
+   * replay that went on to `End`.
+   */
+  stoppedAt?: string;
+  /**
+   * Set when instrumented frames were open at the `emit.from` checkpoint
+   * (§12): a range cannot start inside a frame, so emission stayed off, and
+   * the runner replays again from an earlier checkpoint where none was.
+   */
+  fromNotQuiescent?: boolean;
+}
+
+/** The `__ct` methods the instrumented build calls (§12). */
+type CtRuntime = Record<string, unknown>;
+
+/**
+ * What the in-page runtime offers its runner beyond the protocol's
+ * `__ctReplay` (§9.7): read by the runner, never by the page's clients.
+ */
+export interface CtReplayRunner {
+  status(): ReplayStatus;
+  pendingScriptElement(url: string): boolean;
+  /**
+   * Put `__ct` emission under the replay's control (§12): the runner calls
+   * it from an init script right after the instrumented build's `__ct`
+   * runtime is installed. Each emitting method of `ct` is wrapped so that it
+   * emits only while emission is on, and counts what it emits; `ret` always
+   * returns its value, which the instrumented code passes on. `enter` and
+   * `ret` also count the frames open, whether emission is on or not
+   * ({@link CheckpointTrace.open}).
+   */
+  gateTrace(ct: CtRuntime): void;
 }
 
 /** A latched divergence, thrown into whatever made the diverging call. */
@@ -193,7 +270,7 @@ function base64Bytes(b64: string): Uint8Array {
 export function installReplayRuntime(
   w: Window & typeof globalThis,
   config: ReplayConfig,
-): CtReplay & { status(): ReplayStatus } {
+): CtReplay & CtReplayRunner {
   const orig: ShimOriginals = captureOriginals(w);
   const OrigPromise = orig.Promise;
   const decoded = decodeLog(base64Bytes(config.log), { inlineBodies: "batch" });
@@ -252,6 +329,22 @@ export function installReplayRuntime(
   };
   let pendingEffects: RecordOf<"DomEffect">[] = [];
 
+  // Range materialisation (§12): emission is off until the `from`
+  // checkpoint has matched, and the replay stops at the first checkpoint at
+  // or after `to` where no instrumented frame is open.
+  const emitFrom =
+    config.emit?.from === undefined ? undefined : BigInt(config.emit.from);
+  const emitTo =
+    config.emit?.to === undefined ? undefined : BigInt(config.emit.to);
+  /** The last checkpoint compared and matched, for a divergence report. */
+  let lastCheckpoint: MatchedCheckpoint | null = null;
+  /**
+   * Instrumented frames entered and not yet returned from, counted by
+   * `gateTrace` whether emission is on or not (see
+   * {@link CheckpointTrace.open}).
+   */
+  let openFrames = 0;
+
   const status: ReplayStatus = {
     state: "loading",
     checkpoints: 0,
@@ -260,6 +353,9 @@ export function installReplayRuntime(
     tasks: 0,
     cursor: "",
     pageErrors: [],
+    emitting: emitFrom === undefined,
+    trace: { steps: 0, calls: 0, returns: 0 },
+    checkpointTrace: [],
   };
 
   /** The index of the first non-`Mark` record at or after `i`. */
@@ -336,6 +432,7 @@ export function installReplayRuntime(
         actual: actual ?? "",
         detail,
         cause: "mismatch",
+        lastCheckpoint,
       };
       status.state = "diverged";
       status.divergence = failed;
@@ -868,6 +965,27 @@ export function installReplayRuntime(
       }
     }
     status.checkpoints++;
+    lastCheckpoint = {
+      ordinal: r.ordinal,
+      seq: r.seq.toString(),
+      scheme: r.scheme,
+      stateHash: r.state_hash,
+    };
+    status.checkpointTrace.push({
+      ordinal: r.ordinal,
+      seq: r.seq.toString(),
+      ...status.trace,
+      open: openFrames,
+    });
+    // A checkpoint is a quiescent point (§7.3): no page code is on the stack
+    // and the macrotask's microtasks have drained. A range starts here only
+    // when no instrumented frame is suspended across it either (§12); when
+    // one is, emission stays off and the runner widens the range to an
+    // earlier checkpoint where none was.
+    if (emitFrom !== undefined && r.seq === emitFrom) {
+      if (openFrames === 0) status.emitting = true;
+      else status.fromNotQuiescent = true;
+    }
     at++;
   };
 
@@ -946,6 +1064,14 @@ export function installReplayRuntime(
         return letDocTaskGo(r);
       case "Checkpoint":
         compareCheckpoint(r);
+        if (emitTo !== undefined && r.seq >= emitTo && openFrames === 0) {
+          // The range's end (§12): the first checkpoint at or after `to`
+          // with no instrumented frame open, so every call the trace entered
+          // has returned; the trace stops here, and the replay with it.
+          status.emitting = false;
+          status.stoppedAt = r.seq.toString();
+          return "ended";
+        }
         return "next";
       case "DomEffect":
         pendingEffects.push(r);
@@ -1384,10 +1510,33 @@ export function installReplayRuntime(
     }
   };
 
-  const replay: CtReplay & {
-    status(): ReplayStatus;
-    pendingScriptElement(url: string): boolean;
-  } = {
+  /** See {@link CtReplayRunner.gateTrace}. */
+  const gateTrace = (ct: CtRuntime): void => {
+    const counted: [string, keyof TracePosition | undefined][] = [
+      ["step", "steps"],
+      ["write", "steps"],
+      ["enter", "calls"],
+      ["ret", "returns"],
+      ["value", undefined],
+      ["markCorrelation", undefined],
+    ];
+    for (const [name, counter] of counted) {
+      const f = ct[name];
+      if (typeof f !== "function") continue;
+      const passThrough = name === "ret";
+      // The frames open, tracked whether emission is on or not: they decide
+      // where a range may be bounded (§12).
+      const frames = name === "enter" ? 1 : name === "ret" ? -1 : 0;
+      ct[name] = function gated(this: unknown, ...args: unknown[]): unknown {
+        openFrames += frames;
+        if (!status.emitting) return passThrough ? args[1] : undefined;
+        if (counter !== undefined) status.trace[counter]++;
+        return (f as (...a: unknown[]) => unknown).apply(ct, args);
+      };
+    }
+  };
+
+  const replay: CtReplay & CtReplayRunner = {
     protocol: 1,
     level,
     header,
@@ -1454,6 +1603,7 @@ export function installReplayRuntime(
       return progress.pendingScripts().some((s) => progress.srcOf(s) === url);
     },
     checkpointDue: () => current()?.record === "Checkpoint",
+    gateTrace,
     gate,
     fail,
     get failed() {
@@ -1472,6 +1622,8 @@ export function installReplayRuntime(
           : `, waiting for ${JSON.stringify(awaiting)}`),
       dispatchedDuringInject: status.dispatchedDuringInject.slice(),
       pageErrors: status.pageErrors.slice(),
+      trace: { ...status.trace },
+      checkpointTrace: status.checkpointTrace.slice(),
     }),
   };
   Object.defineProperty(w, REPLAY_GLOBAL, {

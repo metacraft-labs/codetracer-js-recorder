@@ -142,7 +142,25 @@ This is a monorepo managed with npm workspaces:
   as a typed error and, with `--out`, instruments the build itself and writes
   the materialised trace through codetracer's `session-manager record-web`,
   passing it the trace's recording id (`materialisedRecordingId`, derived from
-  the session, so a trace written again is byte-identical). Its in-page half
+  the session, so a trace written again is byte-identical). `--seq-from` and
+  `--seq-to` materialise a range: the replay runs from the start with `__ct`
+  emission off until the last checkpoint at or before the range's start and
+  stops at the first checkpoint at or after its end, both found in the
+  recording's `jsbound.chk` (`rangeBounds`; the in-page runtime's `gateTrace`
+  wraps the `__ct` methods). A bound is only ever a checkpoint where no
+  instrumented frame is open (an `async` function or a generator suspended
+  across it): `gateTrace` counts the frames entered and not yet returned
+  from whether emission is on or not, the replay stops at the first
+  checkpoint at or after the end with none open, and a start with frames
+  open moves to the last earlier checkpoint with none, by replaying a second
+  time (`quiescentBounds`); the trace's `seq-range` arg and the report's
+  `range` give the bounds it actually has. This relies on every call
+  reporting its exit, including one that falls off its end after an early
+  `return` elsewhere (`completesNormally` in
+  `packages/instrumenter/src/visitor.ts`). The reader refuses a `jsbound.chk` that disagrees
+  with the log (`verifyCheckpointIndex` in `packages/boundary-format`), and a
+  divergence reports the last checkpoint that matched. Pinned by
+  `tests/boundary/seeking.test.ts`. Its in-page half
   (`src/browser/runtime.ts`, bundled to `dist/replay-runtime.iife.js`) is `__ctReplay`, the one cursor every replayed
   read is matched against, and the scheduler that owns the page's tasks. The
   document's own loading (the parser's progress, external scripts,

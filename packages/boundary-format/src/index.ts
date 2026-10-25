@@ -14,3 +14,4 @@ export * from "./schema.js";
 export * from "./codec.js";
 export * from "./json.js";
 export * from "./batch.js";
+export * from "./checkpoint-index.js";
