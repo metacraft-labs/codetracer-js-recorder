@@ -18,12 +18,15 @@
  * with the resource as fast as the runner can answer, or slower than on
  * record (the runner's `responseDelayMs` test seam), and must reach `End`
  * either way; a negative control edits the log's order or a value, which
- * must diverge where it reaches the document.
+ * must diverge where it reaches the document. A level-1 session (the
+ * reference micro-framework of the conformance suite, whose protocol has
+ * no `import-seam` capability) is refused at its first dynamic import too.
  *
  * No mocks: the browser, the servers and the runner are real.
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -31,8 +34,20 @@ import {
   type BoundaryRecord,
   type RecordOf,
   PLATFORM_VALUE_SRC,
+  decodeLog,
 } from "../../packages/boundary-format/src/index.js";
 import {
+  buildBundleManifest,
+  writeBundleManifest,
+} from "../../packages/boundary-shim/src/index.js";
+import {
+  buildReferenceFixtures,
+  loadPlaywright,
+  runRecordLeg,
+} from "../../packages/boundary-conformance/src/index.js";
+import {
+  logBytes,
+  replaySession,
   seqAt,
   withRecordBefore,
   withoutRecord,
@@ -453,6 +468,112 @@ describe("replay runs the document's resource tasks in recorded order", () => {
       expect(answered.filter((u) => u.includes("resources-late.js"))).toEqual(
         [],
       );
+    },
+    TIMEOUT,
+  );
+});
+
+describe("a dynamic import() at protocol level 1", () => {
+  it(
+    "replay_refuses_a_dynamic_import_of_a_level_1_session",
+    async () => {
+      // §6 "Dynamic import()", §7.4: the runner gives every script it serves
+      // the replay runtime's seam at level 1 too, where the protocol has no
+      // `import-seam` capability, so a cooperating framework's session ends
+      // `NonReplayable` at the page's first dynamic import rather than let
+      // the module run wherever the replay browser's network decides. The
+      // build is the reference micro-framework's counter (the suite's
+      // test-only level-1 implementation) whose click handler first imports
+      // a module; the module's evaluation reads the framework's clock, which
+      // proves on record that the import ran.
+      const work = fs.mkdtempSync(path.join(os.tmpdir(), "ct-level1-import-"));
+      try {
+        const site = path.join(work, "site");
+        const { buildHash: before } = await buildReferenceFixtures(site);
+        fs.writeFileSync(
+          path.join(site, "counter", "level1-mod.js"),
+          "globalThis.__ctRef.now();\nexport const seven = 7;\n",
+        );
+        // Into the handler the framework registered (its `inject` calls the
+        // first handler registered for a target and type, §9.5), so replay
+        // reaches the call through injection.
+        const app = path.join(site, "counter", "app.js");
+        const handler = "count.set(count.get() + 1);";
+        const source = fs.readFileSync(app, "utf-8");
+        expect(source.split(handler)).toHaveLength(2);
+        fs.writeFileSync(
+          app,
+          source.replace(
+            handler,
+            `import("./level1-mod.js").then((m) => document.body.setAttribute("data-mod", String(m.seven)));\n    ${handler}`,
+          ),
+        );
+        // The pages carry the build hash in their configuration element,
+        // which the hash does not cover (§8.1): embed the new one.
+        const { buildHash } = buildBundleManifest(site);
+        expect(buildHash).not.toBe(before);
+        for (const file of ["index.html", "perturbed.html"]) {
+          const p = path.join(site, "counter", file);
+          const html = fs.readFileSync(p, "utf-8");
+          expect(html).toContain(before);
+          fs.writeFileSync(p, html.split(before).join(buildHash));
+        }
+        expect(writeBundleManifest(site).buildHash).toBe(buildHash);
+
+        const browser = await loadPlaywright().chromium.launch({
+          headless: true,
+        });
+        try {
+          const { runs } = await runRecordLeg({
+            build: site,
+            level: 1,
+            fixtures: ["counter"],
+            browser,
+          });
+          const log = runs[0]?.recording.log;
+          expect(log, runs[0]?.recording.collectError).toBeDefined();
+          const rs = decodeLog(log!, { inlineBodies: "batch" }).records;
+          const header = rs[0] as RecordOf<"Header">;
+          expect(header.protocol_level).toBe(1);
+          expect(header.build_hash).toBe(buildHash);
+          // Level 1 has no `import-seam` (§9.2), and nothing orders the
+          // import.
+          expect(JSON.parse(header.capabilities)).not.toContain("import-seam");
+          expect(rs.some((r) => r.record === "TaskReg" && r.kind === 13)).toBe(
+            false,
+          );
+          // One clock read per click, the handler's, and one more, the
+          // module's (vacuity guard: the import ran on record).
+          const clicks = rs.filter(
+            (r) => r.record === "Input" && r.type === "click",
+          ).length;
+          expect(clicks).toBeGreaterThanOrEqual(2);
+          expect(rs.filter((r) => r.record === "Clock")).toHaveLength(
+            clicks + 1,
+          );
+
+          const file = path.join(work, "session.jsbound.log");
+          fs.writeFileSync(file, logBytes(rs));
+          const r = await replaySession({
+            log: file,
+            build: site,
+            browser,
+            timeoutMs: 30_000,
+          });
+          // Refused at the call, typed and naming the specifier, after the
+          // records before it replayed: the first click's handler imports
+          // before its clock read, which is where the cursor stands.
+          const click = indexWhere(rs, "Input", (i) => i.type === "click");
+          expect(rs[click + 1].record).toBe("Clock");
+          expectDiverged(r, "NonReplayable", seqAt(rs, click + 1));
+          expect(r.divergence?.detail).toContain('"dynamic-import"');
+          expect(r.divergence?.detail).toContain("./level1-mod.js");
+        } finally {
+          await browser.close();
+        }
+      } finally {
+        fs.rmSync(work, { recursive: true, force: true });
+      }
     },
     TIMEOUT,
   );
