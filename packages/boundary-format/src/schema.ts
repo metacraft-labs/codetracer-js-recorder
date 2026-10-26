@@ -298,6 +298,7 @@ export const RECORD_SCHEMA = [
       ["phase", "u8"],
       ["elements", "u32"],
       ["scripts", "u32"],
+      ["text", "u32"],
     ],
   },
   {

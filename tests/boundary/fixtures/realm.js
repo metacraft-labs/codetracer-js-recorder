@@ -30,12 +30,11 @@
   var second = params.get("second") || "";
   var stun = params.get("stun") || "";
   setTimeout(function () {
-    // Into a container the parser has already closed: appended to the body,
-    // the frame would land before or after the body's trailing text
-    // depending on how far the parser got when the timer ran, which the
-    // replay does not hold back.
+    // Appended to the body: under load the timer may run before the parser
+    // inserted the body's trailing text, and the replay must then hold the
+    // parser before it (§6, "The position").
     var frame = document.createElement("iframe");
-    document.getElementById("frames").appendChild(frame);
+    document.body.appendChild(frame);
     var realm = frame.contentWindow;
     if (second !== "") {
       var ws = second.replace(/^http/, "ws");

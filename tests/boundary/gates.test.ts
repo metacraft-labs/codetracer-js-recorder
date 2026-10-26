@@ -6,16 +6,24 @@
  * the document, so once they have run the document must be node for node
  * what the browser builds from the page without them.
  *
- * Each document is loaded twice in real headless Chromium, as served and
- * with every gate `insertGates` puts in (parser gates and the
- * `DOMContentLoaded` and `load` gates), and its tree is serialised node by
+ * Each document is loaded in real headless Chromium as served, with every
+ * gate `insertGates` puts in (parser gates and the `DOMContentLoaded` and
+ * `load` gates), and with those gates again, every parser gate holding the
+ * parser as the replay runtime does where the log says so (it writes a
+ * parser-blocking external gate script, which the parser meets in the
+ * insertion mode the gate left); its tree is serialised node by
  * node, text nodes one by one (two adjacent text nodes are not one), with
- * every element and attribute. The two must be equal. The documents are
+ * every element and attribute. The three must be equal. The documents are
  * the shapes the HTML tree builder treats specially: implied and foster-
  * parented table parts, auto-closed paragraphs and list items, reconstructed
  * formatting elements, `select`, raw text and RCDATA, `template`, foreign
  * content, comments, a missing `head` and `body`, content after `</html>`,
- * a stray `<body>` and a `<frame>` between text; documents whose head
+ * text and comments between tags (gates go at every token boundary, text
+ * included), runs of text in tables and whitespace in a column group,
+ * comments after `</body>` and `</html>`, text and comments in "in
+ * head", "after head", "in select", "in caption", "in table body", "in row",
+ * `<template>` contents and foreign content, after ignored end tags and
+ * between `<pre>` and its newline, a stray `<body>` and a `<frame>` between text; documents whose head
  * the tree builder implies (whitespace after a doctype, a comment or
  * `<html>`, which the modes before the head drop), pretty-printed tables
  * and selects, a page's own `document.write`, declarative shadow roots,
@@ -34,13 +42,15 @@
  * or a replay at another position; the same session on the same page
  * without the policy replays.
  *
- * One test double, and why: `__ctReplay.gate` is a stand-in that only takes
- * the gates out (it never holds the parser), installed as an init script.
+ * One test double, and why: `__ctReplay.gate` is a stand-in that takes the
+ * gates out and, in the holding pass, writes the held script, which the
+ * route answers at once, installed as an init script.
  * What is under test is where the gates go, not the scheduler, which
  * `replay.test.ts` covers with the real runtime.
  *
  * Negative controls: a gate put where `insertGates` refuses to (before a
- * `<col>`; after a doctype, before the head exists) gives a different
+ * `<col>`; after a doctype, before the head exists; before whitespace in a
+ * column group; after `</body>` before a comment) gives a different
  * tree, so the comparison discriminates; and so does the bootstrap where
  * the injector put it before it used the tokenizer (after `<html>` or a
  * doctype, before whitespace the modes before the head drop).
@@ -172,6 +182,67 @@ t</textarea>`,
 <HTML>
 <!-- c -->
 <BODY><P>x</BODY>`,
+  // Gates at the boundaries around text and comments (§6, "The position"):
+  // a run of text in a table is foster-parented or not by all of its
+  // characters, whitespace in a column group stays in it, and comments
+  // after `</body>` and `</html>` go to the `<html>` element and the
+  // document.
+  "text and comments around tags": `<p>a<!--c-->b<!---->c</p>
+<div>one <b>two</b> three<br>four</div>
+<p>x<span></span>y</p>tail`,
+  "text runs in tables": `<table>  x  <tr><td>a</td> b </tr>
+  <!-- c -->
+</table>
+<table>\n  <tr> <td>t</td>  </tr>\n</table>`,
+  "whitespace in a column group": `<table><colgroup>
+  <col>
+  <!-- c -->
+</colgroup>
+<col>
+<tr><td>x</td></tr></table>`,
+  // Whitespace after `</body>` and `</html>` and no comment: a gate there
+  // switches to "in body", where the whitespace goes to the body just the
+  // same (the page a task can run in while the parser has `</body>` and
+  // not yet `</html>`).
+  "whitespace after body and html": `<p>a</p></body>
+</html>
+`,
+  "comments after body and html": `<p>a</p></body>
+<!-- after body -->
+</html>
+<!-- after html -->
+`,
+  // Text and comments in each insertion mode a gate's `<script>` start tag
+  // is processed in (HTML, "Tree construction"): "in head" and "after
+  // head", raw text in the head (`<noscript>`, scripting on), "in select"
+  // (and in a cell), "in caption", "in table body" and "in row" with runs
+  // of text the tree builder foster-parents or not, text after stray end
+  // tags the body ignores (the parser appends it to the text before), a
+  // comment between `<pre>` and its newline, text in `<template>` contents
+  // and in foreign content (and after an HTML element that breaks out of
+  // it), and a comment after a stray end tag after `</body>`, which
+  // switches to "in body" itself.
+  "text and comments in head and after head": `<!doctype html><html><head> <!-- h1 -->
+  <title>t</title> <!-- h2 --> <noscript><p>n</p></noscript>
+</head> <!-- after head -->
+<body> x <!-- b --> y </body></html>`,
+  "text and comments in select": `<select> <!-- s --> <option>a</option> x <optgroup label=g> <!-- o --> <option>b</optgroup> </select>
+<table><tr><td><select> t <option>c</select> u </td></tr></table>`,
+  "text and comments in table sections": `<table> <caption> c <!-- cap --> d </caption> <!-- t -->
+<tbody> x <!-- tb --> <tr> y <!-- tr --> <td>z</td> w </tr> </tbody>
+<tfoot> <tr><td>f</td></tr> </tfoot> v </table> after`,
+  "text after ignored end tags": `<p>a</div>b</span>c</p>d</td>e<!--x-->f</table>g`,
+  "comment between pre and its newline": `<pre><!---->
+x</pre><listing><!--l-->
+y</listing>`,
+  "text in template and foreign content": `<template> a <!-- t --> <p>b</p> c </template> d
+<svg> <g> t <!-- s --> </g> u </svg> e
+<math> <mi> m </mi> <!-- m --> </math> f
+<svg><p>broke out</p> after </svg> g`,
+  "comment after a stray end tag after body": `<p>a</p></body></p>
+<!-- in body now -->
+</html>
+<!-- c -->`,
   // An unquoted value holding a quote: the quote starts no quoted value, so
   // the `>` in the title below is in a quoted value, not a tag's end.
   "unquoted value with a quote": `<img alt=it's><span title='a >
@@ -180,6 +251,10 @@ t</textarea>`,
 };
 
 let browser: Browser;
+/** The gate scripts the inline gates wrote, with `treeOf`'s `hold`. */
+const heldScripts = new Set<string>();
+/** Numbers each `treeOf` call, so its held scripts count apart. */
+let treeCalls = 0;
 
 beforeAll(async () => {
   browser = await loadPlaywright().chromium.launch({ headless: true });
@@ -193,16 +268,35 @@ afterAll(async () => {
  * The document `html` builds, node by node, after every script ran; the
  * record bootstrap's element (the level-0 reference) is left out.
  */
-async function treeOf(html: string): Promise<string[]> {
+async function treeOf(html: string, hold = false): Promise<string[]> {
+  const call = treeCalls++;
   const context = await browser.newContext();
   try {
+    // With `hold`, every inline parser gate also does what the replay
+    // runtime's does where it holds the parser: it writes a parser-blocking
+    // external gate script (`document.write`), parsed in the insertion mode
+    // the inline gate left, and then takes every gate out of the document.
+    // A gate that holds must leave the tree as it was too.
     await context.addInitScript({
       content: `globalThis.__ctReplay = { gate() {
+        const s = document.currentScript;
+        if (${hold} && s !== null && !s.src && document.readyState === "loading") {
+          document.write('<script data-ct-replay-gate src="${GATE_PATH}gate/held?n=' + (globalThis.__ctHeld = (globalThis.__ctHeld || 0) + 1) + '"></' + 'script>');
+        }
         for (const s of Array.from(document.querySelectorAll("script[data-ct-replay-gate]"))) s.remove();
       } };`,
     });
     await context.route("**/*", async (route, request) => {
       const url = new URL(request.url());
+      if (url.pathname === `${GATE_PATH}gate/held`) {
+        heldScripts.add(`${call}:${url.search}`);
+        await route.fulfill({
+          status: 200,
+          headers: { "content-type": "text/javascript" },
+          body: "",
+        });
+        return;
+      }
       if (url.pathname.startsWith(GATE_PATH)) {
         await route.fulfill({
           status: 200,
@@ -240,19 +334,27 @@ describe("the replay runner's document gates", () => {
         const gated = insertGates(html, options);
         expect(gated.skipped, name).toBeUndefined();
         gates += gated.parserGates;
-        const [plain, withGates] = [
+        const [plain, withGates, held] = [
           await treeOf(html),
           await treeOf(gated.html),
+          await treeOf(gated.html, true),
         ];
-        results[name] = JSON.stringify(withGates) === JSON.stringify(plain);
+        results[name] =
+          JSON.stringify(withGates) === JSON.stringify(plain) &&
+          JSON.stringify(held) === JSON.stringify(plain);
         if (!results[name]) {
           // Show the first difference in the failure message.
           expect(withGates, name).toEqual(plain);
+          expect(held, `${name}, every gate holding`).toEqual(plain);
         }
       }
       expect(Object.values(results).every((r) => r)).toBe(true);
       // Vacuity: the gates went in, many of them.
       expect(gates).toBeGreaterThan(40);
+      // ... and in the `hold` pass every one of them wrote its held script,
+      // and so did the parser gate after the event gates, one per document,
+      // which `parserGates` does not count.
+      expect(heldScripts.size).toBe(gates + Object.keys(DOCUMENTS).length);
 
       // Negative control: a gate before a `<col>` ends its column group, and
       // the `<col>` implies a second one.
@@ -263,6 +365,30 @@ describe("the replay runner's document gates", () => {
         PARSER_GATE + "<col>",
       );
       expect(await treeOf(bad)).not.toEqual(await treeOf(html));
+
+      // Negative control: a gate in a column group before whitespace ends
+      // the group, so the whitespace goes to the table; and a gate after
+      // `</body>` before a comment switches to "in body", so the comment
+      // goes to the body. insertGates puts none at either.
+      for (const [doc, at] of [
+        ["whitespace in a column group", "<colgroup>"],
+        ["comments after body and html", "</body>"],
+      ]) {
+        const html = DOCUMENTS[doc];
+        const after = html.indexOf(at) + at.length;
+        expect(insertGates(html, options).html, doc).not.toContain(
+          at + PARSER_GATE,
+        );
+        expect(
+          await treeOf(html.slice(0, after) + PARSER_GATE + html.slice(after)),
+          doc,
+        ).not.toEqual(await treeOf(html));
+      }
+
+      // ... but with only whitespace after `</body>` a gate goes there.
+      expect(
+        insertGates(DOCUMENTS["whitespace after body and html"], options).html,
+      ).toContain("</body>" + PARSER_GATE);
 
       // Negative control: a gate where the head does not exist yet (right
       // after the doctype, as before the head rule) keeps the whitespace
@@ -346,7 +472,8 @@ describe("the replay runner's document gates", () => {
     "a_gate_the_page_refuses_is_a_typed_divergence",
     async () => {
       // A session whose only task ran while the parser was before the
-      // second <p> (html, head, meta, title, body, p: 6 elements), on a page
+      // second <p> (html, head, meta, title, body, p: 6 elements; the
+      // title's and the first paragraph's text: 2 of text), on a page
       // whose <meta> is a policy or not.
       const page = (meta: string) =>
         `<!doctype html><html><head>${meta}<title>t</title></head>` +
@@ -387,7 +514,14 @@ describe("the replay runner's document gates", () => {
               referrer_origin: "",
               traceparent: "",
             },
-            { record: "Loading", seq: 1n, phase: 1, elements: 6, scripts: 0 },
+            {
+              record: "Loading",
+              seq: 1n,
+              phase: 1,
+              elements: 6,
+              scripts: 0,
+              text: 2,
+            },
             { record: "End", last_seq: 1n, reason: 2 },
           ] as BoundaryRecord[];
           const log = path.join(dir, "jsbound.log");

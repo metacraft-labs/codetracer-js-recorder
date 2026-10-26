@@ -4,14 +4,21 @@
  * replay holds the document's own loading, so that a task recorded while
  * the document loaded runs on replay where it ran on record.
  *
- * - **Parser gates.** Before every start tag the parser will turn into an
- *   element, the runner inserts one inline classic script,
+ * - **Parser gates.** At every boundary between two of the tokenizer's
+ *   tokens (a tag, a comment, a doctype), between a token and the character
+ *   data after or before it, and at the end of the document, where it is
+ *   safe (below), the runner inserts one inline classic script,
  *   `<script data-ct-replay-gate>__ctReplay.gate()</script>`. When the
  *   parser reaches it, the replay runtime compares the document's position
- *   with the `Loading` record at the cursor; when they are equal it writes
- *   a parser-blocking external script (`document.write`), whose request the
- *   runner holds until the scheduler has released the tasks recorded at
- *   that position. Otherwise it does nothing. Either way it removes itself.
+ *   (its elements, scripts and text) with the `Loading` record at the
+ *   cursor; when they are equal it writes a parser-blocking external script
+ *   (`document.write`), whose request the runner holds until the scheduler
+ *   has released the tasks recorded at that position. Otherwise it does
+ *   nothing. Either way it removes itself. These are the points between
+ *   which the parser inserts nodes (Chromium's parser yields between
+ *   tokens), so the replay can hold it wherever the recording could have
+ *   seen it, but inside a run of text, which a network that delivered the
+ *   document in pieces may have cut: a typed divergence.
  * - **`DOMContentLoaded` and `load` gates.** A `defer` script and an `async`
  *   script at the end of the document, held by the runner until the log's
  *   `DocTask` says the document dispatched the event: `DOMContentLoaded` is
@@ -28,12 +35,18 @@
  * Where a gate goes, so that the gated document is the recorded one once
  * the gates are gone:
  *
- * - Only before a start tag, and only where the token before it is a tag,
- *   a comment or a doctype, with nothing but whitespace between them; the
- *   gate goes right after that token, so it is never in the middle of
- *   text (a gate takes itself out of the document before the parser reads
- *   on, so text after it joins the text before it anyway; this keeps the
- *   positions to the ones the tree builder treats alike).
+ * - Only at a boundary (`Boundary`, `html-scan.ts`): never inside a run of
+ *   character data, raw text or RCDATA, or a tag. A gate before a whole run
+ *   of text, or after one, leaves the run whole: in "in table" the tree
+ *   builder decides whether to foster-parent a run by all of its characters,
+ *   which a gate inside it would split.
+ * - Where the tree builder may be "in column group", only right before a
+ *   start tag (which leaves that mode, as the gate's `<script>` would) or
+ *   at the end: a `<script>` there ends the column group, so whitespace
+ *   after it would go to the table. Where it may be "after body", not when
+ *   a comment follows before the next `</body>` or `</html>`, start tag,
+ *   text or the end: a `<script>` there switches to "in body", so that
+ *   comment would go to the body instead of the `<html>` element.
  * - The tests (`tests/boundary/gates.test.ts`) hold a set of documents the
  *   tree builder treats specially to "the same tree with and without
  *   gates", in real Chromium.
@@ -53,7 +66,7 @@
  *   encoding declaration before it (`bootstrapPlacement`), the same copy
  *   goes before the gate (`GateOptions.declarationCopy`): the copy is an
  *   element of the recorded tree, which the gate, taking itself out, is not.
- * - Not before `<col>`: a script ends
+ * - Not before `<col>` (or `<template>` in a column group): a script ends
  *   the column group it would be in, and the `<col>` then implies another;
  *   nor right after `<pre>` or `<listing>`, whose first newline the parser
  *   drops only when it comes first; not inside raw text or RCDATA
@@ -75,7 +88,10 @@
 
 import type { BoundaryRecord } from "@codetracer/boundary-format";
 import { REPLAY_GATE_MARKER } from "@codetracer/boundary-shim/dist/browser/document-progress.js";
-import { scanTags } from "@codetracer/boundary-shim/dist/html-scan.js";
+import {
+  type Boundary,
+  scanTags,
+} from "@codetracer/boundary-shim/dist/html-scan.js";
 
 /** The marker attribute of a gate, which a document position never counts. */
 export const GATE_MARKER = REPLAY_GATE_MARKER;
@@ -205,38 +221,41 @@ export function insertGates(html: string, options: GateOptions): GatedDocument {
     return { html, parserGates: 0 };
   }
   const inserts: number[] = [];
+  const boundaries: Boundary[] = [];
   let skipped: string | undefined;
   let plaintext = false;
-  scanTags(html, (tag) => {
-    if (tag.end) return;
-    if (tag.name === "frameset") {
-      skipped = "a frameset document has no body for the gates";
-      return false;
-    }
-    if (
-      options.parser &&
-      tag.afterToken >= 0 &&
-      !tag.nested &&
-      // The stand-in, where there is one, made the head already.
-      (tag.headMade || (standIn !== undefined && tag.afterToken >= standIn)) &&
-      tag.name !== "html" &&
-      tag.name !== "head" &&
-      tag.name !== "col" &&
-      tag.afterStartTag !== "pre" &&
-      tag.afterStartTag !== "listing"
-    ) {
-      inserts.push(tag.afterToken);
-    }
-    if (tag.name === "plaintext") {
-      // Everything after it is text: no more gates, and the event gates
-      // would be text too.
-      skipped = "<plaintext> makes the rest of the document text";
-      plaintext = true;
-      return false;
-    }
-  });
+  scanTags(
+    html,
+    (tag) => {
+      if (tag.end) return;
+      if (tag.name === "frameset") {
+        skipped = "a frameset document has no body for the gates";
+        return false;
+      }
+      if (tag.name === "plaintext") {
+        // Everything after it is text: no more gates, and the event gates
+        // would be text too.
+        skipped = "<plaintext> makes the rest of the document text";
+        plaintext = true;
+        return false;
+      }
+    },
+    {
+      boundary(b) {
+        // In document order, each offset once.
+        boundaries.push(b);
+      },
+    },
+  );
   if (skipped !== undefined && !plaintext) {
     return { html, parserGates: 0, skipped };
+  }
+  if (options.parser) {
+    boundaries.forEach((b, i) => {
+      if (gateGoesAt(b, standIn, () => commentInBodyMode(boundaries, i))) {
+        inserts.push(b.at);
+      }
+    });
   }
   if (standIn !== undefined) {
     // The bootstrap's position (a parser gate may be there already).
@@ -262,6 +281,68 @@ export function insertGates(html: string, options: GateOptions): GatedDocument {
     parserGates: options.parser ? inserts.length : 0,
     ...(skipped !== undefined ? { skipped } : {}),
   };
+}
+
+/**
+ * Whether a comment comes after boundary `boundaries[i]`, where the tree
+ * builder may be "after body", before anything takes it back to that mode or
+ * makes the mode not matter: a gate's `<script>` there switches it to "in
+ * body", and a comment the parser meets in "in body" goes to the body, where
+ * "after body" puts it on the `<html>` element ("after after body": on the
+ * document). The next `</body>` or `</html>` switches back; a start tag or
+ * text that is not whitespace would have switched to "in body" anyway; at the
+ * end nothing follows.
+ * https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-afterbody
+ */
+function commentInBodyMode(
+  boundaries: readonly Boundary[],
+  i: number,
+): boolean {
+  for (let j = i; j < boundaries.length; j++) {
+    const b = boundaries[j];
+    if (j > i && !b.afterBody) return false;
+    if (b.next === "comment") return true;
+    if (b.next === "start" || b.next === "eof") return false;
+    if (b.next === "end" && (b.name === "body" || b.name === "html")) {
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether a parser gate goes at boundary `b` (see the module comment);
+ * `standIn` is where the bootstrap's stand-in goes, which makes the head;
+ * `commentAhead` says whether a comment follows in "after body" mode
+ * ({@link commentInBodyMode}), asked only there.
+ */
+function gateGoesAt(
+  b: Boundary,
+  standIn: number | undefined,
+  commentAhead: () => boolean,
+): boolean {
+  if (b.nested) return false;
+  if (!b.headMade && (standIn === undefined || b.at < standIn)) return false;
+  // The newline right after `<pre>` or `<listing>` is dropped only when
+  // it is the next token.
+  if (b.afterStartTag === "pre" || b.afterStartTag === "listing") {
+    return false;
+  }
+  if (
+    b.next === "start" &&
+    (b.name === "html" || b.name === "head" || b.name === "col")
+  ) {
+    return false;
+  }
+  if (b.inColumnGroup) {
+    // Whitespace or a comment after a gate here would leave the column
+    // group; a start tag other than `<col>` and `<template>` leaves it
+    // anyway.
+    if (b.next === "eof") return true;
+    return b.next === "start" && b.name !== "template";
+  }
+  if (b.afterBody) return !commentAhead();
+  return true;
 }
 
 /** `html` with `text(p)` inserted at each of the ascending `positions` `p`. */

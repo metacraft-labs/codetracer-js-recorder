@@ -30,6 +30,7 @@
 import { DOC_TASK, LOADING_PHASE } from "@codetracer/boundary-format";
 
 import { REPLAY_GATE_MARKER, isOwnElement } from "./own-elements.js";
+import { ParseCensus, getter } from "./parse-census.js";
 import type { Recorder } from "./recorder.js";
 import {
   type ResourceEvent,
@@ -56,12 +57,21 @@ export { REPLAY_GATE_MARKER };
  *   the document, but not, while it parses, the one that is its last
  *   element. Inline module scripts are not counted (they run
  *   later, with no event that says when), nor are the record bootstrap and
- *   the replay runner's gates.
+ *   the replay runner's gates;
+ * - `text`: while it parses, the character data the document holds
+ *   ({@link DocumentProgress.characterData}): the length of every text
+ *   node's data and one more than the length of every comment's, in UTF-16
+ *   code units, but for the text of CodeTracer's own scripts and of the
+ *   inline script the elements leave out. The parser inserts text and
+ *   comments as well as elements, and a task that runs before it reached a
+ *   run of text sees, and changes, another document than one that runs after
+ *   it. 0 once the document is parsed: the parser inserts nothing more.
  */
 export interface DocumentPosition {
   phase: number;
   elements: number;
   scripts: number;
+  text: number;
 }
 
 /** Whether two positions are the same. */
@@ -70,15 +80,46 @@ export function samePosition(
   b: DocumentPosition,
 ): boolean {
   return (
-    a.phase === b.phase && a.elements === b.elements && a.scripts === b.scripts
+    a.phase === b.phase &&
+    a.elements === b.elements &&
+    a.scripts === b.scripts &&
+    a.text === b.text
   );
 }
 
-/** `{phase, elements, scripts}` as a short string, for a report. */
+/** `{phase, elements, scripts, text}` as a short string, for a report. */
 export function describePosition(p: DocumentPosition | undefined): string {
   return p === undefined
     ? "loaded"
-    : `phase ${p.phase}, ${p.elements} elements, ${p.scripts} scripts run`;
+    : `phase ${p.phase}, ${p.elements} elements, ${p.scripts} scripts run, ${p.text} of text`;
+}
+
+/** `NodeFilter.SHOW_TEXT | NodeFilter.SHOW_COMMENT` (DOM, "Interface NodeFilter"). */
+const SHOW_CHARACTER_DATA = 0x4 | 0x80;
+/** `Node.ELEMENT_NODE` and `Node.TEXT_NODE`. */
+const ELEMENT_NODE = 1;
+const TEXT_NODE = 3;
+
+/** `Node.DOCUMENT_POSITION_FOLLOWING`. */
+const FOLLOWING = 0x4;
+
+/** Whether the `<script>` `el` is a module script (by its `type`). */
+function isModuleScript(el: Element): boolean {
+  return (el.getAttribute("type") ?? "").trim().toLowerCase() === "module";
+}
+
+/**
+ * Whether `el` is an inline classic script of HTML's: the kind the parser
+ * may be inside of, or hold at its end tag (see
+ * `DocumentProgress.trailingInlineScript`).
+ */
+function isInlineClassicScript(el: Element): boolean {
+  return (
+    el.localName === "script" &&
+    el.namespaceURI === "http://www.w3.org/1999/xhtml" &&
+    !el.hasAttribute("src") &&
+    !isModuleScript(el)
+  );
 }
 
 /** The document's own events {@link DocumentProgress.listen} reports. */
@@ -90,17 +131,6 @@ export interface DocumentEvents {
   load(): void;
 }
 
-/** A getter of `owner`'s prototype chain, captured before a page could patch it. */
-function getter<T>(owner: object, name: string): (this: unknown) => T {
-  let o: object | null = owner;
-  while (o !== null) {
-    const d = Object.getOwnPropertyDescriptor(o, name);
-    if (d?.get !== undefined) return d.get as (this: unknown) => T;
-    o = Object.getPrototypeOf(o);
-  }
-  throw new Error(`no ${name} getter`);
-}
-
 /**
  * The position of one document, and the record of which of its scripts have
  * settled and which of its events were dispatched. See the module comment.
@@ -110,9 +140,21 @@ export class DocumentProgress {
   private readonly readyState: (this: unknown) => string;
   private readonly currentScriptOf: (this: unknown) => Element | null;
   private readonly scriptSrc: (this: unknown) => string;
+  /**
+   * The platform functions {@link characterData} walks the document with,
+   * captured before a page could patch them.
+   */
+  private readonly createTreeWalker: Document["createTreeWalker"];
+  private readonly nextNode: (this: TreeWalker) => Node | null;
+  private readonly nodeType: (this: unknown) => number;
+  private readonly parentNode: (this: unknown) => Node | null;
+  private readonly dataLength: (this: unknown) => number;
   /** Live: every element, and every `<script>`, of the document. */
   private readonly all: HTMLCollectionOf<Element>;
   private readonly scriptElements: HTMLCollectionOf<Element>;
+  /** The census of the document while it parses, if it was made then. */
+  private readonly census: ParseCensus | undefined;
+  private readonly compareDocumentPosition: Node["compareDocumentPosition"];
   private readonly settledScripts = new WeakSet<Element>();
   private dcl = false;
   private loaded = false;
@@ -122,8 +164,27 @@ export class DocumentProgress {
     this.readyState = getter<string>(this.doc, "readyState");
     this.currentScriptOf = getter<Element | null>(this.doc, "currentScript");
     this.scriptSrc = getter<string>(w.HTMLScriptElement.prototype, "src");
+    this.createTreeWalker = w.Document.prototype.createTreeWalker;
+    this.nextNode = w.TreeWalker.prototype.nextNode;
+    this.nodeType = getter<number>(w.Node.prototype, "nodeType");
+    this.parentNode = getter<Node | null>(w.Node.prototype, "parentNode");
+    this.dataLength = getter<number>(w.CharacterData.prototype, "length");
     this.all = this.doc.getElementsByTagName("*");
     this.scriptElements = this.doc.getElementsByTagName("script");
+    this.compareDocumentPosition = w.Node.prototype.compareDocumentPosition;
+    // Made, and started, before page code, while the document parses; a
+    // document made after that is measured whole, as is every document once
+    // it is parsed.
+    let census: ParseCensus | undefined;
+    if (this.state === "loading") {
+      try {
+        census = new ParseCensus(w);
+        census.start();
+      } catch {
+        census = undefined;
+      }
+    }
+    this.census = census;
   }
 
   /** Whether `DOMContentLoaded` has been dispatched. */
@@ -141,21 +202,137 @@ export class DocumentProgress {
     return this.readyState.call(this.doc);
   }
 
-  /** Where the document is now; `undefined` once `load` was dispatched. */
+  /** Whether {@link position} answers from the census now (the document parses). */
+  get incremental(): boolean {
+    return this.parsingCensus() !== undefined;
+  }
+
+  /**
+   * Where the document is now; `undefined` once `load` was dispatched.
+   * While the document parses, from its {@link ParseCensus}, in time
+   * proportional to what changed since the last question (a recorder asks
+   * at every task, the replay runner at every parser gate); otherwise as
+   * {@link fullPosition}, which it equals.
+   */
   position(): DocumentPosition | undefined {
-    if (this.loaded) return undefined;
-    const parsing = this.state === "loading";
-    const phase = parsing
-      ? LOADING_PHASE.parsing
-      : this.dcl
-        ? LOADING_PHASE.contentLoaded
-        : LOADING_PHASE.parsed;
+    const census = this.parsingCensus();
+    return census === undefined
+      ? this.fullPosition()
+      : this.censusPosition(census);
+  }
+
+  /**
+   * As {@link position}, measured from the whole document (its live
+   * collections and a walk of its text), in time proportional to its size:
+   * the definition the census is held to (`tests/boundary/parse-census.test.ts`).
+   */
+  fullPosition(): DocumentPosition | undefined {
+    const phase = this.phase();
+    if (phase === undefined) return undefined;
+    const parsing = phase === LOADING_PHASE.parsing;
     const s = this.countScripts(parsing);
     return {
       phase,
       elements: this.all.length - s.uncounted,
       scripts: s.run,
+      text: parsing ? this.characterData(s.held) : 0,
     };
+  }
+
+  /** The position's `phase` now; `undefined` once `load` was dispatched. */
+  phase(): number | undefined {
+    if (this.loaded) return undefined;
+    if (this.state === "loading") return LOADING_PHASE.parsing;
+    return this.dcl ? LOADING_PHASE.contentLoaded : LOADING_PHASE.parsed;
+  }
+
+  /** Whether the document is at `p` now. */
+  at(p: DocumentPosition): boolean {
+    const q = this.position();
+    return q !== undefined && samePosition(q, p);
+  }
+
+  /**
+   * The census, while the document parses (stopped once it is parsed:
+   * the parser inserts nothing more, and the other phases are measured at
+   * each task only); `undefined` otherwise.
+   */
+  private parsingCensus(): ParseCensus | undefined {
+    const census = this.census;
+    if (census === undefined || !census.active) return undefined;
+    if (this.state !== "loading") {
+      census.stop();
+      return undefined;
+    }
+    return census;
+  }
+
+  /**
+   * The position while the document parses, from `census`: what
+   * {@link fullPosition} measures, as {@link countScripts} and
+   * {@link characterData} define it.
+   */
+  private censusPosition(census: ParseCensus): DocumentPosition {
+    const c = census.counts();
+    const last = census.lastElement();
+    const held = last !== null && isInlineClassicScript(last) ? last : null;
+    let run = 0;
+    for (const s of c.scripts) {
+      if (s.hasAttribute("src")) {
+        if (this.settledScripts.has(s)) run++;
+        continue;
+      }
+      if (isModuleScript(s) || s === held) continue;
+      run++;
+    }
+    return {
+      phase: LOADING_PHASE.parsing,
+      elements: c.elements - (held === null ? 0 : 1),
+      scripts: run,
+      text: c.text - (held === null ? 0 : census.textOfChildren(held)),
+    };
+  }
+
+  /**
+   * The character data the document holds, as a position counts it (see
+   * {@link DocumentPosition}): every text node's length and every comment's
+   * plus one (an empty comment is a node the parser inserted too), in tree
+   * order from the document (a `<template>`'s contents and shadow trees are
+   * not in it, as their elements are not counted either), but for the text
+   * of CodeTracer's own scripts and of `held`, the inline script
+   * {@link countScripts} leaves out (the parser may be inside it).
+   *
+   * https://dom.spec.whatwg.org/#interface-treewalker
+   */
+  characterData(held: Element | null = null): number {
+    const walker = this.createTreeWalker.call(
+      this.doc,
+      this.doc,
+      SHOW_CHARACTER_DATA,
+    );
+    let n = 0;
+    for (
+      let node = this.nextNode.call(walker);
+      node !== null;
+      node = this.nextNode.call(walker)
+    ) {
+      const length = this.dataLength.call(node);
+      if (this.nodeType.call(node) !== TEXT_NODE) {
+        n += length + 1;
+        continue;
+      }
+      const parent = this.parentNode.call(node);
+      if (
+        parent !== null &&
+        (parent === held ||
+          (this.nodeType.call(parent) === ELEMENT_NODE &&
+            DocumentProgress.isOwn(parent as Element)))
+      ) {
+        continue;
+      }
+      n += length;
+    }
+    return n;
   }
 
   /** Whether `el` is one of CodeTracer's own scripts, never counted. */
@@ -193,11 +370,23 @@ export class DocumentProgress {
    * excepted, in document order.
    */
   pendingScripts(): HTMLScriptElement[] {
+    const pending = (s: Element) =>
+      !DocumentProgress.isOwn(s) &&
+      s.hasAttribute("src") &&
+      !this.settledScripts.has(s);
+    const census = this.parsingCensus();
+    if (census !== undefined) {
+      // The census has them in the order it met them, and the parser can
+      // insert before what it inserted already (a foster parent).
+      const found = census.counts().scripts.filter(pending);
+      return (found as HTMLScriptElement[]).sort((a, b) =>
+        this.compareDocumentPosition.call(a, b) & FOLLOWING ? -1 : 1,
+      );
+    }
     const out: HTMLScriptElement[] = [];
     for (let i = 0; i < this.scriptElements.length; i++) {
       const s = this.scriptElements[i];
-      if (DocumentProgress.isOwn(s) || !s.hasAttribute("src")) continue;
-      if (!this.settledScripts.has(s)) out.push(s as HTMLScriptElement);
+      if (pending(s)) out.push(s as HTMLScriptElement);
     }
     return out;
   }
@@ -273,7 +462,11 @@ export class DocumentProgress {
    * {@link trailingInlineScript}: replay gets there before the parser
    * inserts it).
    */
-  private countScripts(parsing: boolean): { run: number; uncounted: number } {
+  private countScripts(parsing: boolean): {
+    run: number;
+    uncounted: number;
+    held: Element | null;
+  } {
     let n = 0;
     let uncounted = 0;
     let held: Element | null | undefined;
@@ -287,7 +480,7 @@ export class DocumentProgress {
         if (this.settledScripts.has(s)) n++;
         continue;
       }
-      if ((s.getAttribute("type") ?? "").trim().toLowerCase() === "module") {
+      if (isModuleScript(s)) {
         continue;
       }
       if (parsing) {
@@ -299,7 +492,10 @@ export class DocumentProgress {
       }
       n++;
     }
-    return { run: n, uncounted };
+    // The inline script left out, whose text is not counted either. Found
+    // only while the document parses (and so `held` is `undefined` when no
+    // inline classic script was met).
+    return { run: n, uncounted, held: held ?? null };
   }
 
   /**
@@ -323,15 +519,7 @@ export class DocumentProgress {
     for (let i = this.all.length - 1; i >= 0; i--) {
       const el = this.all[i];
       if (DocumentProgress.isOwn(el)) continue;
-      if (
-        el.localName !== "script" ||
-        el.namespaceURI !== "http://www.w3.org/1999/xhtml" ||
-        el.hasAttribute("src") ||
-        (el.getAttribute("type") ?? "").trim().toLowerCase() === "module"
-      ) {
-        return null;
-      }
-      return el;
+      return isInlineClassicScript(el) ? el : null;
     }
     return null;
   }
@@ -393,8 +581,7 @@ export function recordDocumentProgress(
       const s = progress.currentExternalScript();
       if (s !== undefined && !announced.has(s)) announce(s, DOC_TASK.script);
     },
-    checkpointsAllowed: () =>
-      progress.position()?.phase !== LOADING_PHASE.parsing,
+    checkpointsAllowed: () => progress.phase() !== LOADING_PHASE.parsing,
   });
   progress.listen(addEventListener, {
     scriptSettled(script) {

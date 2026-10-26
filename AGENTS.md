@@ -186,7 +186,20 @@ This is a monorepo managed with npm workspaces:
   (`Loading` and `DocTask` records, written by
   `packages/boundary-shim/src/browser/document-progress.ts` on both sides)
   by the runner's gates (`src/gates.ts`), pinned by `tests/boundary/gates.test.ts`
-  and the slow-loading session of `tests/boundary/replay.test.ts`. So are the
+  and the slow-loading session of `tests/boundary/replay.test.ts`. A position
+  counts the document's text and comments as well as its elements
+  (`Loading.text`), and the parser gates sit at every token boundary where a
+  `<script>` leaves the tree as it was, so a task released while the document
+  parses sees the text it saw on record; a position inside a run of text
+  (the network cut it) is a typed divergence (`TaskOrderMismatch`). Pinned by
+  `tests/boundary/replay-loading-text.test.ts`. A gate runs at almost every
+  token boundary, so nothing it does may cost the size of the document:
+  while the document parses the position is counted from its mutation
+  records (`src/browser/parse-census.ts`, held to the whole-document count,
+  `DocumentProgress.fullPosition`, by `tests/boundary/parse-census.test.ts`),
+  and a gate removes itself, never by searching the document's scripts (a
+  live collection Blink recounts after every change to the tree: a 500 KB
+  page took a minute to replay that way). So are the
   events of resource elements (an image's, a style sheet's, a frame's `load`
   and `error`, a media element's events; `DocTask` kind 5, decided by
   `packages/boundary-shim/src/browser/resource-events.ts` on both sides):

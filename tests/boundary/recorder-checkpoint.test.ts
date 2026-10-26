@@ -321,7 +321,12 @@ describe("Recorder progress and startup invalidation", () => {
           if (action === "fault") recorder.fault(new Error("progress control"));
           if (action === "loading" || action === "loading-halt") {
             haltOnLoading = action === "loading-halt";
-            recorder.emit("Loading", { phase: 1, elements: 0, scripts: 0 });
+            recorder.emit("Loading", {
+              phase: 1,
+              elements: 0,
+              scripts: 0,
+              text: 0,
+            });
           }
         },
       });
@@ -341,6 +346,7 @@ describe("Recorder progress and startup invalidation", () => {
                   phase: 1,
                   elements: 0,
                   scripts: 0,
+                  text: 0,
                 },
                 { record: "Clock", seq: 2n, src: 1, bits: 0n },
               ]
@@ -352,6 +358,7 @@ describe("Recorder progress and startup invalidation", () => {
                     phase: 1,
                     elements: 0,
                     scripts: 0,
+                    text: 0,
                   },
                 ]
               : action === "fault"

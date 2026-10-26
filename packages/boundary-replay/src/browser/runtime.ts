@@ -58,7 +58,6 @@ import {
   DocumentProgress,
   describePosition,
   listenForResourceEvents,
-  samePosition,
 } from "@codetracer/boundary-shim/dist/browser/document-progress.js";
 import { resourceEventOf } from "@codetracer/boundary-shim/dist/browser/resource-events.js";
 import {
@@ -555,6 +554,14 @@ export function installReplayRuntime(
   const doc = w.document;
   const documentWrite = w.Document.prototype.write;
   const removeElement = w.Element.prototype.remove;
+  const currentScriptOf = Object.getOwnPropertyDescriptor(
+    w.Document.prototype,
+    "currentScript",
+  )!.get as (this: Document) => HTMLOrSVGScriptElement | null;
+  const previousElementSiblingOf = Object.getOwnPropertyDescriptor(
+    w.Element.prototype,
+    "previousElementSibling",
+  )!.get as (this: Element) => Element | null;
   /**
    * The runner's function that lets a held gate, script, `DOMContentLoaded`
    * or `load` go (`ReplayConfig.binding`), taken off the window before any
@@ -646,17 +653,14 @@ export function installReplayRuntime(
     if (task?.record !== "DocTask" || task.kind !== kind || task.src !== src) {
       return false;
     }
-    if (loading !== undefined) {
-      const q = progress.position();
-      if (q === undefined || !samePosition(q, loading)) {
-        fail(
-          "TaskOrderMismatch",
-          `the document's task (${describeRecord(task)}) ran at a position other than the recorded one`,
-          describePosition(loading),
-          describePosition(q),
-          loading.seq.toString(),
-        );
-      }
+    if (loading !== undefined && !progress.at(loading)) {
+      fail(
+        "TaskOrderMismatch",
+        `the document's task (${describeRecord(task)}) ran at a position other than the recorded one`,
+        describePosition(loading),
+        describePosition(progress.position()),
+        loading.seq.toString(),
+      );
     }
     at = i + 1;
     return true;
@@ -1131,26 +1135,29 @@ export function installReplayRuntime(
    * stays there while those records are replayed.
    */
   const atLoading = (r: RecordOf<"Loading">): Step => {
-    const q = progress.position();
-    if (q === undefined) {
-      fail(
-        "TaskOrderMismatch",
-        "the log has the document still loading here, but the replayed document has loaded",
-        describePosition(r),
-        describePosition(q),
-      );
-    }
-    if (samePosition(q!, r)) {
+    // Compared field by field, the text only when the elements agree
+    // (`DocumentProgress.at`): this runs at every step while the scheduler
+    // waits for the document to get there.
+    if (progress.at(r)) {
       if (r.phase === 1 && !parserHeld()) return "wait";
       at++;
       return "next";
     }
-    if (q!.phase > r.phase) {
+    const phase = progress.phase();
+    if (phase === undefined) {
+      fail(
+        "TaskOrderMismatch",
+        "the log has the document still loading here, but the replayed document has loaded",
+        describePosition(r),
+        describePosition(undefined),
+      );
+    }
+    if (phase! > r.phase) {
       fail(
         "TaskOrderMismatch",
         "the replayed document is past the point of its loading where the log has the next task run",
         describePosition(r),
-        describePosition(q),
+        describePosition(progress.position()),
       );
     }
     return moveDocumentOn(r);
@@ -1454,14 +1461,13 @@ export function installReplayRuntime(
 
   /** A parser gate (see {@link CtReplay.gate}). */
   const gate = (): void => {
-    removeGates();
+    removeRunningGate();
     kick();
     if (failed !== undefined || gateHeld !== undefined) return;
     if (progress.state !== "loading") return;
     const r = current();
     if (r?.record !== "Loading" || r.phase !== 1) return;
-    const q = progress.position();
-    if (q === undefined || !samePosition(q, r)) return;
+    if (!progress.at(r)) return;
     // Hold the parser here: a parser-blocking script the runner answers
     // only when the scheduler lets it (HTML, "document.write()": a script
     // written by a parser-inserted script is parser-inserted, and blocks).
@@ -1494,6 +1500,32 @@ export function installReplayRuntime(
     // it whether it stays there or not (HTML, "the pending parsing-blocking
     // script"); out of the document, the page's code cannot see it.
     removeGates();
+  };
+
+  /**
+   * Take the gate running now out of the document, with the gates right
+   * before it (the `DOMContentLoaded` and `load` gates, which the last
+   * parser gate follows), in time that does not grow with the document:
+   * it runs at every parser gate, of which there is one at almost every
+   * token boundary, and {@link removeGates} reads a live collection of the
+   * document's scripts, which Blink counts again after every change to the
+   * tree (a 500 KB page took a minute to replay). Every gate takes itself
+   * out this way, and a gate that holds the parser takes out the script it
+   * wrote with {@link removeGates}, so none is left for the page to meet.
+   */
+  const removeRunningGate = (): void => {
+    const self = currentScriptOf.call(doc);
+    if (self === null || !self.hasAttribute(GATE_MARKER)) {
+      removeGates();
+      return;
+    }
+    let before = previousElementSiblingOf.call(self);
+    while (before !== null && before.hasAttribute(GATE_MARKER)) {
+      const next = previousElementSiblingOf.call(before);
+      removeElement.call(before);
+      before = next;
+    }
+    removeElement.call(self);
   };
 
   /**
@@ -1568,8 +1600,7 @@ export function installReplayRuntime(
       guard();
       const r = current();
       if (r?.record !== "Loading") return true;
-      const q = progress.position();
-      if (q === undefined || !samePosition(q, r)) return false;
+      if (!progress.at(r)) return false;
       at++;
       return true;
     },
@@ -1581,8 +1612,7 @@ export function installReplayRuntime(
       const i = skipMarks(at);
       const loading = records[i];
       if (loading?.record !== "Loading") return false;
-      const q = progress.position();
-      if (q === undefined || !samePosition(q, loading)) return false;
+      if (!progress.at(loading)) return false;
       const j = skipMarks(i + 1);
       const task = records[j];
       const id = BigInt(taskId);

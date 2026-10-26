@@ -159,6 +159,52 @@ export interface ScanEnd {
   unterminated?: { kind: "comment" | "doctype"; start: number };
 }
 
+/** What starts at a {@link Boundary}. */
+export type BoundaryNext =
+  | "start"
+  | "end"
+  | "comment"
+  | "doctype"
+  | "text"
+  | "eof";
+
+/**
+ * A boundary between two of the tokenizer's tokens, or between a token and
+ * character data, or a token and the end of the document: a point where the
+ * parser may stop between two insertions, so the place a task can run
+ * while the document is parsed. There is none inside raw text or RCDATA
+ * (the boundary after a raw text element's start tag and the one before its
+ * end tag are inside its text), inside a tag, or inside a run of character
+ * data (a `<` that starts no tag is part of the run). With the context the
+ * replay runner's gates need (`packages/boundary-replay/src/gates.ts`),
+ * read from the tokens before it; the two tree builder modes it reports are
+ * approximations that err toward reporting the mode.
+ */
+export interface Boundary {
+  at: number;
+  next: BoundaryNext;
+  /** The tag's lower-case name when {@link next} is a tag; "" otherwise. */
+  name: string;
+  /** The start tag that ends at {@link at} (lower case); "" otherwise. */
+  afterStartTag: string;
+  /** Inside `<template>` contents or `<svg>`/`<math>`. */
+  nested: boolean;
+  /** As {@link Tag.headMade}: the tree builder has made the head. */
+  headMade: boolean;
+  /**
+   * Whether the tree builder may be "in column group" here: after a
+   * `<colgroup>` or `<col>` start tag, until `</colgroup>`,
+   * `</table>`, another start tag or text that is not whitespace.
+   */
+  inColumnGroup: boolean;
+  /**
+   * Whether the tree builder may be "after body" (or "after after body")
+   * here: after a `</body>` or `</html>` end tag, until a start tag or
+   * text that is not whitespace.
+   */
+  afterBody: boolean;
+}
+
 /** Optional visitors of {@link scanTags}. */
 export interface ScanVisitors {
   /**
@@ -167,6 +213,11 @@ export interface ScanVisitors {
    * stops the scan.
    */
   text?(from: number, to: number): boolean | void;
+  /**
+   * Each {@link Boundary}, in document order, before the token, text or end
+   * that starts there is visited. Returning `false` stops the scan.
+   */
+  boundary?(b: Boundary): boolean | void;
 }
 
 /**
@@ -181,6 +232,8 @@ export function scanTags(
   const bom = bomLength(html);
   let lastTokenEnd = -1;
   let lastStartTag = "";
+  // Where the raw text the scan skipped last ends: its end tag starts there.
+  let rawEndAt = -1;
   let headMade = false;
   let template = 0;
   let foreign = 0;
@@ -191,11 +244,47 @@ export function scanTags(
     from >= to ||
     visitors.text === undefined ||
     visitors.text(from, to) !== false;
+  // Boundaries: `tokenEnd` is where the last token ended when a boundary is
+  // owed there (-1 after raw text, whose end tag starts right where its
+  // text ends, and after a tag the document ends inside); `lastStartTag`
+  // names the start tag that ended there, if one did.
+  let tokenEnd = -1;
+  let inColumnGroup = false;
+  let afterBody = false;
+  const boundary = (at: number, next: BoundaryNext, name = ""): boolean =>
+    visitors.boundary === undefined ||
+    visitors.boundary({
+      at,
+      next,
+      name,
+      afterStartTag: at === tokenEnd ? lastStartTag : "",
+      nested: template > 0 || foreign > 0,
+      headMade,
+      inColumnGroup,
+      afterBody,
+    }) !== false;
+  /**
+   * Character data `[from, to)` is next: a boundary where it starts, if a
+   * token ended there; text that is not whitespace leaves the modes the
+   * boundaries report.
+   */
+  const textBoundary = (from: number, to: number): boolean => {
+    if (from >= to) return true;
+    if (from === tokenEnd && !boundary(from, "text")) return false;
+    if (hasText(html, from, to)) {
+      inColumnGroup = false;
+      afterBody = false;
+    }
+    return true;
+  };
 
   while (i < n) {
     const lt = html.indexOf("<", i);
     if (lt < 0) {
-      text(i, n);
+      if (!textBoundary(i, n)) return {};
+      if (!headMade && hasText(html, i, n)) headMade = true;
+      if (!text(i, n)) return {};
+      boundary(n, "eof");
       return {};
     }
     // Text between the last token and this one: only whitespace keeps the
@@ -208,10 +297,12 @@ export function scanTags(
         }
       }
     }
+    if (!textBoundary(i, lt)) return {};
     if (!headMade && hasText(html, i, lt)) headMade = true;
     if (!text(i, lt)) return {};
     const c = html[lt + 1] ?? "";
     if (html.startsWith("<!--", lt)) {
+      if (!boundary(lt, "comment")) return {};
       // A comment; `<!-->` and `<!--->` end at once (abrupt closing).
       let end: number;
       if (html.startsWith("<!-->", lt)) end = lt + 5;
@@ -223,6 +314,7 @@ export function scanTags(
       }
       i = end;
       lastTokenEnd = end;
+      tokenEnd = end;
       lastStartTag = "";
       continue;
     }
@@ -232,6 +324,7 @@ export function scanTags(
       // text.
       i = lt + 3;
       lastTokenEnd = i;
+      tokenEnd = i;
       lastStartTag = "";
       continue;
     }
@@ -243,10 +336,12 @@ export function scanTags(
       // A doctype, CDATA outside foreign content, or a bogus comment (which
       // `</` followed by anything but a letter or `>` also starts,
       // "invalid-first-character-of-tag-name"): to `>`.
+      if (!boundary(lt, "doctype")) return {};
       const gt = html.indexOf(">", lt + 2);
       if (gt < 0) return { unterminated: { kind: "doctype", start: lt } };
       i = gt + 1;
       lastTokenEnd = i;
+      tokenEnd = i;
       lastStartTag = "";
       continue;
     }
@@ -254,9 +349,11 @@ export function scanTags(
     if (!isAlpha(html[nameStart] ?? "")) {
       // `<` that starts no tag is text, and so is `</` at the end of the
       // document.
+      if (!textBoundary(lt, lt + 1)) return {};
       if (!text(lt, lt + 1)) return {};
       i = lt + 1;
       lastTokenEnd = -1;
+      tokenEnd = -1;
       headMade = true;
       continue;
     }
@@ -307,6 +404,12 @@ export function scanTags(
       }
       rawTextEnd = close;
     }
+    // The boundary before the tag: none before the end tag of raw text
+    // (`tokenEnd` is -1 there, and no text was visited), which is inside
+    // that text.
+    if (rawEndAt !== lt && !boundary(lt, end ? "end" : "start", name)) {
+      return {};
+    }
     const tag: Tag = {
       end,
       name,
@@ -322,19 +425,41 @@ export function scanTags(
       ...(rawTextEnd !== undefined ? { rawTextEnd } : {}),
     };
     if (visit(tag) === false) return {};
+    const outside = template === 0 && foreign === 0;
     if (end) {
       if (name === "template" && template > 0) template--;
       else if ((name === "svg" || name === "math") && foreign > 0) foreign--;
     } else if (name === "template") template++;
     else if ((name === "svg" || name === "math") && !selfClosing) foreign++;
+    if (outside) {
+      // The modes the boundaries report (approximately; see `Boundary`).
+      if (end) {
+        if (name === "colgroup" || name === "table") inColumnGroup = false;
+        if (name === "body" || name === "html") afterBody = true;
+      } else {
+        inColumnGroup =
+          name === "colgroup" ||
+          name === "col" ||
+          (inColumnGroup && name === "template");
+        afterBody = false;
+      }
+    }
     i = stop;
     lastTokenEnd = stop;
+    // A tag the document ends inside makes nothing, and no boundary
+    // follows it.
+    tokenEnd = tag.terminated ? stop : -1;
     lastStartTag = end ? "" : name;
     if (!end && name !== "html") headMade = true;
     if (rawTextEnd !== undefined) {
       i = rawTextEnd;
       lastTokenEnd = -1;
+      tokenEnd = -1;
+      rawEndAt = rawTextEnd;
     }
   }
+  // The document ended right after a token (not inside raw text, which
+  // leaves `tokenEnd` at -1).
+  if (tokenEnd === n) boundary(n, "eof");
   return {};
 }

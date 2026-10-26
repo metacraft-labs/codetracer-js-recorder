@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>the page never meets one of the replay's gates</title>
+  </head>
+  <body>
+    <ul id="out"></ul>
+    <script>
+      // How many of the replay runner's gates the page's code can see (none
+      // on record, and none on replay), written into the page, so that a
+      // replay that left one in the document diverges at a checkpoint: while
+      // the parser runs the page's scripts, in a timer, at DOMContentLoaded,
+      // at load (after the last parser gate and the DOMContentLoaded and
+      // load gates ran) and after it.
+      function gatesSeen(when) {
+        var li = document.createElement("li");
+        li.textContent =
+          when +
+          " " +
+          document.querySelectorAll("script[data-ct-replay-gate]").length;
+        document.getElementById("out").appendChild(li);
+      }
+      gatesSeen("parsing");
+      setTimeout(function () {
+        gatesSeen("timer");
+      }, 0);
+      document.addEventListener("DOMContentLoaded", function () {
+        gatesSeen("DOMContentLoaded");
+      });
+      window.addEventListener("load", function () {
+        gatesSeen("load");
+        setTimeout(function () {
+          gatesSeen("after load");
+          document.body.setAttribute("data-done", "1");
+        }, 50);
+      });
+    </script>
+    <p>text <b>bold</b> tail<!-- c --></p>
+    <script>
+      gatesSeen("a later script");
+    </script>
+    text after the last script
+  </body>
+</html>
