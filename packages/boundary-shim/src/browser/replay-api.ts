@@ -84,10 +84,18 @@ export interface DivergenceReport {
   detail: string;
   /**
    * `substituted-sensitive` when a raw read of a sensitive value preceded
-   * the divergence, `mismatch` otherwise (§7.2). This runner
-   * version observes no sensitive reads, so it is always `mismatch`.
+   * the divergence, `mismatch` otherwise (§7.2): a replay that substituted
+   * a placeholder for a value the page read outside a declassifier may
+   * diverge for that reason alone.
    */
   cause: "mismatch" | "substituted-sensitive";
+  /**
+   * The first raw sensitive read the replay observed before it diverged,
+   * when `cause` is `substituted-sensitive`: the field's target (§9.3),
+   * what was read, the `seq` of the last record the cursor had consumed
+   * when it was read, and the page's stack frames. `null` otherwise.
+   */
+  sensitiveRead: SensitiveReadReport | null;
   /**
    * The last checkpoint the replay compared and matched before it diverged
    * (§7.2, §12): the replay is known to agree with the recording up to it,
@@ -98,6 +106,18 @@ export interface DivergenceReport {
 }
 
 /** A `Checkpoint` record the replay compared and matched (§7.3). */
+/** A raw read of a sensitive value by the page on replay (§7.2 `cause`). */
+export interface SensitiveReadReport {
+  /** The field's target (§9.3). */
+  target: string;
+  /** What was read: `value`, `textContent`, `innerText`, or `event.<property>`. */
+  what: string;
+  /** The `seq` (decimal) of the last record consumed when it was read, `0` for none. */
+  afterSeq: string;
+  /** The page's stack frames at the read, innermost first (at most 8). */
+  frames: string[];
+}
+
 export interface MatchedCheckpoint {
   ordinal: number;
   /** Its `seq` (decimal). */
@@ -248,6 +268,17 @@ export interface CtReplay {
   /** The latched divergence, if the replay has diverged. */
   readonly failed: DivergenceReport | undefined;
   /**
+   * The page read a sensitive value outside a declassifier (§7.2, §11.3):
+   * the replay substituted a placeholder for it, so a divergence after this
+   * is reported with `cause: substituted-sensitive` and this read. Only the
+   * first is kept.
+   */
+  noteSensitiveRead(read: {
+    target: string;
+    what: string;
+    frames: string[];
+  }): void;
+  /**
    * The runner's parser gates call this (§6, "The document's own tasks";
    * `packages/boundary-replay/src/gates.ts`): it removes the calling gate
    * script and, when the document is at the position of the `Loading`
@@ -270,10 +301,18 @@ export interface ReplayHooks {
    * directly with an event built from the recorded properties. Returns
    * `"ok"`, or a reason, which the runner reports as `InjectionFailed`.
    */
-  inject(input: RecordOf<"Input">, effects: RecordOf<"DomEffect">[]): string;
+  inject(input: RecordOf<"Input">, effects: InputEffect[]): string;
   /** The framework's state hash now (§9.6), for a `Checkpoint`. */
   checkpoint(): { scheme: string; state_hash: string };
 }
+
+/**
+ * What precedes an `Input` and is applied before it is injected (§9.5): a
+ * `DomEffect`, or a `Scrubbed` record in place of a sensitive field's value,
+ * for which a placeholder of its class and length is put into the field
+ * (§11.3.4).
+ */
+export type InputEffect = RecordOf<"DomEffect"> | RecordOf<"Scrubbed">;
 
 /** The installed `__ctReplay`, if any. */
 export function replayOf(g: object): CtReplay | undefined {

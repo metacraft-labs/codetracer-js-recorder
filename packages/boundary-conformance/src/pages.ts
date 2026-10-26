@@ -16,19 +16,31 @@ export interface MarkupOptions {
   iids: boolean;
 }
 
+/**
+ * The level-0 declaration of a field's sensitivity (§11.3.1): the generic
+ * build marks the fields the fixture declares public with `data-ct-public`
+ * and the declared-sensitive ones with `data-ct-sensitive`. The reference
+ * build declares them through its own framework instead, so its markup
+ * carries neither.
+ */
+type Declare = (what: "public" | "sensitive") => string;
+
 /** The `<body>` content of each fixture's page. */
-const BODIES: Record<string, (a: (role: string) => string) => string> = {
+const BODIES: Record<
+  string,
+  (a: (role: string) => string, d: Declare) => string
+> = {
   counter: (a) =>
     `<main id="app"><h1>Counter</h1>` +
     `<button type="button" ${a("inc")}>+1</button> ` +
     `<output ${a("count")}>0</output></main>`,
-  "text-input": (a) =>
+  "text-input": (a, d) =>
     `<main id="app"><h1>Text input</h1>` +
-    `<label>Name <input type="text" ${a("name")} aria-label="Name"></label> ` +
+    `<label>Name <input type="text" ${a("name")}${d("public")} aria-label="Name"></label> ` +
     `<output ${a("echo")}></output></main>`,
-  "password-form": (a) =>
+  "password-form": (a, d) =>
     `<main id="app"><h1>Sign in</h1><form ${a("form")} aria-label="Sign in">` +
-    `<label>User <input type="text" ${a("user")} aria-label="User"></label> ` +
+    `<label>User <input type="text" ${a("user")}${d("public")} aria-label="User"></label> ` +
     `<label>Password <input type="password" ${a("pass")} aria-label="Password"></label> ` +
     `<button type="submit" ${a("submit")}>Sign in</button></form>` +
     `<p ${a("status")}></p></main>`,
@@ -54,6 +66,22 @@ const BODIES: Record<string, (a: (role: string) => string) => string> = {
     `<a href="?view=about" ${a("nav-about")}>About</a> ` +
     `<a href="?view=home" ${a("nav-home")}>Home</a></nav>` +
     `<h1 ${a("view")}>home</h1></main>`,
+  "sensitive-login": (a, d) =>
+    `<main id="app"><h1>Sign in</h1><form ${a("form")} aria-label="Sign in">` +
+    `<label>User <input type="text" ${a("user")}${d("public")} aria-label="User"></label> ` +
+    `<label>Password <input type="password" ${a("pass")} aria-label="Password"></label> ` +
+    `<button type="submit" ${a("submit")}>Sign in</button></form>` +
+    `<p ${a("status")}></p></main>`,
+  "sensitive-email": (a, d) =>
+    `<main id="app"><h1>E-mail</h1>` +
+    `<label>E-mail <input type="email" ${a("email")} aria-label="E-mail"></label> ` +
+    `<label>Note <input type="text" ${a("note")}${d("public")} aria-label="Note"></label> ` +
+    `<output ${a("verdict")}></output></main>`,
+  "sensitive-pin": (a, d) =>
+    `<main id="app"><h1>PIN</h1>` +
+    `<label>Label <input type="text" ${a("label")}${d("public")} aria-label="Label"></label> ` +
+    `<label>PIN <input type="text" inputmode="numeric" ${a("pin")}${d("sensitive")} aria-label="PIN"></label> ` +
+    `<output ${a("pin-state")}></output></main>`,
 };
 
 /** The fixtures whose page hydrates late (the pre-hydration queue). */
@@ -74,10 +102,12 @@ export const PERTURBATION = `<p class="ct-unrelated">An unrelated paragraph.</p>
 export function bodyMarkup(fixture: string, options: MarkupOptions): string {
   const body = BODIES[fixture];
   if (body === undefined) throw new Error(`no page for fixture ${fixture}`);
-  return body((role) =>
-    options.iids
-      ? `data-fx="${role}" data-iid="${fixture}/${role}"`
-      : `data-fx="${role}"`,
+  return body(
+    (role) =>
+      options.iids
+        ? `data-fx="${role}" data-iid="${fixture}/${role}"`
+        : `data-fx="${role}"`,
+    (what) => (options.iids ? "" : ` data-ct-${what}`),
   );
 }
 

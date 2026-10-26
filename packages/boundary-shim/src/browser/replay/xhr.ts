@@ -325,7 +325,9 @@ export function replayXhr(ctx: ReplayContext): void {
     }
     const body = arguments[0] as unknown;
     const digest =
-      s.method === "GET" || s.method === "HEAD" ? "" : (bodyDigest(body) ?? "");
+      s.method === "GET" || s.method === "HEAD"
+        ? ""
+        : (bodyDigest(body, ctx.holes) ?? "");
     s.sent = true;
     s.reqId = ctx.nextReqId();
     s.taskId = ctx.nextTaskId();

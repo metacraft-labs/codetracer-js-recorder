@@ -40,6 +40,23 @@ import { patchPerformance } from "./seams-perf.js";
 import { patchPlatformSeams } from "./seams-platform.js";
 import { patchRefusals } from "./seams-refusals.js";
 import { patchTimeSeams } from "./seams-time.js";
+import { listenForPageErrors } from "./seams-error.js";
+import { rescrubFrame, sanitizeRecord } from "./record-scrub.js";
+import {
+  addsToScrubLists,
+  joinScrubLists,
+  NO_SCRUB_LISTS,
+  type ScrubLists,
+} from "./scrub.js";
+import {
+  canonicalOutput,
+  type CtApi,
+  currentSensitiveValues,
+  makeCtApi,
+  publishCtApi,
+  sensitiveState,
+  trackShadowRoots,
+} from "./sensitive.js";
 
 /** The shim's version; `Header.recorder_id` is `codetracer-boundary-shim/<this>`. */
 export const SHIM_VERSION = "0.1.0";
@@ -49,6 +66,12 @@ export const DOM_V1 = "dom-v1";
 
 /** `End.reason` (§5.2). */
 const EndReason = { pagehide: 1, stop: 2 };
+
+/**
+ * The `Refusal.feature` of a declassifier call the log cannot carry
+ * (§7.5, §11.3.2): its output is not JSON data, or it threw.
+ */
+export const UNRECORDABLE_DECLASSIFIER = "unrecordable-declassifier";
 
 /** What the installed shim publishes on `globalThis.__ctBoundaryShim`. */
 export interface ShimControl {
@@ -93,6 +116,11 @@ export interface ShimControl {
   domV1Hash(): string;
   /** Test seam: the next frame the encoder is asked for throws. */
   injectEncoderFault(): void;
+  /**
+   * The page's sensitive-input API (§11.3.1, §11.3.2), also published as
+   * `globalThis.ct` when the page has no `ct` of its own.
+   */
+  readonly ct: CtApi;
 }
 
 /**
@@ -109,9 +137,24 @@ export function installBoundaryShim(
     CONTROL_GLOBAL
   ];
   if (existing !== undefined) return existing;
-  if (privacySignal(w.navigator) !== undefined) return undefined;
+  const sensitive = sensitiveState(w);
+  if (privacySignal(w.navigator) !== undefined) {
+    // Nothing is recorded, but a page that declares its fields and
+    // declassifiers must still run: its `ct` calls run the declassifier and
+    // log nothing (§11.2, §11.3.2).
+    publishCtApi(
+      w,
+      makeCtApi(w, sensitive, (_id, fn, self, args) => fn.apply(self, args)),
+    );
+    return undefined;
+  }
 
   const orig = captureOriginals(w);
+  // The site's scrub lists (§11.3.5): the ingest's `config` carries them,
+  // and no batch is sent before it arrives; the frames written before are
+  // scrubbed again with them then (`onConfig`).
+  let lists: ScrubLists = NO_SCRUB_LISTS;
+  const holes = () => currentSensitiveValues(w, sensitive);
   const doc = w.document;
   const sessionId = newSessionId(w, orig);
   // The transport is made before the first frame is written, with the
@@ -131,11 +174,22 @@ export function installBoundaryShim(
           // No consent, or the ingest disabled recording: stop recording,
           // since the records could go nowhere.
           onDisabled: () => late.rec?.halt(),
+          onConfig: (c) => {
+            const site: ScrubLists = {
+              headers: c.scrubHeaders,
+              queryKeys: c.scrubQueryKeys,
+            };
+            if (!addsToScrubLists(lists, site)) return undefined;
+            lists = joinScrubLists(lists, site);
+            const now = lists;
+            return (frame) => rescrubFrame(frame, now);
+          },
         });
   const rec = new Recorder({
     checkpointHash: () => domV1Hash(doc),
     checkpointScheme: DOM_V1,
     sink: transport,
+    sanitize: (r) => sanitizeRecord(r, lists, holes),
   });
   late.rec = rec;
   if (transport?.status().state === "off") rec.halt();
@@ -163,6 +217,8 @@ export function installBoundaryShim(
     w,
     rec,
     orig,
+    sensitive,
+    holes,
     refuseOnce(feature, detail) {
       if (refused.has(feature) || !rec.recording) return;
       refused.add(feature);
@@ -177,6 +233,9 @@ export function installBoundaryShim(
   // A seam that cannot be patched would leave a silent hole in the log, so
   // it is a recorder fault: the log says why it stops.
   for (const patch of [
+    // The shadow roots the page attaches, before it can attach one: the
+    // field focused in a closed one is found through them (§11.3.3).
+    (c: SeamContext) => trackShadowRoots(c.w, c.sensitive),
     patchTimeSeams,
     patchNetSeams,
     patchDomSeams,
@@ -199,6 +258,9 @@ export function installBoundaryShim(
   rec.guard(() =>
     listenForPageEvents(ctx, () => rec.end(EndReason.pagehide, true)),
   );
+  rec.guard(() => listenForPageErrors(ctx));
+  const ct = makeCtApi(w, sensitive, recordDeclassifier(ctx));
+  publishCtApi(w, ct);
 
   const inMemory = <T>(read: () => T): T => {
     if (transport !== undefined) {
@@ -235,6 +297,7 @@ export function installBoundaryShim(
     uploadStatus: () => transport?.status(),
     domV1Hash: () => domV1Hash(doc),
     injectEncoderFault: () => rec.injectEncoderFault(),
+    ct,
   };
   Object.defineProperty(w, CONTROL_GLOBAL, {
     value: control,
@@ -243,6 +306,44 @@ export function installBoundaryShim(
     writable: false,
   });
   return control;
+}
+
+/**
+ * How a declassifier runs on record (§11.3.2): the real value goes in, the
+ * function runs, and its output is logged as `Declassify{fn_id, output}`
+ * and returned. Only the outermost call is logged: a declassifier a
+ * declassifier calls is part of the outer one's body, which replay does not
+ * run. An output that is not JSON data, or a declassifier that throws, is
+ * refused (`unrecordable-declassifier`, §7.5): the log could not return it.
+ */
+function recordDeclassifier(ctx: SeamContext): Parameters<typeof makeCtApi>[2] {
+  const { rec } = ctx;
+  let depth = 0;
+  return (id, fn, self, args) => {
+    if (!rec.recording || depth > 0) return fn.apply(self, args);
+    let out: unknown;
+    depth++;
+    try {
+      out = fn.apply(self, args);
+    } catch (e) {
+      ctx.refuseOnce(UNRECORDABLE_DECLASSIFIER, `${id} threw`);
+      throw e;
+    } finally {
+      depth--;
+    }
+    rec.guard(() => {
+      const output = canonicalOutput(out);
+      if (output === undefined) {
+        ctx.refuseOnce(
+          UNRECORDABLE_DECLASSIFIER,
+          `${id} returned a value that is not JSON data`,
+        );
+      } else {
+        rec.emit("Declassify", { fn_id: id, output });
+      }
+    });
+    return out;
+  };
 }
 
 /**

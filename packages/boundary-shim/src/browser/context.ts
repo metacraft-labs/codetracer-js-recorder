@@ -5,6 +5,7 @@
 
 import type { ShimOriginals } from "./originals.js";
 import type { Recorder } from "./recorder.js";
+import type { SensitiveState } from "./sensitive.js";
 
 /** The window type the shim runs in. */
 export type ShimWindow = Window & typeof globalThis;
@@ -13,6 +14,14 @@ export interface SeamContext {
   w: ShimWindow;
   rec: Recorder;
   orig: ShimOriginals;
+  /** Which fields are sensitive, and what they held (§11.3, `sensitive.ts`). */
+  sensitive: SensitiveState;
+  /**
+   * The sensitive values to hole now (§5.2.1), longest first: what a seam
+   * removes from a request body before digesting it and from an outbound
+   * message before logging it.
+   */
+  holes(): readonly string[];
   /**
    * Write `Refusal{feature, detail}` the first time `feature` is used in
    * this session (JS-Boundary-Recording.md §7.5); later uses write nothing.

@@ -173,6 +173,8 @@ export function readKeyOf(
       return `Navigation:${r.kind}`;
     case "Refusal":
       return `Refusal:${r.feature}`;
+    case "Declassify":
+      return `Declassify:${r.fn_id}`;
     default:
       return undefined;
   }
@@ -326,7 +328,11 @@ const inputs: Check = (run, decoded) => {
       lastTask = r;
       lastTaskIndex = i;
     }
-    if (r.record === "Input" || r.record === "DomEffect") {
+    if (
+      r.record === "Input" ||
+      r.record === "DomEffect" ||
+      r.record === "Scrubbed"
+    ) {
       if (!targets[r.target]?.resolved) {
         problems.push(
           `${r.record} at seq ${r.seq}: target ${JSON.stringify(r.target)} resolves to nothing`,
@@ -387,16 +393,31 @@ const inputs: Check = (run, decoded) => {
     );
   }
   for (const e of run.fixture.domEffects ?? []) {
-    const n = records.filter(
-      (r) =>
-        r.record === "DomEffect" &&
-        r.effect === e.effect &&
-        fxOf(r.target) === e.fx,
+    const n = records.filter((r) =>
+      e.effect === "scrubbed"
+        ? r.record === "Scrubbed" && fxOf(r.target) === e.fx
+        : r.record === "DomEffect" &&
+          r.effect === e.effect &&
+          fxOf(r.target) === e.fx,
     ).length;
     if (n < e.min) {
       problems.push(
-        `${n} DomEffect{effect: ${e.effect}} on ${e.fx}, at least ${e.min} expected`,
+        e.effect === "scrubbed"
+          ? `${n} Scrubbed on ${e.fx}, at least ${e.min} expected`
+          : `${n} DomEffect{effect: ${e.effect}} on ${e.fx}, at least ${e.min} expected`,
       );
+    }
+    // A sensitive field's value is never in a DomEffect (§11.3.3).
+    if (e.effect === "scrubbed") {
+      const leaked = records.filter(
+        (r) =>
+          r.record === "DomEffect" && r.effect === 1 && fxOf(r.target) === e.fx,
+      ).length;
+      if (leaked > 0) {
+        problems.push(
+          `${leaked} DomEffect{effect: 1} on the sensitive field ${e.fx}, whose value must be Scrubbed`,
+        );
+      }
     }
   }
   return problems;
@@ -420,6 +441,8 @@ function targetSequence(
       out.push({ what: `Input ${r.type}`, target: r.target });
     else if (r.record === "DomEffect")
       out.push({ what: `DomEffect ${r.effect}`, target: r.target });
+    else if (r.record === "Scrubbed")
+      out.push({ what: `Scrubbed ${r.class}`, target: r.target });
     else if (r.record === "LayoutRead")
       out.push({ what: `LayoutRead ${r.prop}`, target: r.target });
   }

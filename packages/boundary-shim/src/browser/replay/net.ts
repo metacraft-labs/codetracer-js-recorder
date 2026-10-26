@@ -32,6 +32,7 @@ import {
   messageBytes,
   normaliseMethod,
 } from "../seams-net.js";
+import { holeBytes } from "../sensitive.js";
 import { BODY_CONSUMERS, Dir, Outcome } from "../stream-body.js";
 import { type ReplayContext, blobBytes } from "./context.js";
 import { replayPlatformTask } from "./platform.js";
@@ -265,7 +266,7 @@ function replayFetch(ctx: ReplayContext): void {
         ? (input as Request).url
         : absoluteUrl(w, input instanceof URL ? input.href : input);
       let digest: string | null;
-      if (init?.body !== undefined) digest = bodyDigest(init.body);
+      if (init?.body !== undefined) digest = bodyDigest(init.body, ctx.holes);
       else if (isRequest && (input as Request).body !== null) digest = null;
       else digest = "";
       const reqId = ctx.nextReqId();
@@ -428,7 +429,13 @@ function replayFetch(ctx: ReplayContext): void {
   );
 }
 
-function replayBeacon({ w, replay, orig, nextReqId }: ReplayContext): void {
+function replayBeacon({
+  w,
+  replay,
+  orig,
+  nextReqId,
+  holes,
+}: ReplayContext): void {
   if (orig.sendBeacon === undefined) return;
   replaceValue(
     w.Navigator.prototype,
@@ -444,7 +451,7 @@ function replayBeacon({ w, replay, orig, nextReqId }: ReplayContext): void {
         api: Api.beacon,
         method: "POST",
         url: absoluteUrl(w, url instanceof URL ? url.href : url),
-        body_digest: bodyDigest(data) ?? "",
+        body_digest: bodyDigest(data, holes) ?? "",
       });
       // Logged at once: outcome 1 when the browser queued it (§10.4).
       return (
@@ -713,7 +720,9 @@ function replayWebSocket(ctx: ReplayContext): void {
         dir: Dir.out,
         frame: frameOf(data),
       });
-      const sent = messageBytes(data);
+      const raw = messageBytes(data);
+      // Compared in holed form, as it was logged (§5.2.1).
+      const sent = raw === null ? null : holeBytes(raw, ctx.holes());
       const logged = blobBytes(replay, m.data);
       if (sent !== null && !sameBytes(sent, logged)) {
         replay.fail(

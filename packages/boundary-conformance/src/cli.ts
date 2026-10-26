@@ -11,6 +11,9 @@
  * ct-boundary-conformance replay --build <dir> --level <0|1>
  *                                [--fixture <name>]... [--out <report.json>]
  *                                [--concurrency <n>] [--timeout-ms <n>]
+ * ct-boundary-conformance noninterference --build <dir> --level <0|1>
+ *                                [--fixture <name>]... [--secret-a <X> --secret-b <Y>]
+ *                                [--out <report.json>] [--concurrency <n>] [--timeout-ms <n>]
  * ct-boundary-conformance fixtures
  * ```
  *
@@ -21,6 +24,11 @@
  * `replay` records every fixture the same way, replays each recording with
  * CodeTracer's replay runner, and reports the replay leg's checks
  * (`replay-leg.ts`), with the same output and exit status.
+ * `noninterference` records every fixture with sensitive fields twice, with
+ * the two secrets, and checks that the two logs differ only in the
+ * declassifiers' outputs, that neither secret reaches a batch, and that each
+ * log replays with placeholders (`noninterference.ts`, §11.3.6); the same
+ * output and exit status.
  * `fixtures` prints every fixture's contract as JSON, for a framework
  * writing its own build of them.
  */
@@ -30,10 +38,17 @@ import * as fs from "node:fs";
 import { FIXTURES } from "./fixtures.js";
 import { runRecordLeg, SUITE_VERSION } from "./harness.js";
 import { runReplayLeg } from "./replay-leg.js";
+import {
+  noninterferenceFixtures,
+  runNoninterferenceLeg,
+  secretsProblem,
+} from "./noninterference.js";
+import { DEFAULT_SECRETS } from "./fixtures.js";
 import type { ProtocolLevel } from "./protocol.js";
 
 const USAGE = `usage: ct-boundary-conformance record --build <dir> --level <0|1> [--fixture <name>]... [--out <report.json>] [--concurrency <n>] [--timeout-ms <n>]
        ct-boundary-conformance replay --build <dir> --level <0|1> [--fixture <name>]... [--out <report.json>] [--concurrency <n>] [--timeout-ms <n>]
+       ct-boundary-conformance noninterference --build <dir> --level <0|1> [--fixture <name>]... [--secret-a <X> --secret-b <Y>] [--out <report.json>] [--concurrency <n>] [--timeout-ms <n>]
        ct-boundary-conformance fixtures
        ct-boundary-conformance --version`;
 
@@ -46,6 +61,8 @@ interface RecordArgs {
   out?: string;
   concurrency?: number;
   timeoutMs?: number;
+  secretA?: string;
+  secretB?: string;
 }
 
 function positiveInt(flag: string, v: string): number {
@@ -57,7 +74,7 @@ function positiveInt(flag: string, v: string): number {
   return n;
 }
 
-function parseRecordArgs(argv: string[]): RecordArgs {
+function parseRecordArgs(argv: string[], secrets = false): RecordArgs {
   let build: string | undefined;
   let level: ProtocolLevel | undefined;
   const fixtures: string[] = [];
@@ -92,6 +109,12 @@ function parseRecordArgs(argv: string[]): RecordArgs {
       case "--timeout-ms":
         args.timeoutMs = positiveInt(flag, value());
         break;
+      case "--secret-a":
+      case "--secret-b":
+        if (!secrets) throw new UsageError(`${flag} is for noninterference`);
+        if (flag === "--secret-a") args.secretA = value();
+        else args.secretB = value();
+        break;
       default:
         throw new UsageError(`unknown argument ${JSON.stringify(flag)}`);
     }
@@ -102,6 +125,23 @@ function parseRecordArgs(argv: string[]): RecordArgs {
   for (const f of fixtures) {
     if (!known.has(f))
       throw new UsageError(`no fixture named ${JSON.stringify(f)}`);
+  }
+  if ((args.secretA === undefined) !== (args.secretB === undefined)) {
+    throw new UsageError("--secret-a and --secret-b go together");
+  }
+  if (args.secretA !== undefined) {
+    const problem = secretsProblem(args.secretA, args.secretB!);
+    if (problem !== undefined) throw new UsageError(problem);
+  } else if (secrets) {
+    args.secretA = DEFAULT_SECRETS[0];
+    args.secretB = DEFAULT_SECRETS[1];
+  }
+  if (secrets) {
+    try {
+      noninterferenceFixtures(fixtures.length > 0 ? fixtures : undefined);
+    } catch (e) {
+      throw new UsageError((e as Error).message);
+    }
   }
   return {
     ...args,
@@ -128,17 +168,23 @@ export async function main(argv: string[]): Promise<number> {
       process.stdout.write(`${JSON.stringify(FIXTURES, null, 2)}\n`);
       return 0;
     }
-    if (command !== "record" && command !== "replay")
+    if (
+      command !== "record" &&
+      command !== "replay" &&
+      command !== "noninterference"
+    )
       throw new UsageError(
         command === undefined
           ? "no command"
           : `unknown command ${JSON.stringify(command)}`,
       );
-    const args = parseRecordArgs(rest);
+    const args = parseRecordArgs(rest, command === "noninterference");
     const { report } =
       command === "record"
         ? await runRecordLeg(args)
-        : await runReplayLeg(args);
+        : command === "replay"
+          ? await runReplayLeg(args)
+          : await runNoninterferenceLeg(args);
     const json = `${JSON.stringify(report, null, 2)}\n`;
     if (args.out !== undefined) fs.writeFileSync(args.out, json);
     else process.stdout.write(json);

@@ -88,6 +88,7 @@
 
 import type { BoundaryRecord } from "@codetracer/boundary-format";
 import { REPLAY_GATE_MARKER } from "@codetracer/boundary-shim/dist/browser/document-progress.js";
+import { resolveLoggedUrl } from "@codetracer/boundary-shim/dist/browser/scrub.js";
 import {
   type Boundary,
   scanTags,
@@ -389,6 +390,12 @@ export interface DocumentPlan {
    * 5 with that `src`; a media element's events have none, §6).
    */
   takeResource(url: string): boolean;
+  /**
+   * The URL the log names the request for `url` (no fragment) by: the log
+   * holds a script's or a resource's URL scrubbed (§11.3.5), so a request
+   * is looked up by the logged URL it matches (`resolveLoggedUrl`).
+   */
+  loggedUrl(url: string): string;
 }
 
 /** {@link DocumentPlan} of a decoded log. */
@@ -415,7 +422,9 @@ export function documentPlan(records: readonly BoundaryRecord[]): DocumentPlan {
     counts.set(url, left - 1);
     return true;
   };
+  const logged = new Set([...scripts.keys(), ...resources.keys()]);
   return {
+    loggedUrl: (url) => resolveLoggedUrl(logged, url),
     holds:
       parser ||
       domContentLoaded ||

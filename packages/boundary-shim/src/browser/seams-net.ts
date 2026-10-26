@@ -38,6 +38,7 @@ import {
 
 import { TaskKind } from "./recorder.js";
 import { markPageResponse } from "./seams-platform.js";
+import { holeBytes, holeText } from "./sensitive.js";
 import { sha256Hex } from "./sha256.js";
 import {
   Dir,
@@ -87,16 +88,25 @@ export function absoluteUrl(w: SeamContext["w"], url: unknown): string {
 }
 
 /**
- * `body_digest` of a request body: lowercase hex SHA-256 of its bytes, or
- * `""` when there is none. Returns `null` for a body whose bytes cannot be
- * read synchronously.
+ * `body_digest` of a request body: lowercase hex SHA-256 of its *holed*
+ * bytes (§5.2.1: every sensitive value `holes()` names replaced by the hole
+ * token, so a secret and its replay placeholder digest alike), or `""` when
+ * there is none. Returns `null` for a body whose bytes cannot be read
+ * synchronously. The body itself is never logged (§11.3.5).
  */
-export function bodyDigest(body: unknown): string | null {
+export function bodyDigest(
+  body: unknown,
+  holes: () => readonly string[] = () => [],
+): string | null {
   if (body === undefined || body === null) return "";
-  if (typeof body === "string") return sha256Hex(body);
-  if (body instanceof URLSearchParams) return sha256Hex(body.toString());
+  if (typeof body === "string") return sha256Hex(holeText(body, holes()));
+  if (body instanceof URLSearchParams) {
+    return sha256Hex(holeText(body.toString(), holes()));
+  }
   if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-    return sha256Hex(copyBytes(body as ArrayBuffer | ArrayBufferView));
+    return sha256Hex(
+      holeBytes(copyBytes(body as ArrayBuffer | ArrayBufferView), holes()),
+    );
   }
   return null;
 }
@@ -131,7 +141,7 @@ function patchFetch(ctx: SeamContext): void {
           : absoluteUrl(w, input instanceof URL ? input.href : input);
         let digest: string | null;
         if (init?.body !== undefined) {
-          digest = bodyDigest(init.body);
+          digest = bodyDigest(init.body, ctx.holes);
         } else if (isRequest && (input as Request).body !== null) {
           digest = null; // a Request's own body is a stream
         } else {
@@ -640,7 +650,9 @@ function patchXhr(ctx: SeamContext): void {
       rec.guard(() => {
         // For GET and HEAD the platform ignores the body (step 3).
         let digest =
-          s.method === "GET" || s.method === "HEAD" ? "" : bodyDigest(body);
+          s.method === "GET" || s.method === "HEAD"
+            ? ""
+            : bodyDigest(body, ctx.holes);
         if (digest === null) {
           ctx.refuseOnce(
             UNRECORDABLE_REQUEST_BODY,
@@ -799,7 +811,7 @@ function patchBeacon(ctx: SeamContext): void {
     ): boolean {
       if (!rec.recording) return origBeacon.call(this, url, data);
       const reqId = rec.guard(() => {
-        let digest = bodyDigest(data);
+        let digest = bodyDigest(data, ctx.holes);
         if (digest === null) {
           ctx.refuseOnce(
             UNRECORDABLE_REQUEST_BODY,
@@ -1050,6 +1062,8 @@ function patchWebSocket(ctx: SeamContext): void {
             );
             bytes = EMPTY;
           }
+          // An outbound message is logged in holed form (§5.2.1).
+          bytes = holeBytes(bytes, ctx.holes());
           rec.emit("WsMessage", {
             req_id: reqId,
             dir: Dir.out,

@@ -99,7 +99,7 @@ export function logBytes(records: readonly BoundaryRecord[]): Uint8Array {
  * Whether `r` is a boundary read the page makes itself, in its own code
  * (§5.2, "Replay": returned or checked), rather than a record the
  * scheduler releases: a clock, a random source, a request, a storage or
- * layout read, or a `pushState`/`replaceState`.
+ * layout read, a declassifier's call, or a `pushState`/`replaceState`.
  */
 export function isPageRead(r: BoundaryRecord): boolean {
   switch (r.record) {
@@ -108,6 +108,9 @@ export function isPageRead(r: BoundaryRecord): boolean {
     case "NetRequest":
     case "StorageRead":
     case "LayoutRead":
+    // A declassifier's call is a read the page makes in its own code
+    // (§11.3.2): replay returns its logged output.
+    case "Declassify":
       return true;
     case "Navigation":
       return r.kind === 1 || r.kind === 2;

@@ -24,6 +24,8 @@ export * from "./envelope.js";
 export * from "./checks.js";
 export * from "./harness.js";
 export * from "./replay-leg.js";
+export * from "./noninterference.js";
+export * from "./sensitive-logic.js";
 export * from "./builds.js";
 export { startHarnessServer, type HarnessServer } from "./server.js";
 export { loadPlaywright, type Browser } from "./playwright.js";

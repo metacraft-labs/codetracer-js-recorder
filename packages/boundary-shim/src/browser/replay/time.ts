@@ -20,6 +20,7 @@ import {
   UNRECORDABLE_TIMER_HANDLER,
   observedJson,
 } from "../seams-time.js";
+import { inSensitiveField } from "../sensitive.js";
 import { resolveTarget, targetOf } from "../targets.js";
 import { performanceEntriesOf } from "./platform.js";
 import { type ReplayContext, bitsToNumber, utf8Text } from "./context.js";
@@ -311,6 +312,9 @@ function withoutGates(entries: unknown[]): unknown[] {
  */
 function replayObservers(ctx: ReplayContext): void {
   const { w, replay, orig } = ctx;
+  // The replay's own mutation records, holed as the recorder holed the
+  // visitor's (`mutationRecordsJson`), so the two compare.
+  const sensitive = (n: Node) => inSensitiveField(ctx.sensitive, n);
   for (const { name, src, takeRecords } of OBSERVERS) {
     const Orig = orig[name] as Function | undefined;
     if (Orig === undefined) continue;
@@ -371,7 +375,11 @@ function replayObservers(ctx: ReplayContext): void {
       /** A MutationObserver's records handed to the page, compared first. */
       const deliver = () => {
         const records = realRecords(o, collected.splice(0));
-        logged(id, "callback", observedJson(name, records));
+        logged(
+          id,
+          "callback",
+          observedJson(name, records, undefined, sensitive),
+        );
         callback.call(o, records, o);
       };
       /** Whether the log's next value is this observer's callback, now. */
@@ -461,7 +469,11 @@ function replayObservers(ctx: ReplayContext): void {
       if (id === undefined) return origTake.call(this);
       if (name === "MutationObserver") {
         const records = realRecords(this, pendingOf.get(this)?.splice(0) ?? []);
-        logged(id, "takeRecords", observedJson(name, records));
+        logged(
+          id,
+          "takeRecords",
+          observedJson(name, records, undefined, sensitive),
+        );
         return records;
       }
       origTake.call(this);

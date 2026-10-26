@@ -21,11 +21,13 @@ import { PLATFORM_VALUE_SRC } from "@codetracer/boundary-format";
 
 import {
   intersectionEntryJson,
-  mutationRecordJson,
+  mutationRecordsJson,
+  type SensitiveNodeTest,
   performanceEntriesJson,
   resizeEntryJson,
 } from "./entries.js";
 import { ClockSrc, TaskKind, numberToBits } from "./recorder.js";
+import { inSensitiveField } from "./sensitive.js";
 
 /**
  * The `Refusal.feature` of a timer handler that is not a function
@@ -388,9 +390,16 @@ export const OBSERVERS: readonly {
  * The JSON of what observer `name` hands the page: its callback's
  * arguments (`args`) or the list `takeRecords()` returned (`list`).
  * A `PerformanceObserver` callback's value also carries the
- * `droppedEntriesCount` of its third argument, when it has one.
+ * `droppedEntriesCount` of its third argument, when it has one. A
+ * `MutationObserver`'s records are holed where they name a sensitive field's
+ * text (`sensitive`, `mutationRecordsJson`).
  */
-export function observedJson(name: string, list: unknown, third?: unknown) {
+export function observedJson(
+  name: string,
+  list: unknown,
+  third?: unknown,
+  sensitive?: SensitiveNodeTest,
+) {
   if (name === "PerformanceObserver") {
     const entries = Array.isArray(list)
       ? (list as PerformanceEntry[])
@@ -409,7 +418,7 @@ export function observedJson(name: string, list: unknown, third?: unknown) {
       ? items.map((e) => intersectionEntryJson(e as IntersectionObserverEntry))
       : name === "ResizeObserver"
         ? items.map((e) => resizeEntryJson(e as ResizeObserverEntry))
-        : items.map((e) => mutationRecordJson(e as MutationRecord));
+        : mutationRecordsJson(items as MutationRecord[], sensitive);
   return JSON.stringify(json);
 }
 
@@ -426,7 +435,8 @@ export function observedJson(name: string, list: unknown, third?: unknown) {
  * `takeRecords()` call is a `PlatformValue` of its own (query
  * `takeRecords`).
  */
-function patchObservers({ w, rec, orig }: SeamContext): void {
+function patchObservers({ w, rec, orig, sensitive: ss }: SeamContext): void {
+  const sensitive = (n: Node) => inSensitiveField(ss, n);
   for (const { name, src, takeRecords } of OBSERVERS) {
     const Orig = orig[name] as Function | undefined;
     if (Orig === undefined) continue;
@@ -458,7 +468,7 @@ function patchObservers({ w, rec, orig }: SeamContext): void {
         rec.guard(() => {
           if (microtask) rec.microtask();
           else rec.task(taskId, TaskKind.observer);
-          value(taskId, "callback", observedJson(name, a[0], a[2]));
+          value(taskId, "callback", observedJson(name, a[0], a[2], sensitive));
         });
         return callback.apply(this, a);
       };
@@ -483,7 +493,13 @@ function patchObservers({ w, rec, orig }: SeamContext): void {
       const list = origTake.call(this);
       const taskId = tasks.get(this);
       if (taskId !== undefined) {
-        rec.guard(() => value(taskId, "takeRecords", observedJson(name, list)));
+        rec.guard(() =>
+          value(
+            taskId,
+            "takeRecords",
+            observedJson(name, list, undefined, sensitive),
+          ),
+        );
       }
       return list;
     });

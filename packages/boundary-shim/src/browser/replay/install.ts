@@ -28,6 +28,8 @@ import { replayMediaSeams } from "./media.js";
 import { replayMessageSeams } from "./message.js";
 import { replayNetSeams } from "./net.js";
 import { replayNotifications } from "./notification.js";
+import { replaySensitive } from "./sensitive.js";
+import { type CtApi, publishCtApi } from "../sensitive.js";
 import { replayPlatformSeams } from "./platform.js";
 import { replayTimeSeams } from "./time.js";
 import { installTrustedEvents } from "./trusted.js";
@@ -50,6 +52,8 @@ export interface ShimReplayControl extends ReplayInjector {
    * is not used: nothing is uploaded in replay mode.
    */
   consent(callback: () => unknown): void;
+  /** The page's sensitive-input API (§11.3.1, §11.3.2), as in record mode. */
+  readonly ct: CtApi;
 }
 
 /** Install the replay-mode shim on `w`, a client of `replay`. */
@@ -63,6 +67,10 @@ export function installReplayShim(
   if (existing !== undefined) return existing;
   const ctx = newReplayContext(w, replay);
   ctx.trusted = installTrustedEvents(ctx);
+  // Before any seam reads a field: the placeholders, the declassifiers
+  // answered from the log, the raw sensitive reads reported (§11.3).
+  const ct = replaySensitive(ctx);
+  publishCtApi(w, ct);
   // The resource elements' events the runner dispatches in the platform's
   // place reach the page's listeners as trusted, as on record (§6, §10.5).
   replay.useStandIns((target, ev) => {
@@ -97,6 +105,7 @@ export function installReplayShim(
       }
     },
     inject: (input, effects) => injector.inject(input, effects),
+    ct,
   };
   Object.defineProperty(w, CONTROL_GLOBAL, {
     value: control,

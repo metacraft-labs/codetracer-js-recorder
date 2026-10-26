@@ -11,6 +11,8 @@
  * properties.
  */
 
+import { HOLE_TOKEN } from "@codetracer/boundary-format";
+
 import { targetOf } from "./targets.js";
 
 /** A rectangle as its four defining numbers. */
@@ -64,30 +66,95 @@ export function resizeEntryJson(e: ResizeObserverEntry): unknown {
   };
 }
 
-/** A node of a mutation record: its type, its target and, for text, its data. */
-function nodeJson(n: Node | null): unknown {
+/**
+ * A node of a mutation record: its type, its target and, for text, its data
+ * (the hole token, §5.2.1, when `hole`).
+ */
+function nodeJson(n: Node | null, hole = false): unknown {
   if (n === null) return null;
   if (n.nodeType === 1) return { t: 1, target: targetOf(n) };
-  return { t: n.nodeType, target: targetOf(n), data: n.nodeValue };
+  return {
+    t: n.nodeType,
+    target: targetOf(n),
+    data: hole && n.nodeValue !== null ? HOLE_TOKEN : n.nodeValue,
+  };
 }
+
+/**
+ * Whether a node is inside a sensitive field (`inSensitiveField`), asked of
+ * each node a mutation record names.
+ */
+export type SensitiveNodeTest = (n: Node) => boolean;
 
 /**
  * One `MutationRecord` (DOM, "Interface MutationRecord"). Replay compares
  * this form of its own records with the logged one (§5.2), since the page's
  * own DOM changes are replayed and the records follow from them.
+ *
+ * What a sensitive field holds is never written (§11.3.1, §11.3.3): when
+ * the record's target is inside a sensitive field (`sensitive`), the text
+ * it names (a text node's data, a `characterData` record's `oldValue`) and
+ * the old `value` attribute of an `attributes` record are the hole token,
+ * so text typed into a `contenteditable` region, or a value a framework
+ * mirrors into the field's `value` attribute, never reaches the log.
+ * `holedNodes` are nodes known to have been in such a field (removed from
+ * one by an earlier record of the same list), whose own records are holed
+ * too. Replay holes its own records the same way, so the two still compare.
  */
-export function mutationRecordJson(r: MutationRecord): unknown {
+export function mutationRecordJson(
+  r: MutationRecord,
+  sensitive: SensitiveNodeTest = () => false,
+  holedNodes: ReadonlySet<Node> = new Set(),
+): unknown {
+  const hole = holedNodes.has(r.target) || sensitive(r.target);
+  const oldValue =
+    hole &&
+    r.oldValue !== null &&
+    (r.type === "characterData" ||
+      (r.type === "attributes" && r.attributeName === "value"))
+      ? HOLE_TOKEN
+      : r.oldValue;
+  const node = (n: Node) =>
+    nodeJson(n, hole || holedNodes.has(n) || sensitive(n));
   return {
     type: r.type,
-    target: nodeJson(r.target),
-    addedNodes: Array.from(r.addedNodes).map(nodeJson),
-    removedNodes: Array.from(r.removedNodes).map(nodeJson),
-    previousSibling: nodeJson(r.previousSibling),
-    nextSibling: nodeJson(r.nextSibling),
+    target: nodeJson(r.target, hole),
+    addedNodes: Array.from(r.addedNodes).map(node),
+    removedNodes: Array.from(r.removedNodes).map(node),
+    previousSibling: nodeJson(r.previousSibling, hole),
+    nextSibling: nodeJson(r.nextSibling, hole),
     attributeName: r.attributeName,
     attributeNamespace: r.attributeNamespace,
-    oldValue: r.oldValue,
+    oldValue,
   };
+}
+
+/**
+ * A list of `MutationRecord`s ({@link mutationRecordJson}). The nodes a
+ * record removes from a sensitive field are remembered for the whole list,
+ * since by the time the list is delivered such a node may have left the
+ * field, and a later record of the list (a `characterData` change of a text
+ * node removed since) names it with nothing to tell where it was.
+ */
+export function mutationRecordsJson(
+  records: readonly MutationRecord[],
+  sensitive: SensitiveNodeTest = () => false,
+): unknown[] {
+  const holed = new Set<Node>();
+  for (const r of records) {
+    if (!sensitive(r.target)) continue;
+    for (const n of Array.from(r.removedNodes)) holed.add(n);
+    for (const n of Array.from(r.addedNodes)) holed.add(n);
+  }
+  // A text node removed with an element: its own records hold the data too.
+  for (const n of [...holed]) {
+    if (n.nodeType !== 1) continue;
+    const walker = (n.ownerDocument ?? document).createTreeWalker(n, 4);
+    for (let t = walker.nextNode(); t !== null; t = walker.nextNode()) {
+      holed.add(t);
+    }
+  }
+  return records.map((r) => mutationRecordJson(r, sensitive, holed));
 }
 
 /**

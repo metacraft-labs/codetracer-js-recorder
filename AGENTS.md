@@ -135,6 +135,35 @@ This is a monorepo managed with npm workspaces:
   the batch envelope codec (`batch.ts`, `encodeBatch`/`parseBatch`) the suite
   checks uploads with, held to the Rust parser by the shared batch vectors
   (`tests/boundary/vectors/batches.json`).
+  The suite's third leg, `ct-boundary-conformance noninterference`
+  (`src/noninterference.ts`), records each fixture with sensitive fields
+  (`sensitive-login`, `-email`, `-pin`) twice with two secrets, the clocks
+  and random sources pinned by an init script and one server origin, and
+  checks the logs differ only in `Declassify.output`, no secret reaches a
+  batch, and each log replays with placeholders. Its falsifier is a build
+  option of both suite builds (`leakRawRead`); it must keep failing.
+* Sensitive inputs (`packages/boundary-shim/src/browser/sensitive.ts`): which
+  field is sensitive, the shape-preserving placeholders, the hole token's
+  substitution, event masking and the page's `ct` API (`public`,
+  `sensitive`, `declassify`). One module for record and replay, the shim and
+  the reference framework; its state lives on the window under a registered
+  symbol because the recorder, the replay shim, the replay runtime and a
+  framework are separate bundles. Every record is scrubbed before it is
+  encoded by one function (`record-scrub.ts`, the `Recorder`'s `sanitize`):
+  never scrub at a seam, or a new seam writes an unscrubbed URL. The
+  transport sends nothing before the ingest's `config`, whose scrub lists
+  the recorder applies to the frames still held then (`onConfig`). Replay
+  compares a URL with `<scrubbed>` as a wildcard (`urlMatches` in `scrub.ts`)
+  and an error by its template. An undeclared free-text field is sensitive,
+  so a test page that shows what was typed must mark the field
+  `data-ct-public`. An input event's field is found through shadow trees
+  (`eventField`: the composed path, the roots `attachShadow` made, and a
+  fail-closed rule for a tree the shim cannot see into), and what a
+  `MutationObserver` hands the page is holed where it names a sensitive
+  field's text, on both sides by `mutationRecordsJson`, as `dom-v1` holes a
+  sensitive field's value, its `value` attribute and a sensitive textarea's
+  text: frameworks mirror a controlled field's value into the DOM. Pinned by
+  `tests/boundary/sensitive.test.ts`.
 * `packages/boundary-replay` — the replay runner of boundary recording:
   `ct-boundary-replay --log <recording.ct|jsbound.log> --build <dir> [--out
   <trace.ct>]` replays a recorded log in headless Chromium against the build

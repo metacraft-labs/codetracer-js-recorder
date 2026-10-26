@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>sensitive inputs uploaded</title>
+  </head>
+  <body>
+    <main>
+      <input id="pw" type="password" />
+      <input id="cc" type="text" autocomplete="cc-number" />
+      <input id="ds" type="text" data-ct-sensitive />
+      <input id="cs" type="text" />
+      <input id="plain" type="text" />
+      <input id="pub" type="text" />
+      <input id="pubattr" type="text" data-ct-public />
+      <input id="pw2" type="password" />
+      <input id="otp" type="text" autocomplete="one-time-code" />
+      <input id="cc2" type="text" autocomplete="cc-number" data-ct-public />
+      <input id="neg" type="text" />
+      <input id="check" type="checkbox" />
+      <button id="send" type="button">Send</button>
+      <p id="status"></p>
+      <div id="extra"></div>
+    </main>
+    <script src="sensitive-upload.js"></script>
+  </body>
+</html>

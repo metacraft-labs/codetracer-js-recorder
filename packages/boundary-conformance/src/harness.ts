@@ -38,7 +38,14 @@ import {
   runRecordChecks,
 } from "./checks.js";
 import { checkBatches } from "./envelope.js";
-import { type Fixture, FIXTURES, fixtureNamed, type Step } from "./fixtures.js";
+import {
+  DEFAULT_SECRETS,
+  type Fixture,
+  FIXTURES,
+  fixtureNamed,
+  PUBLIC_PROBE,
+  type Step,
+} from "./fixtures.js";
 import { type Browser, loadPlaywright, type Page } from "./playwright.js";
 import {
   FIXTURE_ATTRIBUTE,
@@ -147,13 +154,35 @@ async function runStep(
   server: HarnessServer,
   step: Step,
   ms: number,
+  secret: string,
+  keyboardOnly: boolean,
 ): Promise<void> {
   switch (step.op) {
     case "click":
+      if (keyboardOnly) {
+        // Activation by the keyboard, with no pointer to move: a focused
+        // button activates on Space's keyup (HTML, "activation behavior";
+        // Chromium activates a button on the release of Space), so no event
+        // of the key follows its click, where one would race whatever the
+        // click started (Enter activates on keydown, and its keyup comes
+        // after the click's handlers, in a task of its own).
+        await page.focus(selectorOf(step.fx), { timeout: ms });
+        await page.keyboard.press("Space");
+        return;
+      }
       await page.click(selectorOf(step.fx), { timeout: ms });
       return;
     case "type":
       await page.type(selectorOf(step.fx), step.text, { timeout: ms });
+      return;
+    case "typeSecret":
+      await page.type(selectorOf(step.fx), secret, { timeout: ms });
+      return;
+    case "typePublic":
+      await page.type(selectorOf(step.fx), PUBLIC_PROBE, { timeout: ms });
+      return;
+    case "press":
+      await page.keyboard.press(step.key);
       return;
     case "waitFor": {
       const actual = await waitForText(page, step.fx, step.text, ms);
@@ -184,8 +213,32 @@ function describeStep(step: Step): string {
   return step.op + ("fx" in step ? ` ${step.fx}` : "");
 }
 
+/** How one page is recorded, beyond the fixture and the build. */
+export interface RecordPageOptions {
+  /** The secret the fixture's `typeSecret` steps type (default: the first default secret). */
+  secret?: string;
+  /**
+   * Script run in the page before any of its own (Playwright's
+   * `addInitScript`): the non-interference leg pins the clocks and the
+   * random sources with it (§11.3.6).
+   */
+  initScript?: string;
+  /** The harness server's port (default: a free one). */
+  port?: number;
+  /**
+   * Drive the page without the pointer: the cursor parked outside the
+   * viewport before the page loads, and each `click` step made by the
+   * keyboard (focus, then Space). The browser dispatches hover events at
+   * whatever lies under a cursor as the page lays out, at moments its
+   * scheduling decides, so two sessions with a cursor over the page differ
+   * in where those events fall; the non-interference leg compares two
+   * sessions record for record (§11.3.6).
+   */
+  keyboardOnly?: boolean;
+}
+
 /** Record one page of one fixture. */
-async function recordPage(
+export async function recordPage(
   browser: Browser,
   build: string,
   fixture: Fixture,
@@ -193,8 +246,10 @@ async function recordPage(
   perturbed: boolean,
   probeSource: string,
   ms: number,
+  options: RecordPageOptions = {},
 ): Promise<Recording> {
-  const server = await startHarnessServer(build);
+  const server = await startHarnessServer(build, { port: options.port });
+  const secret = options.secret ?? DEFAULT_SECRETS[0];
   const pagePath = fixturePage(fixture.name, perturbed);
   const problems: string[] = [];
   const recording: Recording = {
@@ -204,15 +259,26 @@ async function recordPage(
   };
   const context = await browser.newContext();
   try {
+    if (options.initScript !== undefined) {
+      await context.addInitScript({ content: options.initScript });
+    }
     const page = await context.newPage();
     const pageErrors: string[] = [];
     page.on("pageerror", (e) => pageErrors.push(e.message));
+    if (options.keyboardOnly === true) await page.mouse.move(4000, 4000);
     await page.goto(server.origin + pagePath, { timeout: ms });
 
     let stepsRan = true;
     for (const step of fixture.steps) {
       try {
-        await runStep(page, server, step, ms);
+        await runStep(
+          page,
+          server,
+          step,
+          ms,
+          secret,
+          options.keyboardOnly === true,
+        );
       } catch (e) {
         problems.push(
           `step "${describeStep(step)}" failed: ${(e as Error).message}`,
@@ -307,6 +373,7 @@ function targetsOf(log: Uint8Array | undefined): string[] {
       if (
         r.record === "Input" ||
         r.record === "DomEffect" ||
+        r.record === "Scrubbed" ||
         r.record === "LayoutRead"
       ) {
         set.add(r.target);

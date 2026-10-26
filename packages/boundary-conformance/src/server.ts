@@ -39,8 +39,20 @@ const TYPES: Record<string, string> = {
   ".wasm": "application/wasm",
 };
 
-/** Start a server for the build in `root` on a free loopback port. */
-export async function startHarnessServer(root: string): Promise<HarnessServer> {
+/** Where the harness server listens. */
+export interface HarnessServerOptions {
+  /**
+   * The loopback port (default: a free one). The non-interference leg
+   * records its two sessions at one origin, so their URLs are the same.
+   */
+  port?: number;
+}
+
+/** Start a server for the build in `root` on a loopback port. */
+export async function startHarnessServer(
+  root: string,
+  options: HarnessServerOptions = {},
+): Promise<HarnessServer> {
   const base = path.resolve(root);
   const batches: Uint8Array[] = [];
   let gateOpen = false;
@@ -59,6 +71,10 @@ export async function startHarnessServer(root: string): Promise<HarnessServer> {
   };
 
   const server = http.createServer((req, res) => {
+    // No `Date` header: what the page reads of a response is the same in
+    // every session, so two recordings differ only where the page made
+    // them differ (the non-interference leg compares them, §11.3.6).
+    res.sendDate = false;
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
@@ -150,7 +166,13 @@ export async function startHarnessServer(root: string): Promise<HarnessServer> {
       res.end(fs.readFileSync(file));
     });
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(options.port ?? 0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
   const port = (server.address() as { port: number }).port;
   return {
     origin: `http://127.0.0.1:${port}`,

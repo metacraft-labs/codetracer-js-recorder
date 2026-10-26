@@ -782,6 +782,7 @@ async function replayOnce(
       actual: buildHash,
       detail: `the build at ${build} hashes to ${buildHash}, not the session's Header.build_hash`,
       cause: "mismatch",
+      sensitiveRead: null,
       lastCheckpoint: null,
     };
     return { report };
@@ -1036,7 +1037,8 @@ async function replayOnce(
         });
         return;
       }
-      const key = url.href.split("#")[0];
+      const rawKey = url.href.split("#")[0];
+      const key = plan.loggedUrl(rawKey);
       if (request.resourceType() === "script" && mainFrame) {
         // A script whose execution the log has runs when its DocTask comes
         // due (the preload scanner's request is the one held). At level 0
@@ -1050,7 +1052,7 @@ async function replayOnce(
           plan.takeScript(key) ||
           (level0 &&
             plan.holds &&
-            (parserScripts.has(key) || (await pageScriptElement(key))))
+            (parserScripts.has(rawKey) || (await pageScriptElement(rawKey))))
         ) {
           await held.hold(`script:${key}`);
         }

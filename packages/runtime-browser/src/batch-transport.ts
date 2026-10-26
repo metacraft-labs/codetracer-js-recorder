@@ -166,8 +166,8 @@ export function privacySignal(
 /**
  * The recorder configuration the ingest's `config` route answers
  * (Boundary-Ingest §3): `{"enabled": bool, "sampling_rate": number,
- * "consent_required": bool, "ring_bytes": integer}`. Unknown fields are
- * ignored (the scrub lists the configuration will carry are read elsewhere).
+ * "consent_required": bool, "ring_bytes": integer, "scrub_headers":
+ * [string], "scrub_query_keys": [string]}`. Unknown fields are ignored.
  */
 export interface IngestConfig {
   /** Record at all. Absent or not `true` means no. */
@@ -178,6 +178,27 @@ export interface IngestConfig {
   consentRequired: boolean;
   /** The ring's cap in bytes, when the ingest sets one. */
   ringBytes?: number;
+  /**
+   * The site's scrub lists (JS-Boundary-Recording §11.3.5): response header
+   * names removed from the log, and query keys whose values are scrubbed in
+   * every URL it holds, besides the recorder's built-in rules. Each trimmed
+   * and lowercased; anything that is not an array of strings is no list.
+   */
+  scrubHeaders: string[];
+  scrubQueryKeys: string[];
+}
+
+/** A site list from the `config` answer: strings, trimmed, lowercased, at most 256. */
+function scrubList(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  const out = new Set<string>();
+  for (const x of v) {
+    if (typeof x !== "string") continue;
+    const s = x.trim().toLowerCase();
+    if (s.length > 0 && s.length <= 256) out.add(s);
+    if (out.size >= 256) break;
+  }
+  return [...out];
 }
 
 /**
@@ -187,7 +208,13 @@ export interface IngestConfig {
  */
 export function parseIngestConfig(json: unknown): IngestConfig {
   if (json === null || typeof json !== "object" || Array.isArray(json)) {
-    return { enabled: false, samplingRate: 0, consentRequired: false };
+    return {
+      enabled: false,
+      samplingRate: 0,
+      consentRequired: false,
+      scrubHeaders: [],
+      scrubQueryKeys: [],
+    };
   }
   const o = json as Record<string, unknown>;
   const rate = o.sampling_rate;
@@ -200,6 +227,8 @@ export function parseIngestConfig(json: unknown): IngestConfig {
       typeof ring === "number" && Number.isSafeInteger(ring)
         ? Math.min(MAX_RING_BYTES, Math.max(MIN_RING_BYTES, ring))
         : undefined,
+    scrubHeaders: scrubList(o.scrub_headers),
+    scrubQueryKeys: scrubList(o.scrub_query_keys),
   };
 }
 
@@ -392,6 +421,17 @@ export interface HttpBatchTransportOptions {
   window?: Window;
   /** Told once, with the reason, when the transport turns off. */
   onDisabled?: (reason: string) => void;
+  /**
+   * Told the ingest's configuration once it arrives and enables recording,
+   * before any batch is sent (nothing is sent before it). It may return a
+   * function that rewrites a frame: every frame still held is passed
+   * through it then (the recorder scrubs them with the site's lists,
+   * JS-Boundary-Recording §11.3.5), so no frame leaves the page unscrubbed.
+   * A rewriter that throws turns the transport off.
+   */
+  onConfig?: (
+    config: IngestConfig,
+  ) => ((frame: Uint8Array) => Uint8Array) | undefined;
 }
 
 /** One unsent frame, or a run of records that will never be sent. */
@@ -541,6 +581,7 @@ export class HttpBatchTransport {
   /** Bytes of this document's `keepalive` requests not yet settled. */
   private keepaliveBytes = 0;
   private readonly onDisabled: ((reason: string) => void) | undefined;
+  private readonly onConfig: HttpBatchTransportOptions["onConfig"];
   private readonly sessionId: string;
   private readonly buildHash: string;
   private routes: { config: string; batches: string } | undefined;
@@ -591,6 +632,7 @@ export class HttpBatchTransport {
       options.flushDeadlineMaxMs ?? FLUSH_DEADLINE_MAX_MS,
     );
     this.onDisabled = options.onDisabled;
+    this.onConfig = options.onConfig;
     this.sessionId = options.sessionId;
     this.buildHash = options.buildHash;
     this.ringBytes = clampRing(options.ringBytes ?? DEFAULT_RING_BYTES);
@@ -803,6 +845,9 @@ export class HttpBatchTransport {
     ) {
       return this.off("config: this session is not sampled");
     }
+    // Before the ring is cut to the new cap and before anything is sent:
+    // the recorder may scrub the frames it holds with the site's lists.
+    if (!this.rewriteHeld(config)) return;
     if (config.ringBytes !== undefined) {
       this.ringBytes = config.ringBytes;
       this.evictToCap();
@@ -812,6 +857,35 @@ export class HttpBatchTransport {
       return;
     }
     this.open();
+  }
+
+  /**
+   * Pass every held frame through the rewriter {@link onConfig} returns, if
+   * any. False when the transport turned off (a rewriter that throws: the
+   * frames could not be scrubbed, so none may be sent).
+   */
+  private rewriteHeld(config: IngestConfig): boolean {
+    let rewrite: ((frame: Uint8Array) => Uint8Array) | undefined;
+    try {
+      rewrite = this.onConfig?.(config);
+    } catch {
+      this.off("the recorder could not take the configuration");
+      return false;
+    }
+    if (rewrite === undefined) return true;
+    try {
+      for (let i = 0; i < this.queue.length; i++) {
+        const e = this.queue.at(i)!;
+        if (e.kind !== "frame") continue;
+        const bytes = rewrite(e.bytes);
+        this.queuedBytes += bytes.length - e.bytes.length;
+        e.bytes = bytes;
+      }
+    } catch {
+      this.off("the recorder could not scrub the frames it held");
+      return false;
+    }
+    return true;
   }
 
   private open(): void {

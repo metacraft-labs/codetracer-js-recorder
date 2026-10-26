@@ -3,6 +3,7 @@ import { fx } from "../../fixture-dom.js";
 import { ref } from "../api.js";
 
 const name = fx("name") as HTMLInputElement;
+ref.public(name);
 const value = ref.state("");
 ref.on(name, "input", () => {
   ref.perfNow();

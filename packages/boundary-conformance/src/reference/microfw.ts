@@ -27,6 +27,17 @@
  * offers `inject` (which calls the registered handler directly, §9.5) and
  * `checkpoint` (its state hash, §9.6).
  *
+ * Sensitive inputs (§11.3, capability `sensitive`): a field the app
+ * declares sensitive with `sensitive(el)` (and every free-text field it does
+ * not declare `public(el)`, as the generic shim decides, so the two agree on
+ * the `dom-v1` digest) has its events masked and its value written as
+ * `Scrubbed`; `secret(initial)` is a signal its checkpoint hash leaves out
+ * entirely (§9.6) and whose read on replay outside a declassifier is reported
+ * as the framework's "unchecked unwrap" (§7.2 `cause`); `declassify(fn, id)`
+ * logs its output as `Declassify` and on replay returns it without running
+ * `fn`; and the network seam holes the sensitive values in what it logs
+ * (§5.2.1).
+ *
  * Seeded defects (`ReferenceDefects`, compiled in by the build) turn it into
  * the broken frameworks the suite must reject.
  */
@@ -57,6 +68,21 @@ import {
   replayOf,
 } from "@codetracer/boundary-shim/dist/browser/replay-api.js";
 import { sha256Hex } from "@codetracer/boundary-shim/dist/browser/sha256.js";
+import { sanitizeRecord } from "@codetracer/boundary-shim/dist/browser/record-scrub.js";
+import { NO_SCRUB_LISTS } from "@codetracer/boundary-shim/dist/browser/scrub.js";
+import {
+  canonicalOutput,
+  currentSensitiveValues,
+  holeText,
+  isSensitive,
+  makeCtApi,
+  maskEventProps,
+  placeholder,
+  rememberSensitive,
+  sensitiveClass,
+  sensitiveState,
+} from "@codetracer/boundary-shim/dist/browser/sensitive.js";
+import type { InputEffect } from "@codetracer/boundary-shim/dist/browser/replay-api.js";
 
 import {
   PROTOCOL_GLOBAL,
@@ -80,6 +106,18 @@ export interface ReferenceDefects {
    * target instead of calling the registered handler (§9.5 forbids it).
    */
   injectByDispatch?: boolean;
+  /**
+   * Record a sensitive field's value as a plain `DomEffect` and its events
+   * unmasked, as a framework that ignores the declaration would: the
+   * non-interference leg must find the secret in the batches.
+   */
+  leakSensitive?: boolean;
+  /**
+   * The sensitive fixtures' apps read the raw sensitive signal outside a
+   * declassifier and branch a request on it (compiled into the apps, not
+   * the framework): the non-interference leg must fail (§11.3.6).
+   */
+  leakRawRead?: boolean;
 }
 
 /** Set by the build (esbuild `define`). */
@@ -98,6 +136,7 @@ const CAPABILITIES = [
   "targets",
   "inject",
   "checkpoint",
+  "sensitive",
   "labels",
   "prehydration",
 ];
@@ -113,6 +152,26 @@ export interface Signal<T> {
 /** What the fixture apps program against (`globalThis.__ctRef`). */
 export interface ReferenceApi {
   state<T>(initial: T): Signal<T>;
+  /**
+   * A signal that holds a sensitive value: left out of the checkpoint hash
+   * (§9.6); read on replay outside a declassifier, a raw sensitive read.
+   */
+  secret(initial: string): Signal<string>;
+  /** Declare a field sensitive (§11.3.1). */
+  sensitive(el: Element): void;
+  /** Declare a free-text field public (§11.3.1); throws on a credential field. */
+  public(el: Element): void;
+  /**
+   * A declassifier under `id` (§11.3.2): its output is logged as
+   * `Declassify` on record and returned from the log on replay, where `fn`
+   * does not run.
+   */
+  declassify<A extends unknown[], R>(
+    fn: (...args: A) => R,
+    id: string,
+  ): (...args: A) => R;
+  /** The seeded defects, for an app whose defect is its own (`leakRawRead`). */
+  readonly defects: ReferenceDefects;
   now(): number;
   perfNow(): number;
   random(): number;
@@ -145,6 +204,9 @@ const replay: CtReplay | undefined = replayOf(w);
 // ── State and checkpoints ───────────────────────────────────────────────
 
 const signals: Signal<unknown>[] = [];
+/** The sensitive-input state the page shares with dom-v1 (§11.3). */
+const sensitive = sensitiveState(w);
+const holes = () => currentSensitiveValues(w, sensitive);
 
 /** `ct-reference-state-v1`: SHA-256 of the JSON of every signal's value. */
 function stateHash(): string {
@@ -163,6 +225,8 @@ const recorderOptions: RecorderOptions = {
   checkpointHash: stateHash,
   checkpointScheme: SCHEME,
   checkpointDomDigest: () => domV1Hash(doc),
+  // The URLs it logs, scrubbed and holed as the generic shim's are.
+  sanitize: (r) => sanitizeRecord(r, NO_SCRUB_LISTS, holes),
 };
 const rec = defects.noCheckpoints
   ? new NoCheckpointRecorder(recorderOptions)
@@ -297,7 +361,19 @@ function recordInvocation(
 ): void {
   const target = targetOf(reg.el);
   if (hydrationTask === undefined) rec.macrotask();
+  const masked = !defects.leakSensitive && isSensitive(sensitive, reg.el);
+  if (masked) sensitive.seen.add(reg.el);
   for (const [effect, value] of effectsOf(reg.el, ev)) {
+    if (masked && effect === 1) {
+      const v = String(value);
+      rememberSensitive(sensitive, v);
+      rec.emit("Scrubbed", {
+        target,
+        class: sensitiveClass(sensitive, reg.el),
+        length: v.length,
+      });
+      continue;
+    }
     rec.emit("DomEffect", { target, effect, value: JSON.stringify(value) });
   }
   let taskId = hydrationTask;
@@ -309,7 +385,11 @@ function recordInvocation(
     task_id: taskId,
     type: ev.type,
     target,
-    props: propsOf(ev),
+    props: masked
+      ? JSON.stringify(
+          maskEventProps(JSON.parse(propsOf(ev)) as Record<string, unknown>),
+        )
+      : propsOf(ev),
     label: labelOf(reg.el),
   });
 }
@@ -400,12 +480,14 @@ function fetchText(
 ): Promise<string> {
   const abs = new URL(url, w.location.href).href;
   const reqId = rec.nextReqId();
+  // The network seam is the sanctioned sink (§11.3.1): the real value goes
+  // out, its holed form is logged (§5.2.1).
   rec.emit("NetRequest", {
     req_id: reqId,
     api: 1,
     method,
     url: abs,
-    body_digest: body === undefined ? "" : sha256Hex(body),
+    body_digest: body === undefined ? "" : sha256Hex(holeText(body, holes())),
   });
   const taskId = rec.nextTaskId();
   rec.emit("TaskReg", { task_id: taskId, kind: 4, delay_ms: 0 });
@@ -459,7 +541,43 @@ function fetchText(
     );
 }
 
+/** A declassifier's call on record: run it and log its output (§11.3.2). */
+const recordDeclassify = makeCtApi(w, sensitive, (id, fn, self, args) => {
+  const out = fn.apply(self, args);
+  const output = canonicalOutput(out);
+  if (output === undefined) {
+    rec.emit("Refusal", {
+      feature: "unrecordable-declassifier",
+      detail: `${id} returned a value that is not JSON data`,
+    });
+  } else {
+    rec.emit("Declassify", { fn_id: id, output });
+  }
+  return out;
+});
+
 const api: ReferenceApi = {
+  defects,
+  secret(initial: string): Signal<string> {
+    let value = initial;
+    // Not in `signals`: a sensitive signal contributes nothing to the
+    // checkpoint hash, not even a write count (§9.6).
+    return {
+      get: () => value,
+      set: (v) => {
+        value = v;
+      },
+    };
+  },
+  sensitive(el) {
+    recordDeclassify.sensitive(el);
+  },
+  public(el) {
+    recordDeclassify.public(el);
+  },
+  declassify(fn, id) {
+    return recordDeclassify.declassify(fn, { id });
+  },
   state<T>(initial: T): Signal<T> {
     let value = initial;
     const s: Signal<T> = {
@@ -686,13 +804,22 @@ function replayClock(r: CtReplay, src: number): number {
   return v.getFloat64(0, true);
 }
 
-/** The `DomEffect`s of default actions, applied before a handler runs. */
-function applyEffects(
-  effects: { target: string; effect: number; value: string }[],
-): string | undefined {
+/**
+ * The `DomEffect`s of default actions, applied before a handler runs; a
+ * `Scrubbed` puts the placeholder of its class and length into the field
+ * (§11.3.4).
+ */
+function applyEffects(effects: InputEffect[]): string | undefined {
   for (const e of effects) {
     const t = resolveTarget(e.target) as HTMLInputElement | null;
-    if (t === null) return `DomEffect target ${e.target} does not resolve`;
+    if (t === null) return `${e.record} target ${e.target} does not resolve`;
+    if (e.record === "Scrubbed") {
+      const value = placeholder(e.class, e.length);
+      t.value = value;
+      sensitive.seen.add(t);
+      rememberSensitive(sensitive, value);
+      continue;
+    }
     const v = JSON.parse(e.value) as unknown;
     if (e.effect === 1) t.value = String(v);
     else if (e.effect === 2) t.checked = v === true;
@@ -713,7 +840,9 @@ function eventFor(
       ? new w.MouseEvent(type, init as MouseEventInit)
       : type === "input"
         ? new w.InputEvent(type, init as InputEventInit)
-        : new w.Event(type, init);
+        : type === "keydown" || type === "keyup"
+          ? new w.KeyboardEvent(type, init as KeyboardEventInit)
+          : new w.Event(type, init);
   Object.defineProperty(ev, "target", { value: target });
   Object.defineProperty(ev, "currentTarget", { value: target });
   return ev;
@@ -722,7 +851,7 @@ function eventFor(
 /** Call the registered handler for `input` (§9.5); `"ok"` or why not. */
 function invoke(
   input: { type: string; target: string; props: string },
-  effects: { target: string; effect: number; value: string }[],
+  effects: InputEffect[],
 ): string {
   const problem = applyEffects(effects);
   if (problem !== undefined) return problem;
@@ -763,11 +892,13 @@ function replayHydrate(r: CtReplay, register: () => void): void {
     register();
     // The inputs that waited for hydration ran inside the hydration task
     // (§9.5): their effects and Inputs follow its Task in the log.
-    let effects: { target: string; effect: number; value: string }[] = [];
+    let effects: InputEffect[] = [];
     for (;;) {
       const v = r.peek().record;
       if (v?.record === "DomEffect") {
         effects.push(r.next("DomEffect"));
+      } else if (v?.record === "Scrubbed") {
+        effects.push(r.next("Scrubbed"));
       } else if (v?.record === "Input" && v.task_id === task.task_id) {
         const input = r.next("Input");
         const result = invoke(input, effects);
@@ -793,7 +924,37 @@ function replayOnPopState(r: CtReplay, fn: () => void): void {
 }
 
 function replayApi(r: CtReplay): ReferenceApi {
+  const replayDeclassify = makeCtApi(w, sensitive, (id) => {
+    const d = r.next("Declassify", { fn_id: id });
+    return JSON.parse(d.output) as unknown;
+  });
   return {
+    defects,
+    secret(initial: string): Signal<string> {
+      let value = initial;
+      return {
+        // Read outside a declassifier: the framework's unchecked unwrap
+        // (§7.2), which the replay reports as a raw sensitive read.
+        get: () => {
+          r.noteSensitiveRead({
+            target: "",
+            what: "secret signal",
+            frames: (new Error().stack ?? "").split("\n").slice(2, 10),
+          });
+          return value;
+        },
+        set: (v) => {
+          value = v;
+        },
+      };
+    },
+    sensitive: (el) => {
+      replayDeclassify.sensitive(el);
+    },
+    public: (el) => {
+      replayDeclassify.public(el);
+    },
+    declassify: (fn, id) => replayDeclassify.declassify(fn, { id }),
     state: api.state,
     create: api.create,
     on,
@@ -821,12 +982,13 @@ function replayApi(r: CtReplay): ReferenceApi {
     },
     fetchText(method, url, body) {
       const reqId = replayReqIds++;
+      const h = holes();
       r.next("NetRequest", {
         req_id: reqId,
         api: 1,
         method,
-        url: new URL(url, w.location.href).href,
-        body_digest: body === undefined ? "" : sha256Hex(body),
+        url: holeText(new URL(url, w.location.href).href, h),
+        body_digest: body === undefined ? "" : sha256Hex(holeText(body, h)),
       });
       const taskId = replayTaskIds++;
       r.registerTask(taskId, 4, 0);

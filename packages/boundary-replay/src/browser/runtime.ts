@@ -73,8 +73,10 @@ import {
   type CtReplay,
   type DivergenceKind,
   type DivergenceReport,
+  type InputEffect,
   type MatchedCheckpoint,
   type RecordView,
+  type SensitiveReadReport,
   REPLAY_CONFIG_GLOBAL,
   REPLAY_GLOBAL,
   type ReplayConfig,
@@ -82,6 +84,16 @@ import {
   type TaskRecord,
 } from "@codetracer/boundary-shim/dist/browser/replay-api.js";
 import { INPUT_EVENT_TYPES } from "@codetracer/boundary-shim/dist/browser/seams-dom.js";
+import {
+  resolveLoggedUrl,
+  templateErrorMessage,
+  urlMatches,
+} from "@codetracer/boundary-shim/dist/browser/scrub.js";
+import {
+  currentSensitiveValues,
+  holeText,
+  sensitiveState,
+} from "@codetracer/boundary-shim/dist/browser/sensitive.js";
 
 import { GATE_MARKER, GATE_PATH } from "../gates.js";
 
@@ -96,7 +108,7 @@ const SHIM_GLOBAL = "__ctBoundaryShim";
 /** What the generic shim's replay mode publishes for the runner. */
 interface ShimReplayControl {
   mode: "replay";
-  inject(input: RecordOf<"Input">, effects: RecordOf<"DomEffect">[]): string;
+  inject(input: RecordOf<"Input">, effects: InputEffect[]): string;
 }
 
 /**
@@ -271,6 +283,10 @@ export function installReplayRuntime(
   config: ReplayConfig,
 ): CtReplay & CtReplayRunner {
   const orig: ShimOriginals = captureOriginals(w);
+  // The sensitive-input state every bundle in the page shares (§11.3),
+  // made now, before any page code, so the platform getters it reads
+  // values through are the platform's.
+  const sensitive = sensitiveState(w);
   const OrigPromise = orig.Promise;
   const decoded = decodeLog(base64Bytes(config.log), { inlineBodies: "batch" });
   const records = decoded.records;
@@ -326,7 +342,32 @@ export function installReplayRuntime(
   let standIn: (target: EventTarget, ev: Event) => void = (target, ev) => {
     w.EventTarget.prototype.dispatchEvent.call(target, ev);
   };
-  let pendingEffects: RecordOf<"DomEffect">[] = [];
+  let pendingEffects: InputEffect[] = [];
+  /**
+   * The first raw read of a sensitive value the page made (§7.2 `cause`):
+   * the replay substituted a placeholder for that value, so a divergence
+   * after it may be that substitution's doing.
+   */
+  let sensitiveRead: SensitiveReadReport | null = null;
+  /** The `seq` of the last record the cursor consumed (`0` before any). */
+  const consumedSeq = (): string => {
+    for (let i = Math.min(at, records.length) - 1; i >= 0; i--) {
+      const s = seqOf(records[i]);
+      if (s !== undefined) return s.toString();
+    }
+    return "0";
+  };
+  /**
+   * The URLs the log names scripts and resources by (`DocTask.src`,
+   * scrubbed on record, §11.3.5); a replayed element's URL is looked up
+   * among them (`resolveLoggedUrl`).
+   */
+  const loggedSrcs = new Set<string>();
+  for (const r of records) {
+    if (r.record === "DocTask" && r.src !== "") loggedSrcs.add(r.src);
+  }
+  const srcOf = (s: HTMLScriptElement): string =>
+    resolveLoggedUrl(loggedSrcs, progress.srcOf(s));
 
   // Range materialisation (§12): emission is off until the `from`
   // checkpoint has matched, and the replay stops at the first checkpoint at
@@ -430,7 +471,8 @@ export function installReplayRuntime(
         recorded: recorded ?? describeRecord(r),
         actual: actual ?? "",
         detail,
-        cause: "mismatch",
+        cause: sensitiveRead === null ? "mismatch" : "substituted-sensitive",
+        sensitiveRead,
         lastCheckpoint,
       };
       status.state = "diverged";
@@ -520,7 +562,15 @@ export function installReplayRuntime(
     }
     for (const [field, value] of Object.entries(checked)) {
       const recorded = (r as unknown as Record<string, unknown>)[field];
-      if (!sameValue(recorded, value)) {
+      // A URL was scrubbed on record (§11.3.5): a value the log holds as
+      // `<scrubbed>` matches whatever the replay used there.
+      const same =
+        field === "url" &&
+        typeof recorded === "string" &&
+        typeof value === "string"
+          ? urlMatches(recorded, value)
+          : sameValue(recorded, value);
+      if (!same) {
         fail(
           "ArgumentMismatch",
           `${kind}.${field} differs: recorded ${describeValue(recorded)}, the page's ${describeValue(value)}`,
@@ -668,7 +718,7 @@ export function installReplayRuntime(
 
   progress.listen(orig.addEventListener, {
     scriptSettled(script) {
-      const src = progress.srcOf(script);
+      const src = srcOf(script);
       if (
         failed === undefined &&
         awaiting?.kind === "script" &&
@@ -838,7 +888,7 @@ export function installReplayRuntime(
    * element"), and so `async` without the attribute.
    */
   const heldByRunner = (s: HTMLScriptElement): boolean => {
-    const src = progress.srcOf(s);
+    const src = srcOf(s);
     if ((inFlight.get(src) ?? 0) > 0) return false;
     if ((heldScripts.get(src) ?? 0) > 0) return true;
     return level === 0 && recordsLoading && s.async === s.hasAttribute("async");
@@ -880,7 +930,17 @@ export function installReplayRuntime(
 
   const onPageError = (kind: number, message: string) => {
     const r = current();
-    if (r?.record === "Error" && r.kind === kind && r.message === message) {
+    // The log holds the message as its template (§11.3.5), the sensitive
+    // values holed first: here the placeholders, as the recorder holed the
+    // visitor's values.
+    if (
+      r?.record === "Error" &&
+      r.kind === kind &&
+      r.message ===
+        templateErrorMessage(
+          holeText(message, currentSensitiveValues(w, sensitive)),
+        )
+    ) {
       at++;
     }
   };
@@ -993,12 +1053,9 @@ export function installReplayRuntime(
     at++;
   };
 
-  const inject = (
-    input: RecordOf<"Input">,
-    effects: RecordOf<"DomEffect">[],
-  ) => {
+  const inject = (input: RecordOf<"Input">, effects: InputEffect[]) => {
     let injector:
-      | ((i: RecordOf<"Input">, e: RecordOf<"DomEffect">[]) => string)
+      | ((i: RecordOf<"Input">, e: InputEffect[]) => string)
       | undefined;
     if (level === 1) {
       const hooks = (
@@ -1095,11 +1152,11 @@ export function installReplayRuntime(
         );
         break;
       case "Scrubbed":
-        fail(
-          "NonReplayable",
-          "a Scrubbed record (a sensitive value replaced in the browser) is not replayed by this runner version",
-        );
-        break;
+        // A sensitive field's value, applied with a placeholder before the
+        // input it precedes is injected (§11.3.4), as a DomEffect is.
+        pendingEffects.push(r);
+        at++;
+        return "next";
       case "Task":
         runTask(r);
         return "ran";
@@ -1252,7 +1309,7 @@ export function installReplayRuntime(
       // must get to it, past the gate it waits at.
       const inDocument = progress
         .pendingScripts()
-        .some((s) => progress.srcOf(s) === r.src);
+        .some((s) => srcOf(s) === r.src);
       if (!inDocument) openGate();
       return "wait";
     }
@@ -1630,7 +1687,9 @@ export function installReplayRuntime(
      * module's dependency or a dynamic import's module (answered).
      */
     pendingScriptElement(url) {
-      return progress.pendingScripts().some((s) => progress.srcOf(s) === url);
+      return progress
+        .pendingScripts()
+        .some((s) => urlMatches(srcOf(s), url) || progress.srcOf(s) === url);
     },
     checkpointDue: () => current()?.record === "Checkpoint",
     gateTrace,
@@ -1638,6 +1697,15 @@ export function installReplayRuntime(
     fail,
     get failed() {
       return failed;
+    },
+    noteSensitiveRead(read) {
+      if (sensitiveRead !== null || failed !== undefined) return;
+      sensitiveRead = {
+        target: read.target,
+        what: read.what,
+        afterSeq: consumedSeq(),
+        frames: read.frames.slice(0, 8),
+      };
     },
     originals: orig,
     status: () => ({

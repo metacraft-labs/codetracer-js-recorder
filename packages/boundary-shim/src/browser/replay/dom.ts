@@ -34,7 +34,9 @@ import { NOTIFICATION_EVENT_TYPES } from "../seams-notification.js";
 import { patchStorageEvents } from "../seams-storage.js";
 import { resolveTarget, targetOf } from "../targets.js";
 import type { RecordOf } from "@codetracer/boundary-format";
+import type { InputEffect } from "../replay-api.js";
 import type { ReplayContext } from "./context.js";
+import { applyScrubbed, watchMaskedProps } from "./sensitive.js";
 
 /** `StorageRead.area` (§5.2). */
 const Area = { local: 1, session: 2, cookie: 3 };
@@ -587,7 +589,7 @@ const Effect = {
 
 /** What the shim's replay mode publishes for the runner to inject with. */
 export interface ReplayInjector {
-  inject(input: RecordOf<"Input">, effects: RecordOf<"DomEffect">[]): string;
+  inject(input: RecordOf<"Input">, effects: InputEffect[]): string;
 }
 
 /**
@@ -827,7 +829,9 @@ export function replayInput(ctx: ReplayContext): ReplayInjector {
       applying = true;
       try {
         for (const e of effects) {
-          const problem = apply(e);
+          // A sensitive field's value: its placeholder (§11.3.4).
+          const problem =
+            e.record === "Scrubbed" ? applyScrubbed(ctx, e) : apply(e);
           if (problem !== undefined) return problem;
         }
       } finally {
@@ -892,12 +896,18 @@ export function replayInput(ctx: ReplayContext): ReplayInjector {
       ) {
         const after = [...effects]
           .reverse()
-          .find((e) => e.effect === Effect.checked);
+          .find(
+            (e): e is RecordOf<"DomEffect"> =>
+              e.record === "DomEffect" && e.effect === Effect.checked,
+          );
         if (after !== undefined) {
           const checked = JSON.parse(after.value) === true;
           el.checked = el.type === "checkbox" ? !checked : false;
         }
       }
+      // At a sensitive field the logged properties are masked (§11.3.3);
+      // the page reading them is a raw sensitive read (§7.2 `cause`).
+      watchMaskedProps(ctx, ev, target);
       // Until the injected event's own listener measures it, every trusted
       // event of a captured type is the platform's reaction.
       injection.depth = Infinity;

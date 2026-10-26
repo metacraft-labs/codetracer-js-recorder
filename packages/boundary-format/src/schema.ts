@@ -52,6 +52,17 @@ export const VOCAB = 1;
 export const MAX_FRAME_LEN = 64 * 1024 * 1024;
 /** The largest body `jsbound.log` carries inline. */
 export const MAX_INLINE_BLOB = 1024;
+/**
+ * The sensitive-hole token (spec §5.2.1): `U+FDD0 "ct:hole" U+FDD1`, 13
+ * UTF-8 bytes. A recorder writes it in place of every span of a checked
+ * field (`NetRequest.url`, the bytes `body_digest` is taken over, outbound
+ * `WsMessage.data`, `Navigation.url`) that carried a sensitive value. U+FDD0
+ * and U+FDD1 are Unicode noncharacters, never valid in interchange text, so
+ * the token cannot collide with real data; it carries no length and no
+ * class, so every secret, and its replay placeholder, holes to the same
+ * bytes. To the decoder it is ordinary UTF-8.
+ */
+export const HOLE_TOKEN = "﷐ct:hole﷑";
 
 /** The record table (spec §5.2). Field names are the spec's. */
 export const RECORD_SCHEMA = [
@@ -275,6 +286,20 @@ export const RECORD_SCHEMA = [
       ["seq", "u64"],
       ["name", "str"],
       ["data", "str"],
+    ],
+  },
+  {
+    // §11.3.2: a declassifier's output (`output`, the canonical JSON of its
+    // return value), matched on replay by `fn_id` and `seq` and returned
+    // without running the function. 0x55 is left out on purpose: it is
+    // reserved for the opt-in escrow record (§11.3.7), which vocabulary 1
+    // does not define, so the decoder refuses it as `UnknownTag`.
+    tag: 0x54,
+    name: "Declassify",
+    fields: [
+      ["seq", "u64"],
+      ["fn_id", "str"],
+      ["output", "str"],
     ],
   },
   {

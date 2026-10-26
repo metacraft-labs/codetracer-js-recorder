@@ -44,27 +44,44 @@ function describe(node: Element | Document | Window | null): Resolution {
  * `input`); then the element's children; then `/`. A text or CDATA node is
  * `T` and the JSON of its data. `<script>` elements are left out whole;
  * comments, processing instructions, shadow roots, `<template>` contents
- * and frame documents are not part of the scheme.
+ * and frame documents are not part of the scheme. A sensitive field's value
+ * and `value` attribute are the hole token, and a sensitive `textarea`'s or
+ * editing host's text one `T` line of the token in place of its children
+ * (§7.3, §11.3.1, §5.2.1).
  */
 function domV1Text(): string {
   let text = "";
   const visit = (el: Element): void => {
     if (el.localName === "script") return;
+    const hidden = isSensitiveField(el);
+    const control =
+      el instanceof HTMLInputElement ||
+      el instanceof HTMLTextAreaElement ||
+      el instanceof HTMLSelectElement;
+    // A sensitive control's `value` attribute (its default value, which a
+    // framework may keep equal to the value) is the token too.
     const attributes = Array.from(el.attributes, (a): [string, string] => [
       a.name,
-      a.value,
+      hidden && control && a.name === "value" ? HOLE : a.value,
     ]);
     // String `<` compares UTF-16 code units; never localeCompare, whose
     // order depends on the browser's locale.
     attributes.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
     text += `E${JSON.stringify([el.localName, attributes])}\n`;
     if (el instanceof HTMLInputElement) {
-      text += `V${JSON.stringify([el.value, el.checked])}\n`;
+      text += `V${JSON.stringify([hidden ? HOLE : el.value, el.checked])}\n`;
     } else if (
       el instanceof HTMLTextAreaElement ||
       el instanceof HTMLSelectElement
     ) {
-      text += `V${JSON.stringify([el.value, false])}\n`;
+      text += `V${JSON.stringify([hidden ? HOLE : el.value, false])}\n`;
+      if (hidden && el instanceof HTMLTextAreaElement) {
+        text += `T${JSON.stringify(HOLE)}\n/\n`;
+        return;
+      }
+    } else if (hidden && el instanceof HTMLElement && el.isContentEditable) {
+      text += `T${JSON.stringify(HOLE)}\n/\n`;
+      return;
     }
     for (const child of Array.from(el.childNodes)) {
       if (child instanceof Element) visit(child);
@@ -78,6 +95,77 @@ function domV1Text(): string {
   if (document.documentElement !== null) visit(document.documentElement);
   return text;
 }
+
+/** The hole token (§5.2.1): U+FDD0, `ct:hole`, U+FDD1. */
+const HOLE = "\uFDD0ct:hole\uFDD1";
+
+/**
+ * Whether `el` is a sensitive field, by §11.3.1 read afresh: a credential
+ * field always; then the page's own declaration (`ct.public` /
+ * `ct.sensitive`, which the recorders keep in the page's shared
+ * sensitive-input state, read here as data); then `data-ct-sensitive`, then
+ * `data-ct-public`; then any free-text field. Written from the
+ * specification, sharing no code with the recorders' classifier.
+ */
+function isSensitiveField(el: Element): boolean {
+  const name = el.localName;
+  const type = (el.getAttribute("type") ?? "text").trim().toLowerCase();
+  const tokens = (el.getAttribute("autocomplete") ?? "")
+    .trim()
+    .toLowerCase()
+    .split(/\s+/);
+  if (name === "input" || name === "textarea") {
+    if (name === "input" && type === "password") return true;
+    if (
+      tokens.some(
+        (t) =>
+          t.startsWith("cc-") ||
+          t === "current-password" ||
+          t === "new-password" ||
+          t === "one-time-code",
+      )
+    ) {
+      return true;
+    }
+  }
+  const state = (
+    globalThis as unknown as Record<
+      symbol,
+      { marks?: WeakMap<Element, string> } | undefined
+    >
+  )[Symbol.for("codetracer.boundary.sensitive")];
+  const mark = state?.marks?.get(el);
+  if (mark !== undefined) return mark === "sensitive";
+  if (el.hasAttribute("data-ct-sensitive")) return true;
+  if (el.hasAttribute("data-ct-public")) return false;
+  if (name === "textarea") return true;
+  if (name === "input") return !NOT_TEXT.has(type);
+  return (
+    el instanceof HTMLElement &&
+    el.isContentEditable &&
+    !(el.parentElement?.isContentEditable ?? false)
+  );
+}
+
+/** The `input` types whose value is not free text (HTML's other states). */
+const NOT_TEXT = new Set([
+  "hidden",
+  "date",
+  "month",
+  "week",
+  "time",
+  "datetime-local",
+  "number",
+  "range",
+  "color",
+  "checkbox",
+  "radio",
+  "file",
+  "submit",
+  "image",
+  "reset",
+  "button",
+]);
 
 const probe = {
   domV1Text,

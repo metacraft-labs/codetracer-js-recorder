@@ -7,6 +7,16 @@
 import { type SeamContext, replaceAccessor, replaceValue } from "./context.js";
 import { TaskKind } from "./recorder.js";
 import { patchStorage } from "./seams-storage.js";
+import {
+  eventField,
+  fieldValue,
+  internally,
+  isEditingHostOrInside,
+  isValueField,
+  maskEventProps,
+  rememberSensitive,
+  sensitiveClass,
+} from "./sensitive.js";
 import { targetOf } from "./targets.js";
 
 /** Patch every seam this module owns. */
@@ -506,7 +516,7 @@ const INPUT_PROPS: readonly string[] = [
   "media",
 ];
 
-function eventProps(ev: Event): string {
+function eventProps(ev: Event): Record<string, unknown> {
   const props: Record<string, unknown> = {};
   const e = ev as unknown as Record<string, unknown>;
   for (const k of INPUT_PROPS) {
@@ -537,7 +547,7 @@ function eventProps(ev: Event): string {
     }
     props[k] = touches;
   }
-  return JSON.stringify(props);
+  return props;
 }
 
 /** `DomEffect.effect` (§5.2). */
@@ -556,21 +566,63 @@ const Effect = {
  * that already changed state, then `Task{kind: input}` and `Input` (§9.5's
  * order, at level 0). `name` is the target's name when it is no node or
  * window (a `MediaQueryList`'s `mql:<n>`).
+ *
+ * At a sensitive field (§11.3.1) the event's properties are masked
+ * (§11.3.3) and its value never written: a `Scrubbed{class, length}` takes
+ * the place of the value's `DomEffect`, and the value is remembered, so it
+ * is holed wherever the page sends it (§5.2.1).
  */
 export function recordInput(
   ctx: SeamContext,
   ev: Event,
   name = targetOf(ev.target),
 ): void {
-  const { rec } = ctx;
+  const { rec, sensitive: s } = ctx;
   rec.macrotask();
+  // The field the event belongs to, found through shadow trees: an event
+  // from inside one reaches these listeners retargeted to its host.
+  const { field, sensitive: masked } = eventField(s, ev);
+  if (masked && field !== null && isValueField(s, field)) {
+    // Holed wherever the page sends it, also once the field has changed or
+    // left the document (§5.2.1).
+    s.seen.add(field);
+    rememberSensitive(
+      s,
+      internally(s, () => fieldValue(s, field)),
+    );
+    // A contenteditable region has no value `DomEffect`; its text is
+    // still a sensitive value, whose shape a `Scrubbed` records and whose
+    // placeholder replay puts there (§11.3.3, §11.3.4).
+    if (
+      ev.type === "input" &&
+      !isFormControl(field) &&
+      isEditingHostOrInside(s, field)
+    ) {
+      rec.emit("Scrubbed", {
+        target: targetOf(field),
+        class: sensitiveClass(s, field),
+        length: internally(s, () => fieldValue(s, field)).length,
+      });
+    }
+  }
   for (const [effect, value] of domEffects(ctx, ev)) {
+    if (masked && effect === Effect.value) {
+      const v = String(value);
+      rememberSensitive(s, v);
+      rec.emit("Scrubbed", {
+        target: name,
+        class: sensitiveClass(s, field!),
+        length: v.length,
+      });
+      continue;
+    }
     rec.emit("DomEffect", {
       target: name,
       effect,
       value: JSON.stringify(value),
     });
   }
+  const props = eventProps(ev);
   const taskId = rec.nextTaskId();
   // Dispatched by the browser, not registered by the page: the task id is
   // minted here, and no TaskReg precedes it.
@@ -579,12 +631,18 @@ export function recordInput(
     task_id: taskId,
     type: ev.type,
     target: name,
-    props: eventProps(ev),
+    props: JSON.stringify(masked ? maskEventProps(props) : props),
     label: "",
   });
 }
 
 /** The state a default action has already changed when `ev` reaches the window. */
+/** Whether `el` is a form control with a `value` (not a contenteditable region). */
+function isFormControl(el: Element): boolean {
+  const name = el.localName;
+  return name === "input" || name === "textarea" || name === "select";
+}
+
 function domEffects(ctx: SeamContext, ev: Event): [number, unknown][] {
   const t = ev.target as Element | Document | null;
   const out: [number, unknown][] = [];

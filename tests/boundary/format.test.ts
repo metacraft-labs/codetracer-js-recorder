@@ -23,6 +23,7 @@ import {
   BoundaryFormatError,
   DECODE_ERROR_CODES,
   ENUM_VALUE_SETS,
+  HOLE_TOKEN,
   RECORD_SCHEMA,
   type BoundaryRecord,
   type Json,
@@ -156,6 +157,86 @@ describe("@codetracer/boundary-format", () => {
           .map((v) => v.want.termination),
       ),
     ).toEqual(new Set(["TruncatedUnterminated", "TruncatedMidRecord"]));
+  });
+
+  it("jsbound_declassify_vectors_decode_identically", () => {
+    // The sensitive-input additions (spec §5.2 `Declassify`, §5.2.1 the
+    // hole token, reserved tag 0x55), against the vectors the Rust side
+    // wrote and decodes in its own half of this test
+    // (`libs/jsbound/tests/vectors.rs`). Both decoders are compared with the
+    // same committed expectation files, so agreeing with them is agreeing
+    // with each other.
+    const vectors = loadVectors();
+    // Vacuity guard, before anything is decoded: by the `record` names of
+    // the expectation files, the valid vectors carry every record kind of
+    // the schema, `Declassify` included.
+    const kinds = new Set(
+      vectors
+        .filter((v) => v.class === "valid")
+        .flatMap((v) => v.want.records ?? [])
+        .map((r) => (r as { record: string }).record),
+    );
+    for (const d of RECORD_SCHEMA) expect(kinds, d.name).toContain(d.name);
+    expect(RECORD_SCHEMA.find((d) => d.tag === 0x54)?.name).toBe("Declassify");
+    expect(RECORD_SCHEMA.some((d) => (d.tag as number) === 0x55)).toBe(false);
+
+    const byName = (name: string): Vector => {
+      const v = vectors.find((x) => x.name === name);
+      expect(v, name).toBeDefined();
+      return v!;
+    };
+    for (const name of [
+      "declassify",
+      "net_request_holed",
+      "sensitive_session",
+    ]) {
+      const v = byName(name);
+      expect(v.class).toBe("valid");
+      // The decoder gives the Rust side's canonical JSON ...
+      expect(observe(v.data), name).toEqual(v.want);
+      // ... and the encoder, given the Rust side's records, its bytes.
+      const encoded = encodeLog(v.want.records!.map(recordFromJson));
+      expect(
+        Buffer.compare(Buffer.from(encoded), Buffer.from(v.data)),
+        `${name}: encoding the expected records reproduces the vector`,
+      ).toBe(0);
+    }
+    // The wire order of Declassify: seq, fn_id, output.
+    expect([
+      ...encodeFrame({
+        record: "Declassify",
+        seq: 1n,
+        fn_id: "f",
+        output: "1",
+      }),
+    ]).toEqual([
+      19, 0, 0, 0, 0x54, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0x66, 1, 0, 0, 0,
+      0x31,
+    ]);
+    // The holed request carries the 13-byte token, and its digest is over
+    // the holed body.
+    expect([...new TextEncoder().encode(HOLE_TOKEN)]).toEqual([
+      0xef, 0xb7, 0x90, 0x63, 0x74, 0x3a, 0x68, 0x6f, 0x6c, 0x65, 0xef, 0xb7,
+      0x91,
+    ]);
+    const holed = decodeLog(byName("net_request_holed").data).records[2];
+    expect(holed.record).toBe("NetRequest");
+    if (holed.record !== "NetRequest") return;
+    expect(holed.url).toContain(HOLE_TOKEN);
+    expect(holed.body_digest).toBe(
+      createHash("sha256")
+        .update(`{"user":"ada","pass":"${HOLE_TOKEN}"}`)
+        .digest("hex"),
+    );
+    // 0x55 is refused as UnknownTag, one byte from the Declassify vector,
+    // which decodes (the negative control).
+    const reserved = byName("reserved_tag_0x55");
+    expect(reserved.base).toBe("declassify");
+    expect(observe(reserved.data)).toEqual({ error: "UnknownTag" });
+    const base = byName("declassify").data;
+    expect(base.length).toBe(reserved.data.length);
+    expect(base.filter((b, i) => b !== reserved.data[i]).length).toBe(1);
+    expect(observe(base).termination).toBe("Complete");
   });
 
   it("every u8 field has exactly one value set", () => {

@@ -105,6 +105,14 @@ export interface RecorderOptions {
   checkpointDomDigest?: () => string;
   /** Where the frames go; absent, they are kept in memory (§10.4). */
   sink?: FrameSink;
+  /**
+   * Scrubs a record before it is encoded (§11.3.5, §5.2.1): the credential
+   * headers, the site's query keys and credential-shaped values in every
+   * URL, the holes of the sensitive values, the error template. Applied to
+   * every record but the fault's own `Refusal`, so nothing the recorder
+   * writes escapes it. Absent, records are written as given.
+   */
+  sanitize?: (record: BoundaryRecord) => BoundaryRecord;
 }
 
 export class Recorder {
@@ -451,7 +459,8 @@ export class Recorder {
       this.faultArmed = false;
       throw new Error("injected encoder fault");
     }
-    return encodeFrame(record);
+    const sanitize = this.opts.sanitize;
+    return encodeFrame(sanitize === undefined ? record : sanitize(record));
   }
 
   private noteClock(c: SeqFields<"Clock">): void {

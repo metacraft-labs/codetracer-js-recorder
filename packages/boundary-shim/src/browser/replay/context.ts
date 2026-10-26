@@ -12,12 +12,27 @@
 
 import type { ShimOriginals } from "../originals.js";
 import type { CtReplay } from "../replay-api.js";
+import {
+  currentSensitiveValues,
+  holeText,
+  type SensitiveState,
+  sensitiveState,
+} from "../sensitive.js";
 import type { TrustedEvents } from "./trusted.js";
 
 export interface ReplayContext {
   w: Window & typeof globalThis;
+  /**
+   * The runner's cursor, as the seams use it: a request's or a navigation's
+   * URL is holed with the replay's own sensitive values (its placeholders)
+   * before it is compared, as the recorder holed the visitor's (§5.2.1).
+   */
   replay: CtReplay;
   orig: ShimOriginals;
+  /** Which fields are sensitive, and the placeholders they hold (§11.3). */
+  sensitive: SensitiveState;
+  /** The sensitive values to hole now: the replay's placeholders (§5.2.1). */
+  holes(): readonly string[];
   /** A fresh `task_id`, as the recorder would have minted it. */
   nextTaskId(): bigint;
   /** A fresh `req_id`. */
@@ -64,10 +79,14 @@ export function newReplayContext(
 ): ReplayContext {
   let nextTask = 1n;
   let nextReq = 1n;
+  const sensitive = sensitiveState(w);
+  const holes = () => currentSensitiveValues(w, sensitive);
   return {
     w,
-    replay,
+    replay: holingCursor(replay, holes),
     orig: replay.originals,
+    sensitive,
+    holes,
     nextTaskId: () => nextTask++,
     nextReqId: () => nextReq++,
     claimTaskId(logged) {
@@ -90,6 +109,35 @@ export function newReplayContext(
     notifications: new Map(),
     injection: { event: undefined, depth: Infinity },
   };
+}
+
+/** The record kinds whose `url` is a checked field the recorder holed (§5.2.1). */
+const HOLED_URL_KINDS: ReadonlySet<string> = new Set([
+  "NetRequest",
+  "Navigation",
+]);
+
+/**
+ * `replay` with its `next` holing the `url` it is asked to compare (a
+ * request's, a navigation's) with `holes()`, as the recorder holed the URL
+ * it logged; every other member is `replay`'s own.
+ */
+function holingCursor(
+  replay: CtReplay,
+  holes: () => readonly string[],
+): CtReplay {
+  const cursor = Object.create(replay) as CtReplay;
+  Object.defineProperty(cursor, "next", {
+    value: (kind: string, checked?: Record<string, unknown>) => {
+      const url = checked?.url;
+      const holed =
+        HOLED_URL_KINDS.has(kind) && typeof url === "string"
+          ? { ...checked, url: holeText(url, holes()) }
+          : checked;
+      return (replay.next as (k: string, c?: unknown) => unknown)(kind, holed);
+    },
+  });
+  return cursor;
 }
 
 /** The IEEE-754 double whose bits are `bits` (`Clock.bits`, §5.2). */

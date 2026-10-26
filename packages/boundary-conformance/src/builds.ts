@@ -79,8 +79,26 @@ function prepare(outDir: string): void {
   }
 }
 
+/** Faults a generic build can carry (the suite's own falsifiers). */
+export interface GenericFaults {
+  /**
+   * The sensitive fixtures read the raw sensitive value outside a
+   * declassifier and branch a request's URL on its first character: the
+   * non-interference leg must fail (§11.3.6).
+   */
+  leakRawRead?: boolean;
+}
+
+/** The esbuild `define` of the fixture apps for the raw-read fault. */
+function appDefines(leakRawRead: boolean | undefined): Record<string, string> {
+  return { __CT_FX_LEAK__: leakRawRead === true ? "true" : "false" };
+}
+
 /** Write the generic build of every fixture into the empty `outDir`. */
-export async function buildGenericFixtures(outDir: string): Promise<void> {
+export async function buildGenericFixtures(
+  outDir: string,
+  faults: GenericFaults = {},
+): Promise<void> {
   prepare(outDir);
   for (const name of PAGE_FIXTURES) {
     const dir = path.join(outDir, name);
@@ -88,6 +106,7 @@ export async function buildGenericFixtures(outDir: string): Promise<void> {
     await bundle(
       path.join(SRC, "generic", "apps", `${name}.ts`),
       path.join(dir, "app.js"),
+      appDefines(faults.leakRawRead),
     );
     const head = DEFERRED_HYDRATION.has(name) ? GENERIC_QUEUE_SCRIPT : "";
     fs.writeFileSync(
@@ -134,6 +153,7 @@ export async function buildReferenceFixtures(
     await bundle(
       path.join(SRC, "reference", "apps", `${name}.ts`),
       path.join(dir, "app.js"),
+      appDefines(defects.leakRawRead),
     );
     const htmlAttributes = DEFERRED_HYDRATION.has(name)
       ? `data-ref-hydration="deferred"`

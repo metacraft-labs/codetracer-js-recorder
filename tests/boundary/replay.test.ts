@@ -873,6 +873,11 @@ describe("conformance replay leg", () => {
         "prehydration",
         "client-nodes",
         "navigation",
+        // The fixtures with sensitive fields (§11.3.6) take part in every
+        // leg.
+        "sensitive-login",
+        "sensitive-email",
+        "sensitive-pin",
       ];
 
       const level1 = runReplayCli(reference, 1);

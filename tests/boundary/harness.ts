@@ -265,6 +265,21 @@ export async function startFixtureServer(
         res.end(JSON.stringify({ value: 42 }));
         return;
       }
+      if (pathname === "/api/headers") {
+        // Response headers the recorder must scrub (§11.3.5): the
+        // credentials a response can carry, a proxy header, a header a site
+        // lists, and one it must keep.
+        res.writeHead(200, {
+          "content-type": "application/json",
+          authorization: "Bearer resp-authz-6f2b9c41",
+          cookie: "resp-cookie=7d3e0a55",
+          "proxy-authenticate": "Basic realm=proxy-realm-8a1c",
+          "x-site-secret": "site-secret-4e9d21",
+          "x-plain": "plain-header-value-77",
+        });
+        res.end(JSON.stringify({ value: 1 }));
+        return;
+      }
       if (pathname === "/api/echo") {
         res.writeHead(200, { "content-type": "text/plain" });
         res.end(body);

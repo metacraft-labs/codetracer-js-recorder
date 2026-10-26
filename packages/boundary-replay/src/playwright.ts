@@ -90,6 +90,11 @@ export interface Page {
     text: string,
     options?: { timeout?: number },
   ): Promise<void>;
+  /** Key presses at the focused element (Playwright's `page.keyboard`). */
+  keyboard: { press(key: string): Promise<void> };
+  /** The pointer (Playwright's `page.mouse`). */
+  mouse: { move(x: number, y: number): Promise<void> };
+  focus(selector: string, options?: { timeout?: number }): Promise<void>;
   evaluate<T>(fn: string | (() => T)): Promise<T>;
   evaluate<T, A>(fn: (arg: A) => T, arg: A): Promise<T>;
   on(event: "pageerror", f: (e: Error) => void): void;
