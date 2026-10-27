@@ -145,7 +145,7 @@ This is a monorepo managed with npm workspaces:
 * Sensitive inputs (`packages/boundary-shim/src/browser/sensitive.ts`): which
   field is sensitive, the shape-preserving placeholders, the hole token's
   substitution, event masking and the page's `ct` API (`public`,
-  `sensitive`, `declassify`). One module for record and replay, the shim and
+  `sensitive`, `declassify`, `mark`). One module for record and replay, the shim and
   the reference framework; its state lives on the window under a registered
   symbol because the recorder, the replay shim, the replay runtime and a
   framework are separate bundles. Every record is scrubbed before it is
@@ -164,6 +164,15 @@ This is a monorepo managed with npm workspaces:
   sensitive field's value, its `value` attribute and a sensitive textarea's
   text: frameworks mirror a controlled field's value into the DOM. Pinned by
   `tests/boundary/sensitive.test.ts`.
+* What a level-0 page declares for its session's narrative
+  (`packages/boundary-shim/src/browser/declarations.ts`): its experiment arms
+  (`data-ct-arms` on the document element, written as `Env.arms`), its
+  controls' labels (`data-ct-label` on an element or an ancestor, written as
+  `Input.label`) and its marks (`ct.mark(name, data)`, written as `Mark`; not
+  logged inside a declassifier's body; a no-op on replay, which skips
+  marks). The shim reads only these declarations, never the page's text, and
+  holes a label and a mark like a URL. Pinned by
+  `tests/boundary/declarations.test.ts`.
 * `packages/boundary-replay` — the replay runner of boundary recording:
   `ct-boundary-replay --log <recording.ct|jsbound.log> --build <dir> [--out
   <trace.ct>]` replays a recorded log in headless Chromium against the build

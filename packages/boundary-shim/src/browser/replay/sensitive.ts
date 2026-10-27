@@ -113,7 +113,9 @@ export function replaySensitive(ctx: ReplayContext): CtApi {
     );
   }
 
-  // Declassifiers: the logged output, the body not run (§11.3.2).
+  // Declassifiers: the logged output, the body not run (§11.3.2). Marks:
+  // checked as on record and otherwise ignored, as the cursor skips them
+  // (§13).
   return makeCtApi(w, s, (id) => {
     const r = replay.next("Declassify", { fn_id: id });
     return JSON.parse(r.output) as unknown;

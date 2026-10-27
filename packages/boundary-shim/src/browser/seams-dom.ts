@@ -5,6 +5,7 @@
  */
 
 import { type SeamContext, replaceAccessor, replaceValue } from "./context.js";
+import { declaredLabel } from "./declarations.js";
 import { TaskKind } from "./recorder.js";
 import { patchStorage } from "./seams-storage.js";
 import {
@@ -632,7 +633,8 @@ export function recordInput(
     type: ev.type,
     target: name,
     props: JSON.stringify(masked ? maskEventProps(props) : props),
-    label: "",
+    // The page's own `data-ct-label`, never its text (§9.4, §13).
+    label: declaredLabel(ev.target),
   });
 }
 

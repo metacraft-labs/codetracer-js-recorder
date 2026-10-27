@@ -25,6 +25,7 @@ import {
   type ShimConfig,
 } from "./config.js";
 import type { SeamContext, ShimWindow } from "./context.js";
+import { declaredArms } from "./declarations.js";
 import { domV1Hash } from "./dom-v1.js";
 import { recordDocumentProgress } from "./document-progress.js";
 import { captureOriginals, type ShimOriginals } from "./originals.js";
@@ -259,7 +260,19 @@ export function installBoundaryShim(
     listenForPageEvents(ctx, () => rec.end(EndReason.pagehide, true)),
   );
   rec.guard(() => listenForPageErrors(ctx));
-  const ct = makeCtApi(w, sensitive, recordDeclassifier(ctx));
+  // A mark made inside a declassifier's body is part of that body, which
+  // replay does not run, and could carry what the body was given: it is not
+  // logged. One depth for both, so they agree on what "inside" is.
+  const declassifying = { depth: 0 };
+  const ct = makeCtApi(
+    w,
+    sensitive,
+    recordDeclassifier(ctx, declassifying),
+    (name, data) => {
+      if (!rec.recording || declassifying.depth > 0) return;
+      rec.guard(() => rec.emit("Mark", { name, data }));
+    },
+  );
   publishCtApi(w, ct);
 
   const inMemory = <T>(read: () => T): T => {
@@ -316,20 +329,22 @@ export function installBoundaryShim(
  * run. An output that is not JSON data, or a declassifier that throws, is
  * refused (`unrecordable-declassifier`, §7.5): the log could not return it.
  */
-function recordDeclassifier(ctx: SeamContext): Parameters<typeof makeCtApi>[2] {
+function recordDeclassifier(
+  ctx: SeamContext,
+  declassifying: { depth: number },
+): Parameters<typeof makeCtApi>[2] {
   const { rec } = ctx;
-  let depth = 0;
   return (id, fn, self, args) => {
-    if (!rec.recording || depth > 0) return fn.apply(self, args);
+    if (!rec.recording || declassifying.depth > 0) return fn.apply(self, args);
     let out: unknown;
-    depth++;
+    declassifying.depth++;
     try {
       out = fn.apply(self, args);
     } catch (e) {
       ctx.refuseOnce(UNRECORDABLE_DECLASSIFIER, `${id} threw`);
       throw e;
     } finally {
-      depth--;
+      declassifying.depth--;
     }
     rec.guard(() => {
       const output = canonicalOutput(out);
@@ -433,7 +448,9 @@ export function readEnvironment(w: ShimWindow, orig: ShimOriginals) {
         ? 1
         : 0,
     reduced_motion: media("(prefers-reduced-motion: reduce)") ? 1 : 0,
-    arms: "{}",
+    // The experiment arms the server rendered the page for (§13), from the
+    // document element's `data-ct-arms`.
+    arms: declaredArms(w.document),
     // The whole URL, query and fragment included: the page reads them
     // (`location.search`, `location.hash`), and replay loads the page at
     // this URL (§5.2, §7.4). `meta.dat`'s `program` leaves them out (§5.1).

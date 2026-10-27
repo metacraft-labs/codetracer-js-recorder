@@ -795,7 +795,31 @@ export interface CtApi {
     fn: (...args: A) => R,
     options?: DeclassifyOptions,
   ): (...args: A) => R;
+  /**
+   * Record a narrative mark (§13): `Mark{name, data}`, `data` the canonical
+   * JSON of `data` (default `null`). Experiment events are marks named
+   * `exposure:<experiment>` and `conversion:<goal>`. A name that is not a
+   * non-empty string of at most {@link MAX_MARK_NAME} characters, or data
+   * that is not JSON data or whose JSON is longer than
+   * {@link MAX_MARK_DATA} characters, throws in every mode, so a page
+   * behaves the same on record and on replay. Replay ignores marks, so on
+   * replay a valid call does nothing.
+   */
+  mark(name: string, data?: unknown): void;
 }
+
+/** The longest `Mark.name` a page may write, in UTF-16 code units. */
+export const MAX_MARK_NAME = 256;
+
+/** The longest `Mark.data` a page may write: its JSON, in UTF-16 code units. */
+export const MAX_MARK_DATA = 4096;
+
+/**
+ * What a mode does with a mark the page made, given its checked name and the
+ * canonical JSON of its data: record logs it as `Mark`; replay, and the inert
+ * API published when nothing is recorded, do nothing.
+ */
+export type MarkCall = (name: string, data: string) => void;
 
 /**
  * What a mode supplies to the API: how a call of a registered declassifier
@@ -820,18 +844,37 @@ function asElement(
 }
 
 /**
- * The page's `ct` API on `w`'s state, its declassifiers run by `call`. The
- * registration rules (an empty or duplicate id throws) and the declarations
- * are the same in every mode, so a page behaves the same on record and on
- * replay.
+ * The page's `ct` API on `w`'s state, its declassifiers run by `call` and its
+ * marks handed to `markCall`. The registration rules (an empty or duplicate
+ * id throws), the marks' checks and the declarations are the same in every
+ * mode, so a page behaves the same on record and on replay.
  */
 export function makeCtApi(
   w: Window & typeof globalThis,
   s: SensitiveState,
   call: DeclassifierCall,
+  markCall: MarkCall = () => undefined,
 ): CtApi {
   const ids = new Set<string>();
   return {
+    mark(name: string, data?: unknown): void {
+      if (
+        typeof name !== "string" ||
+        name === "" ||
+        name.length > MAX_MARK_NAME
+      ) {
+        throw new TypeError(
+          `ct.mark() takes a non-empty name of at most ${MAX_MARK_NAME} characters`,
+        );
+      }
+      const json = canonicalOutput(data === undefined ? null : data);
+      if (json === undefined || json.length > MAX_MARK_DATA) {
+        throw new TypeError(
+          `ct.mark() takes data that is JSON data of at most ${MAX_MARK_DATA} characters`,
+        );
+      }
+      markCall(name, json);
+    },
     public(el: Element): Element {
       const e = asElement(w, el, "public");
       if (credentialClass(s, e) !== undefined) {

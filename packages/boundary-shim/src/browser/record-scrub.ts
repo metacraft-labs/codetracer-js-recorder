@@ -17,7 +17,9 @@
  * - `NetResponse.headers`: the credential, proxy and site-listed headers
  *   removed;
  * - `Error.message`: the sensitive values holed, then reduced to its
- *   template.
+ *   template;
+ * - the page's own words, `Input.label` and `Mark` (its name and every
+ *   string of its data): the sensitive values holed.
  *
  * A request body is never in the log (only its holed digest, which the seam
  * computes), and an outbound message's bytes are holed by the seam.
@@ -73,8 +75,20 @@ export function sanitizeRecord(
     case "DocTask":
       return { ...r, src: url(r.src) };
     case "Input":
-      if (r.type !== "storage") return r;
-      return { ...r, props: mapJsonUrls(r.props, url, (k) => k === "url") };
+      if (r.type !== "storage") {
+        // A label is the page's own declaration (§9.4), but a page could
+        // write what the visitor typed into it.
+        return r.label === "" ? r : { ...r, label: holed(r.label) };
+      }
+      return {
+        ...r,
+        label: r.label === "" ? r.label : holed(r.label),
+        props: mapJsonUrls(r.props, url, (k) => k === "url"),
+      };
+    case "Mark":
+      // The page's own words (§13), which may quote what the visitor typed:
+      // the name, and every string of the data, holed.
+      return { ...r, name: holed(r.name), data: mapJsonStrings(r.data, holed) };
     case "PlatformValue":
       // A MutationObserver's records are compared with the replay's own,
       // which no scrubbing reproduces; they hold the document's own text.
@@ -127,6 +141,36 @@ function mapJsonUrls(
     return x;
   };
   const mapped = walk(v, "");
+  return changed ? JSON.stringify(mapped) : json;
+}
+
+/**
+ * `json` with every string in it (keys excepted) mapped by `f`, written
+ * again only when one changed; text that is not JSON is mapped as a whole.
+ */
+function mapJsonStrings(json: string, f: (s: string) => string): string {
+  let v: unknown;
+  try {
+    v = JSON.parse(json);
+  } catch {
+    return f(json);
+  }
+  let changed = false;
+  const walk = (x: unknown): unknown => {
+    if (typeof x === "string") {
+      const y = f(x);
+      if (y !== x) changed = true;
+      return y;
+    }
+    if (Array.isArray(x)) return x.map(walk);
+    if (x !== null && typeof x === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, e] of Object.entries(x)) out[k] = walk(e);
+      return out;
+    }
+    return x;
+  };
+  const mapped = walk(v);
   return changed ? JSON.stringify(mapped) : json;
 }
 
