@@ -539,6 +539,7 @@ export function installReplayRuntime(
     checked: CheckedFields<K> = {},
   ): RecordOf<K> => {
     guard();
+    takeScriptStart();
     const r = current();
     const actual = `${kind}{${Object.entries(checked)
       .map(([k, v]) => `${k}=${describeValue(v)}`)
@@ -593,6 +594,7 @@ export function installReplayRuntime(
   };
 
   const peekAt = (offset: number): RecordView => {
+    takeScriptStart();
     let i = skipMarks(at);
     for (let n = 0; n < offset; n++) i = skipMarks(i + 1);
     return view(i);
@@ -668,12 +670,15 @@ export function installReplayRuntime(
   let gateHeld: number | undefined;
   let gates = 0;
   /**
-   * The document task the scheduler let go and waits for: a script (and
-   * whether its `DocTask` is still to be taken when it settles), or one of
-   * the two events.
+   * The document task the scheduler let go and waits for: a script, or one
+   * of the two events, or a resource's event. A script's `take` says where
+   * its `[Loading]DocTask` is still to be taken, when the scheduler let it
+   * go before taking them: `settle`, when it settles (`DocTask` 4), or
+   * `firstRecord`, at its first record (`DocTask` 1, {@link takeScriptStart}),
+   * which is where the recorder measured that `Loading`.
    */
   let awaiting:
-    | { kind: "script"; src: string; takeAtSettle: boolean }
+    | { kind: "script"; src: string; take?: "settle" | "firstRecord" }
     | { kind: "domContentLoaded" | "load" }
     | { kind: "resource"; target: string; event: string }
     | undefined;
@@ -716,6 +721,29 @@ export function installReplayRuntime(
     return true;
   };
 
+  /**
+   * Before the page reads the cursor: when the scheduler let a script go
+   * whose `[Loading]DocTask 1` it could not take first (`moveDocumentOn`),
+   * take them now if this read is the script's first record, as the
+   * recorder wrote them (`RecorderProgress.beforeRecord`: before the first
+   * record the script writes while `document.currentScript` names it),
+   * comparing the position here, after what the script changed before it.
+   */
+  const takeScriptStart = (): void => {
+    const a = awaiting;
+    if (failed !== undefined || a?.kind !== "script") return;
+    if (a.take !== "firstRecord") return;
+    const s = progress.currentExternalScript();
+    if (s === undefined || srcOf(s) !== a.src) return;
+    a.take = undefined;
+    if (!takeDocTask(1, a.src)) {
+      fail(
+        "TaskOrderMismatch",
+        `the script ${a.src} wrote its first record, but the log's next document task is not its execution`,
+      );
+    }
+  };
+
   progress.listen(orig.addEventListener, {
     scriptSettled(script) {
       const src = srcOf(script);
@@ -724,17 +752,23 @@ export function installReplayRuntime(
         awaiting?.kind === "script" &&
         awaiting.src === src
       ) {
-        if (awaiting.takeAtSettle) {
-          try {
-            if (!takeDocTask(4, src)) {
-              fail(
-                "TaskOrderMismatch",
-                `the script ${src} ran, but the log's next document task is not its execution`,
-              );
-            }
-          } catch (e) {
-            if (!(e instanceof Divergence)) throw e;
+        try {
+          if (awaiting.take === "settle" && !takeDocTask(4, src)) {
+            fail(
+              "TaskOrderMismatch",
+              `the script ${src} ran, but the log's next document task is not its execution`,
+            );
           }
+          if (awaiting.take === "firstRecord") {
+            // The log has the script write a record while it ran; this run
+            // wrote none.
+            fail(
+              "TaskOrderMismatch",
+              `the script ${src} ran without writing the record the log has it write first`,
+            );
+          }
+        } catch (e) {
+          if (!(e instanceof Divergence)) throw e;
         }
         awaiting = undefined;
       }
@@ -1276,6 +1310,15 @@ export function installReplayRuntime(
     return undefined;
   };
 
+  /**
+   * The script whose execution (`DocTask` 1) is the record at `from` (marks
+   * aside), if it is one.
+   */
+  const scriptStartAfter = (from: number): string | undefined => {
+    const r = records[skipMarks(from)];
+    return r?.record === "DocTask" && r.kind === 1 ? r.src : undefined;
+  };
+
   /** The `DocTask` at the cursor: let the document run that task. */
   const letDocTaskGo = (r: RecordOf<"DocTask">): Step => {
     at++;
@@ -1303,7 +1346,7 @@ export function installReplayRuntime(
       return "wait";
     }
     if (r.kind === 1 || r.kind === 4) {
-      awaiting = { kind: "script", src: r.src, takeAtSettle: false };
+      awaiting = { kind: "script", src: r.src };
       openScript(r.src);
       // A parser-inserted script the parser has not reached yet: the parser
       // must get to it, past the gate it waits at.
@@ -1364,8 +1407,25 @@ export function installReplayRuntime(
       "script" in work &&
       (heldScripts.get(work.script) ?? 0) > 0
     ) {
-      awaiting = { kind: "script", src: work.script, takeAtSettle: true };
+      awaiting = { kind: "script", src: work.script, take: "settle" };
       openScript(work.script);
+      return "wait";
+    }
+    // A `Loading` followed by a held script's `DocTask` 1 was measured at
+    // the script's first record, so it counts what the script changed
+    // before it (an application shell that renders, then reads the clock):
+    // with the parser held at the script, or the document parsed, only the
+    // script can bring the document there. Let it go, when it is in the
+    // document and has not run, and take the `Loading` with its `DocTask`
+    // at its first record (`takeScriptStart` checks the position then).
+    const start = target === undefined ? undefined : scriptStartAfter(at + 1);
+    if (
+      start !== undefined &&
+      (heldScripts.get(start) ?? 0) > 0 &&
+      progress.pendingScripts().some((s) => srcOf(s) === start)
+    ) {
+      awaiting = { kind: "script", src: start, take: "firstRecord" };
+      openScript(start);
       return "wait";
     }
     const stuck = (why: string): never =>
@@ -1522,6 +1582,10 @@ export function installReplayRuntime(
     kick();
     if (failed !== undefined || gateHeld !== undefined) return;
     if (progress.state !== "loading") return;
+    // The `Loading` at the cursor is that of a script the scheduler let go
+    // (`take: "firstRecord"`): the script brings the document there, never
+    // the parser, which the script (an `async` one) may let run first.
+    if (awaiting?.kind === "script" && awaiting.take === "firstRecord") return;
     const r = current();
     if (r?.record !== "Loading" || r.phase !== 1) return;
     if (!progress.at(r)) return;
@@ -1655,6 +1719,7 @@ export function installReplayRuntime(
     },
     takePosition() {
       guard();
+      takeScriptStart();
       const r = current();
       if (r?.record !== "Loading") return true;
       if (!progress.at(r)) return false;
@@ -1666,6 +1731,13 @@ export function installReplayRuntime(
     },
     takeDueTask(taskId) {
       if (failed !== undefined) return false;
+      try {
+        takeScriptStart();
+      } catch (e) {
+        // Latched; the scheduler reports it.
+        if (!(e instanceof Divergence)) throw e;
+        return false;
+      }
       const i = skipMarks(at);
       const loading = records[i];
       if (loading?.record !== "Loading") return false;

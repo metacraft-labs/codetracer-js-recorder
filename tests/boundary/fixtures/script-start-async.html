@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>an async script that changes the document while the parser waits for another</title>
+  </head>
+  <body>
+    <ul id="out"></ul>
+    <div id="host"></div>
+    <script async src="script-start.js"></script>
+    <script src="script-start-hold.js?delay=400"></script>
+    <p id="after">markup the parser inserts after the slow script</p>
+  </body>
+</html>

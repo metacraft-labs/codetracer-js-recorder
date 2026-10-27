@@ -17,7 +17,9 @@
 //   `value` attribute, and a `textarea` whose value it mirrors into its
 //   default value (its text), as frameworks keep controlled fields, under a
 //   `MutationObserver` with old values; and the undeclared `contenteditable`
-//   region `ed`.
+//   region `ed`. The script makes both fields itself, as an application
+//   shell renders before its first boundary read (the observer), so its
+//   execution is logged at a position that counts them.
 (function () {
   var kase = new URLSearchParams(location.search).get("case");
   var $ = function (id) {
@@ -68,11 +70,16 @@
     $("status").textContent = String(Math.random());
   });
   if (kase === "mirror") {
-    var mir = $("mir");
+    var mir = document.createElement("input");
+    mir.id = "mir";
+    mir.type = "text";
+    $("mirrors").appendChild(mir);
+    var ta = document.createElement("textarea");
+    ta.id = "ta";
+    $("mirrors").appendChild(ta);
     mir.addEventListener("input", function () {
       mir.setAttribute("value", mir.value);
     });
-    var ta = $("ta");
     ta.addEventListener("input", function () {
       ta.defaultValue = ta.value;
     });

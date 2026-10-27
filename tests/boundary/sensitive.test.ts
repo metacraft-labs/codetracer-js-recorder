@@ -738,6 +738,16 @@ describe("sensitive inputs on the record-and-replay route", () => {
           ),
         )
         .join("\n");
+      // The script made both fields before its first record (the
+      // observer's TaskReg), so its execution follows a Loading that
+      // counts them, which only the script brings the replay to.
+      const start = indexWhere(
+        records,
+        "DocTask",
+        (d) => d.kind === 1 && d.src.endsWith("/sensitive.js"),
+      );
+      expect(records[start - 1].record).toBe("Loading");
+      expect(records[start + 1]).toMatchObject({ record: "TaskReg", kind: 10 });
       // Vacuity guard: the page's observer records of the mirrored fields
       // are in the log (holed) ...
       expect(

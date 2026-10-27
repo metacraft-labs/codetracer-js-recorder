@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>an async script that changes the document after DOMContentLoaded</title>
+  </head>
+  <body>
+    <ul id="out"></ul>
+    <div id="host"></div>
+    <script async src="script-start.js?delay=400"></script>
+    <p id="after">markup the parser inserts before the script arrives</p>
+  </body>
+</html>

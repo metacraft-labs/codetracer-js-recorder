@@ -258,7 +258,14 @@ This is a monorepo managed with npm workspaces:
   `<script>` leaves the tree as it was, so a task released while the document
   parses sees the text it saw on record; a position inside a run of text
   (the network cut it) is a typed divergence (`TaskOrderMismatch`). Pinned by
-  `tests/boundary/replay-loading-text.test.ts`. A gate runs at almost every
+  `tests/boundary/replay-loading-text.test.ts`. An external script's
+  `DocTask` 1 and the `Loading` before it are written at the script's first
+  record, so the position counts what the script changed before it; replay
+  lets such a script go where the parser waits for it and takes the two at
+  its first read (`takeScriptStart`); one that settles without that read,
+  or an `async` one run while the parser waited for the network (nothing
+  holds the replay's parser there), is a typed divergence at that
+  `Loading`. Pinned by `tests/boundary/replay-script-start.test.ts`. A gate runs at almost every
   token boundary, so nothing it does may cost the size of the document:
   while the document parses the position is counted from its mutation
   records (`src/browser/parse-census.ts`, held to the whole-document count,
