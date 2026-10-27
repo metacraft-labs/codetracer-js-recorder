@@ -190,6 +190,8 @@ export class Recorder {
     // Reserve before calling the sink, which may synchronously fault this
     // session after accepting the frame. Its Refusal needs the following seq.
     const frame = this.encode(record);
+    // Sanitization is a public callback and may halt or fault the session.
+    if (!this.recording) return;
     const seq = this.nextSeq;
     this.nextSeq += 1n;
     try {
@@ -335,6 +337,7 @@ export class Recorder {
       // An encoding failure still faults an active session. Once encoded,
       // close before delivery: terminal sink callbacks must not append records.
       const frame = this.encode(end);
+      if (!this.recording) return;
       this.state = "ended";
       const sink = this.opts.sink;
       if (sink === undefined) {
@@ -376,12 +379,15 @@ export class Recorder {
     try {
       const detail = describe(error);
       try {
-        this.push({
+        // A broken sanitizer must not suppress the fault fallback. Keep the
+        // real encoder (including its fault seam), bypass only sanitization.
+        const refusal = {
           record: "Refusal",
           seq: this.nextSeq,
           feature: RECORDER_FAULT,
           detail,
-        } as BoundaryRecord);
+        } as BoundaryRecord;
+        this.append(this.encode(refusal, false), this.nextSeq);
         this.nextSeq += 1n;
       } catch {
         // The encoder cannot write even the refusal: the log simply stops.
@@ -442,7 +448,9 @@ export class Recorder {
   }
 
   private push(record: BoundaryRecord): void {
-    this.append(this.encode(record), "seq" in record ? record.seq : undefined);
+    const frame = this.encode(record);
+    if (!this.recording) return;
+    this.append(frame, "seq" in record ? record.seq : undefined);
   }
 
   private append(frame: Uint8Array, seq: bigint | undefined): void {
@@ -454,12 +462,12 @@ export class Recorder {
     }
   }
 
-  private encode(record: BoundaryRecord): Uint8Array {
+  private encode(record: BoundaryRecord, scrub = true): Uint8Array {
     if (this.faultArmed) {
       this.faultArmed = false;
       throw new Error("injected encoder fault");
     }
-    const sanitize = this.opts.sanitize;
+    const sanitize = scrub ? this.opts.sanitize : undefined;
     return encodeFrame(sanitize === undefined ? record : sanitize(record));
   }
 
