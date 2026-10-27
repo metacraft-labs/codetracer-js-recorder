@@ -17,6 +17,10 @@ import {
   privacySignal,
   type TransportStatus,
 } from "@codetracer/runtime-browser/dist/batch-transport.js";
+import {
+  readPageTraceContext,
+  timelineThrough,
+} from "@codetracer/runtime-browser/dist/trace-context.js";
 
 import {
   CONTROL_GLOBAL,
@@ -407,6 +411,12 @@ function u32(v: number): number {
  * logged as the page's (a cooperating framework that records natively
  * reads it the same way). `color_scheme` is 0 (no preference), 1 (light) or
  * 2 (dark); `reduced_motion` is 1 when the user asked for reduced motion.
+ * `traceparent` is the W3C trace context of the server-rendered response
+ * (`readPageTraceContext`, the reader the browser error reporter uses): a
+ * `<meta name="traceparent">` the parser has already put in the document
+ * (one before the bootstrap), else the navigation's `Server-Timing`
+ * `traceparent` entry, read through the captured original; empty when
+ * neither is a well-formed one.
  */
 export function readEnvironment(w: ShimWindow, orig: ShimOriginals) {
   const nav = w.navigator;
@@ -456,6 +466,10 @@ export function readEnvironment(w: ShimWindow, orig: ShimOriginals) {
     // this URL (§5.2, §7.4). `meta.dat`'s `program` leaves them out (§5.1).
     url: w.location.href,
     referrer_origin: referrerOrigin,
-    traceparent: "",
+    traceparent:
+      readPageTraceContext(
+        w.document,
+        timelineThrough(w.performance, orig.getEntriesByType),
+      )?.value ?? "",
   };
 }

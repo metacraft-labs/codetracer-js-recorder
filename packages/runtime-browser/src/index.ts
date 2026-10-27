@@ -928,3 +928,14 @@ export function installBrowserRuntime(
 // §11.1) lives in its own module so the boundary shim's bundle can import it
 // without the `__ct` runtime above (`@codetracer/runtime-browser/dist/batch-transport.js`).
 export * from "./batch-transport.js";
+
+// ── Browser error reports ───────────────────────────────────────────────
+//
+// The opt-in error reporter (uncaught errors and unhandled rejections become
+// scrubbed reports, uploaded only with the page's consent and never under Do
+// Not Track or Global Privacy Control) and the server-rendered response's
+// W3C trace context it attaches. Each is its own module, importable by its
+// subpath like the transport.
+export * from "./error-report.js";
+export * from "./trace-context.js";
+export * from "./error-frames.js";

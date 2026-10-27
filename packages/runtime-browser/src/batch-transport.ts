@@ -262,6 +262,13 @@ export interface TransportOriginals {
   mathRandom: () => number;
   performanceNow: (() => number) | undefined;
   /**
+   * `Performance.prototype.getEntriesByType`, called with the window's
+   * `performance` as `this`: a boundary shim logs the page's reads of the
+   * performance timeline, and the error reporter's read of the navigation
+   * entry (its `Server-Timing` trace context) is not one of them.
+   */
+  getEntriesByType: Performance["getEntriesByType"] | undefined;
+  /**
    * `Document.prototype.visibilityState`'s accessor: a boundary shim logs
    * the page's reads of it (record) or answers them from the log (replay),
    * and the transport's own read, when the page is hidden, is neither.
@@ -276,6 +283,7 @@ function moduleOriginals(): TransportOriginals {
     EventTarget?: { prototype: EventTarget };
     Document?: { prototype: Document };
     performance?: { now?: () => number };
+    Performance?: { prototype: Performance };
   };
   const visibility =
     g.Document === undefined
@@ -294,6 +302,7 @@ function moduleOriginals(): TransportOriginals {
     Promise,
     mathRandom: Math.random,
     performanceNow: g.performance?.now,
+    getEntriesByType: g.Performance?.prototype.getEntriesByType,
     visibilityState:
       visibility?.get === undefined ? undefined : { descriptor: visibility },
   };
@@ -344,6 +353,7 @@ export function resolveTransportOriginals(
     Promise: pick("Promise"),
     mathRandom: pick("mathRandom"),
     performanceNow: pick("performanceNow"),
+    getEntriesByType: pick("getEntriesByType"),
     visibilityState: pick("visibilityState"),
   };
 }

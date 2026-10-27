@@ -142,11 +142,14 @@ This is a monorepo managed with npm workspaces:
   checks the logs differ only in `Declassify.output`, no secret reaches a
   batch, and each log replays with placeholders. Its falsifier is a build
   option of both suite builds (`leakRawRead`); it must keep failing.
-* Sensitive inputs (`packages/boundary-shim/src/browser/sensitive.ts`): which
+* Sensitive inputs (`packages/runtime-browser/src/sensitive.ts`, re-exported
+  as `packages/boundary-shim/src/browser/sensitive.ts`): which
   field is sensitive, the shape-preserving placeholders, the hole token's
   substitution, event masking and the page's `ct` API (`public`,
-  `sensitive`, `declassify`, `mark`). One module for record and replay, the shim and
-  the reference framework; its state lives on the window under a registered
+  `sensitive`, `declassify`, `mark`). One module for record and replay, the shim,
+  the reference framework and the browser error reporter (below), so it lives
+  in `runtime-browser`, which the shim depends on, and so does `scrub.ts`
+  (likewise re-exported by the shim); its state lives on the window under a registered
   symbol because the recorder, the replay shim, the replay runtime and a
   framework are separate bundles. Every record is scrubbed before it is
   encoded by one function (`record-scrub.ts`, the `Recorder`'s `sanitize`):
@@ -164,6 +167,31 @@ This is a monorepo managed with npm workspaces:
   sensitive field's value, its `value` attribute and a sensitive textarea's
   text: frameworks mirror a controlled field's value into the DOM. Pinned by
   `tests/boundary/sensitive.test.ts`.
+* The browser error reporter (`packages/runtime-browser/src/error-report.ts`,
+  `installErrorReporter`): a window `error` of a script error or an
+  `unhandledrejection` becomes one report, scrubbed by the boundary log's
+  own rules (`scrubErrorReport`: sensitive values holed, the message
+  templated, every URL scrubbed), carrying the server-rendered response's W3C
+  `traceparent` (`trace-context.ts`: a `<meta name="traceparent">`, else the
+  navigation's `Server-Timing` `traceparent` entry), and uploaded to the
+  site's endpoint without credentials or referrer. Inert unless `enabled:
+  true` with an `http(s)` endpoint; nothing at all under Do Not Track or
+  Global Privacy Control (`privacySignal`, the transport's predicate); each
+  report is sent only when the page's consent callback, shown it as it would
+  be sent, answers yes. Its platform functions are captured originals, like
+  the transport's, the timeline's `getEntriesByType` included (on a page the
+  shim records, the patched one logs each read as the page's). Error frames
+  are parsed by `error-frames.ts`, which the shim's `Error` record uses too.
+  The shim writes the same trace context, by the same reader, into its
+  `Env` record's `traceparent` when it reads `Env` (`readEnvironment` in
+  `install.ts`): a `<meta name="traceparent">` counts only when it precedes
+  the bootstrap (before the page's encoding declaration, which the bootstrap
+  follows), the `Server-Timing` entry always. Pinned by
+  `tests/browser/error-report.test.ts`: real Chromium against a page whose
+  request the real OpenTelemetry Python SDK traces
+  (`tests/browser/fixtures/error-report/server.py`, run with the dev shell's
+  `CT_OTEL_PYTHON`), with negative controls and falsifiers (a mutated
+  reporter or shim built for each) that must keep showing the defect.
 * What a level-0 page declares for its session's narrative
   (`packages/boundary-shim/src/browser/declarations.ts`): its experiment arms
   (`data-ct-arms` on the document element, written as `Env.arms`), its

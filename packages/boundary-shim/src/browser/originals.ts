@@ -32,6 +32,13 @@ export interface ShimOriginals {
   Date: DateConstructor;
   dateNow: () => number;
   performanceNow: () => number;
+  /**
+   * `Performance.prototype.getEntriesByType`, for reads that are not the
+   * page's: the navigation entry's `Server-Timing` trace context, read for
+   * the `Env` record and by the browser error reporter (which takes these
+   * published originals).
+   */
+  getEntriesByType: Performance["getEntriesByType"] | undefined;
   mathRandom: () => number;
   getRandomValues: Crypto["getRandomValues"];
   randomUUID: Crypto["randomUUID"] | undefined;
@@ -211,6 +218,7 @@ export function captureOriginals(w: Window & typeof globalThis): ShimOriginals {
     Date: w.Date,
     dateNow: w.Date.now,
     performanceNow: w.performance.now,
+    getEntriesByType: w.Performance?.prototype.getEntriesByType,
     mathRandom: w.Math.random,
     getRandomValues: w.Crypto.prototype.getRandomValues,
     randomUUID: w.Crypto.prototype.randomUUID,

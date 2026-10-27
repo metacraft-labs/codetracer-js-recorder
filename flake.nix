@@ -196,6 +196,14 @@
             PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
             PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
 
+            # A Python with the OpenTelemetry SDK, for the backend of the
+            # browser error report test (tests/browser/error-report.test.ts),
+            # whose page request is traced by the real SDK. An absolute path
+            # rather than a `python3` on PATH, so the shell puts no Python in
+            # front of the developer's own; the test fails, naming this shell,
+            # when it is unset.
+            CT_OTEL_PYTHON = "${pkgs.python3.withPackages (ps: [ ps.opentelemetry-sdk ])}/bin/python3";
+
             # `cargo <subcommand>` looks for `cargo-<subcommand>` in
             # `$CARGO_HOME/bin` BEFORE it searches PATH. On any machine with
             # rustup -- including the self-hosted macOS runner -- that
