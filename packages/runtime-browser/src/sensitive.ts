@@ -63,6 +63,26 @@ export interface SensitiveState {
    * focused field inside it, which an event's composed path hides.
    */
   shadowRoots: WeakMap<Element, ShadowRoot>;
+  /**
+   * The keystrokes that may produce text whose `keydown` was masked and
+   * whose `keyup` has not been seen yet, by physical key, oldest first, at
+   * most {@link MAX_KEYS_IN_FLIGHT} ({@link keystrokeMasked}): the rest of
+   * such a keystroke is masked wherever focus has moved meanwhile.
+   */
+  keysInFlight: Set<string>;
+  /**
+   * The key of the latest `keydown` when it was masked and may produce
+   * text ({@link UNKNOWN_KEY} when its key could not be read), `undefined`
+   * otherwise: the keystroke whose text the editing events that follow it
+   * insert ({@link keystrokeTaints}).
+   */
+  lastMaskedKeydown: string | undefined;
+  /**
+   * The fields a masked keystroke put text into after focus left its
+   * sensitive field ({@link keystrokeTaints}): sensitive from then on,
+   * whatever the page declares ({@link isSensitive}).
+   */
+  tainted: WeakSet<Element>;
   /** Reads made by the recorder or the runtime themselves, never the page's. */
   internalDepth: number;
   /** Told of each raw read of a sensitive value by the page (replay only). */
@@ -130,6 +150,9 @@ export function sensitiveState(w: Window & typeof globalThis): SensitiveState {
     remembered: [],
     seen: new Set(),
     shadowRoots: new WeakMap(),
+    keysInFlight: new Set(),
+    lastMaskedKeydown: undefined,
+    tainted: new WeakSet(),
     internalDepth: 0,
     onRawRead: undefined,
     getters: {
@@ -348,13 +371,15 @@ export function fieldOf(s: SensitiveState, target: unknown): Element | null {
 
 /**
  * Whether `el` is sensitive (§11.3.1). In order: a credential field is; then
- * the page's own call (`ct.sensitive(el)` or `ct.public(el)`, the last one
- * made); then the attributes (`data-ct-sensitive` wins over
- * `data-ct-public`); then every free-text field is (fails closed), and
- * nothing else is.
+ * a field a masked keystroke put text into ({@link keystrokeTaints}), which
+ * stays sensitive whatever the page declares; then the page's own call
+ * (`ct.sensitive(el)` or `ct.public(el)`, the last one made); then the
+ * attributes (`data-ct-sensitive` wins over `data-ct-public`); then every
+ * free-text field is (fails closed), and nothing else is.
  */
 export function isSensitive(s: SensitiveState, el: Element): boolean {
   if (credentialClass(s, el) !== undefined) return true;
+  if (s.tainted.has(el)) return true;
   const mark = s.marks.get(el);
   if (mark !== undefined) return mark === "sensitive";
   if (s.getters.hasAttribute.call(el, "data-ct-sensitive")) return true;
@@ -727,6 +752,206 @@ export function eventField(
   return { field, sensitive: textEventMaskedAt(s, ev.type, field) };
 }
 
+/** The most keystrokes {@link SensitiveState.keysInFlight} holds. */
+export const MAX_KEYS_IN_FLIGHT = 256;
+
+/** {@link SensitiveState.lastMaskedKeydown} for a key that cannot be read. */
+export const UNKNOWN_KEY = "?";
+
+/**
+ * The named key values (UI Events KeyboardEvent key Values) that stand for
+ * text being typed rather than for a function: `Dead` (a dead key, which
+ * composes the next character, §3.2 "Dead keys"), `Process` (a key the
+ * input method editor consumed, §3.1 IME and Composition Keys) and
+ * `Unidentified` (a key the platform could not identify, as a virtual
+ * keyboard's often is): https://www.w3.org/TR/uievents-key/
+ */
+const TEXT_NAMED_KEYS = new Set(["Dead", "Process", "Unidentified"]);
+
+/**
+ * Whether a keyboard event's `key` may be, or stand for, typed text: a
+ * printable key or one of {@link TEXT_NAMED_KEYS}; a key that cannot be
+ * read may be (fails closed). Modifiers and the other named keys produce no
+ * text, which is why a held `Alt` whose `keyup` the window never sees (it
+ * switched windows) is not remembered.
+ */
+export function keyMayBeText(key: unknown): boolean {
+  if (typeof key !== "string" || key === "") return true;
+  return isPrintableKey(key) || TEXT_NAMED_KEYS.has(key);
+}
+
+/**
+ * The physical key a keyboard event is of: its `code` (UI Events
+ * KeyboardEvent code Values), which a keystroke's `keydown`, `keypress`
+ * and `keyup` share whatever modifier changes between them, or, for an
+ * event with no `code` (a virtual keyboard's), its `key`. `undefined`
+ * for an event whose properties cannot be read.
+ */
+function keystrokeOf(ev: Event): string | undefined {
+  try {
+    const k = ev as KeyboardEvent;
+    if (typeof k.code === "string" && k.code !== "") return `code:${k.code}`;
+    if (typeof k.key === "string") return `key:${k.key}`;
+  } catch {
+    // A getter that throws: no physical key to tell.
+  }
+  return undefined;
+}
+
+/** A keyboard event's `key`, `undefined` when it cannot be read. */
+function keyOf(ev: Event): unknown {
+  try {
+    return (ev as KeyboardEvent).key;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether a `keydown` repeats a held key (UI Events, `repeat`); one whose
+ * flag cannot be read counts as a repeat (fails closed: a repeat of a
+ * masked key is masked).
+ */
+function isRepeat(ev: Event): boolean {
+  try {
+    return (ev as KeyboardEvent).repeat !== false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Whether the keyboard event `ev`, which {@link eventField} found
+ * `masked` or not by where it was dispatched, is to be masked (§11.3.3),
+ * keeping the events of one keystroke masked together:
+ *
+ * - a `keydown` is masked as found, and also when it repeats a held key
+ *   (`repeat`, the key held down) whose first `keydown` was masked, since
+ *   it is the same keystroke; `s` remembers, for a key that may produce
+ *   text ({@link keyMayBeText}), whether it was masked, until the key is
+ *   released, and remembers the latest masked one for the editing events
+ *   that follow it ({@link keystrokeTaints});
+ * - a `keypress` or `keyup` is masked as found, and also when the
+ *   `keydown` of its physical key was masked and that key has not been
+ *   released since (its `keyup` forgets it).
+ *
+ * A page that moves focus between a key's `keydown` and its `keyup`
+ * (a PIN or one-time-code widget advancing to the next field on the last
+ * digit, a field blurred by its own handler, a full field with a
+ * `maxlength` advanced by an `input` handler) has the browser dispatch
+ * the rest of the keystroke at the element focused by then (UI Events,
+ * "keyup", https://www.w3.org/TR/uievents/#event-type-keyup: its target
+ * is the focused element), which may be a public
+ * field, a button or `body`; its `key` and `code` are still the
+ * character typed into the sensitive field. A `keypress` or `keyup` whose
+ * key cannot be told is masked while any masked keystroke is in flight
+ * (fails closed). A `keyup` that never arrives (the window lost focus with
+ * the key held) leaves the key remembered until its next `keydown`, which
+ * masks only more; the oldest of more than {@link MAX_KEYS_IN_FLIGHT}
+ * remembered keys is forgotten, which only a virtual keyboard sending
+ * hundreds of distinct keys without their `keyup` could reach (a key with
+ * a `code` is one of a fixed set). Other events are masked as found.
+ */
+export function keystrokeMasked(
+  s: SensitiveState,
+  ev: Event,
+  masked: boolean,
+): boolean {
+  const type = ev.type;
+  if (type !== "keydown" && type !== "keypress" && type !== "keyup") {
+    return masked;
+  }
+  const key = keystrokeOf(ev);
+  if (type === "keydown") {
+    const held = key !== undefined && s.keysInFlight.has(key);
+    const m = masked || (held && isRepeat(ev));
+    const text = keyMayBeText(keyOf(ev));
+    if (key !== undefined) {
+      // Deleted and added again, so that the set's order stays oldest
+      // first for the bound below.
+      s.keysInFlight.delete(key);
+      if (m && text) {
+        s.keysInFlight.add(key);
+        if (s.keysInFlight.size > MAX_KEYS_IN_FLIGHT) {
+          s.keysInFlight.delete(s.keysInFlight.values().next().value!);
+        }
+      }
+    }
+    s.lastMaskedKeydown = m && text ? (key ?? UNKNOWN_KEY) : undefined;
+    return m;
+  }
+  const inFlight =
+    key === undefined
+      ? s.keysInFlight.size > 0 || s.lastMaskedKeydown !== undefined
+      : s.keysInFlight.has(key);
+  if (type === "keyup") {
+    if (key !== undefined) s.keysInFlight.delete(key);
+    if (
+      key === undefined ||
+      s.lastMaskedKeydown === key ||
+      s.lastMaskedKeydown === UNKNOWN_KEY
+    ) {
+      s.lastMaskedKeydown = undefined;
+    }
+  }
+  return masked || inFlight;
+}
+
+/**
+ * Whether `el` is a field a keystroke can put text into: a value field
+ * ({@link isValueField}) other than a checkbox, a radio button and a file
+ * chooser, whose state no typed character becomes.
+ */
+function takesTypedText(s: SensitiveState, el: Element): boolean {
+  if (!isValueField(s, el)) return false;
+  if (localName(el) !== "input") return true;
+  const t = inputType(s, el);
+  return t !== "checkbox" && t !== "radio" && t !== "file";
+}
+
+/**
+ * Whether the event `ev` at `field`, which is not sensitive, carries text
+ * of a masked keystroke into it, so that `field` is to be made sensitive
+ * from now on (§11.3.3, "a keystroke is masked as a whole"): a page whose
+ * `keydown` handler moves focus from a sensitive field to another field
+ * without cancelling the key has the browser insert the key's character
+ * into the field focused by then (UI Events, the default action of a
+ * `keydown` is to dispatch `keypress` and the text input events at the
+ * focused element, https://www.w3.org/TR/uievents/#keydown), whose value
+ * then holds a character typed into the sensitive field. It is:
+ *
+ * - a `keypress` that {@link keystrokeMasked} masked (`masked`), which at
+ *   a field that is not sensitive only a keystroke in flight does: the
+ *   character is inserted next unless the page cancels the `keypress`;
+ * - an editing event (`beforeinput`, `input`, `textInput`, a composition
+ *   event) while the latest `keydown` was masked, may produce text and has
+ *   not been released ({@link SensitiveState.lastMaskedKeydown}): the
+ *   platform dispatches the editing events of a keystroke after its
+ *   `keydown` and before the next one, an input method's composition
+ *   (whose `keydown`s are `Process`) included.
+ *
+ * Only a field that takes typed text ({@link takesTypedText}) is made
+ * sensitive. It fails closed: a `keypress` the page then cancels, and an
+ * editing event of another origin (a paste by the mouse) made while a
+ * masked key is held or its `keyup` was never seen, make the field
+ * sensitive too, which costs that field's replay fidelity, never privacy.
+ */
+export function keystrokeTaints(
+  s: SensitiveState,
+  ev: Event,
+  field: Element | null,
+  sensitive: boolean,
+  masked: boolean,
+): boolean {
+  if (sensitive || field === null || !takesTypedText(s, field)) return false;
+  if (ev.type === "keypress") return masked;
+  if (!isEditingEvent(ev.type)) return false;
+  const last = s.lastMaskedKeydown;
+  return (
+    last !== undefined && (last === UNKNOWN_KEY || s.keysInFlight.has(last))
+  );
+}
+
 /**
  * Whether `node` is inside a sensitive field (§11.3.1): a sensitive
  * `contenteditable` region's text, a sensitive `textarea`'s, or the field
@@ -942,8 +1167,12 @@ export function isPrintableKey(key: string): boolean {
  * `props` (an `Input`'s properties, §10.2) masked for a sensitive target
  * (§11.3.3): a printable `key` becomes `*` per UTF-16 code unit and its
  * `code` `Masked` (a physical key identifies the character on a known
- * layout); `data` (an `InputEvent`'s or a `CompositionEvent`'s) becomes `*`
- * per code unit. Named keys, modifiers, `inputType` and the rest stay.
+ * layout); so does the `code` of a named key that stands for typed text
+ * ({@link TEXT_NAMED_KEYS}: an input method's `Process` keys spell what the
+ * visitor typed in their physical keys, a `Dead` key's names the accent),
+ * whose `key` stays; `data` (an `InputEvent`'s or a `CompositionEvent`'s)
+ * becomes `*` per code unit. Other named keys, modifiers, `inputType` and
+ * the rest stay.
  */
 export function maskEventProps(
   props: Record<string, unknown>,
@@ -951,6 +1180,8 @@ export function maskEventProps(
   const out = { ...props };
   if (typeof out.key === "string" && isPrintableKey(out.key)) {
     out.key = "*".repeat(out.key.length);
+    if ("code" in out) out.code = "Masked";
+  } else if (typeof out.key === "string" && TEXT_NAMED_KEYS.has(out.key)) {
     if ("code" in out) out.code = "Masked";
   }
   for (const k of MASKED_TEXT_PROPS) {

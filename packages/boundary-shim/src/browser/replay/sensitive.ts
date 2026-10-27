@@ -141,6 +141,13 @@ export function applyScrubbed(
   }
   const field = fieldOf(s, t);
   if (field === null) return `Scrubbed target ${e.target} is not a field`;
+  // The recorder writes a `Scrubbed` only for a sensitive field, so one
+  // for a field that is public here is the record side making it
+  // sensitive at this point of the log, because a masked keystroke put its
+  // character there (`keystrokeTaints`): so is it here, before the event
+  // it precedes is injected, which keeps the checkpoints, the holing and
+  // the raw-read reports in step with the record side.
+  if (!isSensitive(s, field)) s.tainted.add(field);
   const value = placeholder(e.class, e.length);
   if (
     field instanceof w.HTMLInputElement ||
@@ -176,6 +183,14 @@ function loggedMasked(props: Record<string, unknown>): boolean {
  * logged properties. The second case is told by the log, not by the
  * document: what the record side decided may depend on where focus was
  * (`body`'s `:focus`), which an injected event does not reproduce.
+ *
+ * So is the third: a keyboard event at any element, a public field
+ * included, whose logged `code` is `Masked`, which the record side masked
+ * because it finished (or repeated) a keystroke whose `keydown` was masked
+ * after focus had moved away from the sensitive field (`keystrokeMasked`).
+ * At a value field only `code` tells it: a public field's `data` may be
+ * all `*` because the visitor typed `*`. A field such a keystroke put its
+ * character into is sensitive here by then (`applyScrubbed`).
  */
 export function watchMaskedProps(
   ctx: ReplayContext,
@@ -188,7 +203,8 @@ export function watchMaskedProps(
   if (field === null) return;
   if (
     !isSensitive(s, field) &&
-    !(!isValueField(s, field) && loggedMasked(props))
+    !(!isValueField(s, field) && loggedMasked(props)) &&
+    props.code !== "Masked"
   ) {
     return;
   }

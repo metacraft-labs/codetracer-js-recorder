@@ -14,6 +14,8 @@ import {
   internally,
   isEditingHostOrInside,
   isValueField,
+  keystrokeMasked,
+  keystrokeTaints,
   maskEventProps,
   rememberSensitive,
   sensitiveClass,
@@ -582,8 +584,22 @@ export function recordInput(
   rec.macrotask();
   // The field the event belongs to, found through shadow trees: an event
   // from inside one reaches these listeners retargeted to its host.
-  const { field, sensitive: masked } = eventField(s, ev);
-  if (masked && field !== null && isValueField(s, field)) {
+  const found = eventField(s, ev);
+  const field = found.field;
+  let sensitive = found.sensitive;
+  // Its properties are masked also when it finishes a keystroke whose
+  // keydown was masked, wherever focus has moved since (§11.3.3); the
+  // element it was dispatched at is not sensitive for that alone.
+  let masked = keystrokeMasked(s, ev, sensitive);
+  // But a field such a keystroke puts its character into is, from now on
+  // (§11.3.3): its value holds what was typed into a sensitive field.
+  const taints = keystrokeTaints(s, ev, field, sensitive, masked);
+  if (taints) {
+    s.tainted.add(field!);
+    sensitive = true;
+    masked = true;
+  }
+  if (sensitive && field !== null && isValueField(s, field)) {
     // Holed wherever the page sends it, also once the field has changed or
     // left the document (§5.2.1).
     s.seen.add(field);
@@ -605,9 +621,21 @@ export function recordInput(
         length: internally(s, () => fieldValue(s, field)).length,
       });
     }
+    // The field was public until this event: a `Scrubbed` of its value
+    // now tells replay that it is sensitive from here on (`applyScrubbed`)
+    // before the event is injected, as here before the page's listeners
+    // see it. An `input` writes its own `Scrubbed` (above, or below for
+    // its value).
+    if (taints && ev.type !== "input") {
+      rec.emit("Scrubbed", {
+        target: targetOf(field),
+        class: sensitiveClass(s, field),
+        length: internally(s, () => fieldValue(s, field)).length,
+      });
+    }
   }
   for (const [effect, value] of domEffects(ctx, ev)) {
-    if (masked && effect === Effect.value) {
+    if (sensitive && effect === Effect.value) {
       const v = String(value);
       rememberSensitive(s, v);
       rec.emit("Scrubbed", {

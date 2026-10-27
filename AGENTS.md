@@ -170,8 +170,14 @@ This is a monorepo managed with npm workspaces:
   `MutationObserver` hands the page is holed where it names a sensitive
   field's text, on both sides by `mutationRecordsJson`, as `dom-v1` holes a
   sensitive field's value, its `value` attribute and a sensitive textarea's
-  text: frameworks mirror a controlled field's value into the DOM. Pinned by
-  `tests/boundary/sensitive.test.ts`.
+  text: frameworks mirror a controlled field's value into the DOM. A
+  keystroke is masked as a whole (`keystrokeMasked`: the `keypress`, `keyup`
+  and repeated `keydown`s of a key whose `keydown` was masked are masked
+  wherever focus has moved), and a field such a keystroke puts its
+  character into becomes sensitive (`keystrokeTaints`, `SensitiveState.tainted`),
+  told to replay by a `Scrubbed` that `applyScrubbed` reads the same way;
+  an input method's `Process` keys and a `Dead` key have their `code`
+  masked. Pinned by `tests/boundary/sensitive.test.ts`.
 * The browser error reporter (`packages/runtime-browser/src/error-report.ts`,
   `installErrorReporter`): a window `error` of a script error or an
   `unhandledrejection` becomes one report, scrubbed by the boundary log's

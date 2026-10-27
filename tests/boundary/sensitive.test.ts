@@ -243,6 +243,259 @@ const valuesAt = (records: BoundaryRecord[], target: string) =>
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
+/** The secrets typed into `sensitive-focus.html`'s sensitive fields. */
+interface FocusSecrets {
+  pinA: string;
+  pinB: string;
+  pinC: string;
+  otp: string;
+}
+
+/** Four digits each, the last one moving focus away; no letters. */
+const FOCUS_SECRETS: FocusSecrets = {
+  pinA: "4719",
+  pinB: "8357",
+  pinC: "5174",
+  otp: "9183",
+};
+
+/**
+ * Type each secret into its field of `sensitive-focus.html` (each field's
+ * last key moves focus away, see the fixture), then `publicText` into the
+ * public field, and send.
+ */
+async function driveFocusMoves(
+  page: SPage,
+  secrets: FocusSecrets,
+  publicText: string,
+): Promise<void> {
+  for (const id of ["pinA", "pinB", "pinC", "otp"] as const) {
+    await page.click(`#${id}`);
+    await page.keyboard.type(secrets[id]);
+  }
+  await page.click("#pub");
+  await page.keyboard.type(publicText);
+  await page.click("#send");
+}
+
+/**
+ * The records of a `sensitive-focus.html` session hold every keystroke of
+ * every secret masked, key and code, at the field it was typed into and at
+ * the element its last key finished at; and no key event anywhere carries
+ * a key or a physical key of a secret.
+ */
+function expectFocusMovesMasked(
+  records: BoundaryRecord[],
+  secrets: FocusSecrets,
+): void {
+  const masked = (target: string, type: string, n: number) => {
+    const props = inputsAt(records, target, type).map(propsOf);
+    expect(props.length, `${target} ${type}`).toBe(n);
+    for (const p of props) {
+      expect(p.key, `${target} ${type}`).toBe("*");
+      expect(p.code, `${target} ${type}`).toBe("Masked");
+    }
+  };
+  // Typed into the fields: every keydown masked.
+  for (const id of ["pinA", "pinB", "pinC", "otp"] as const) {
+    masked(`path:#${id}`, "keydown", secrets[id].length);
+  }
+  // The keydown handler cancelled `pinA`'s last key and focused the public
+  // field: its keyup finished there.
+  masked("path:#pinA", "keyup", 3);
+  masked("path:#pubA", "keyup", 1);
+  masked("path:#pubA", "keypress", 0);
+  // Not cancelled: the keypress and the keyup at the button, at `body`.
+  for (const [id, at] of [
+    ["pinB", "path:#btn"],
+    ["pinC", "path:#page"],
+  ] as const) {
+    masked(`path:#${id}`, "keypress", 3);
+    masked(`path:#${id}`, "keyup", 3);
+    masked(at, "keypress", 1);
+    masked(at, "keyup", 1);
+  }
+  // Auto-advanced by the input handler: only the keyup moved.
+  masked("path:#otp", "keypress", 4);
+  masked("path:#otp", "keyup", 3);
+  masked("path:#pubD", "keyup", 1);
+  // Nowhere a key of a secret, nor its physical key.
+  const digits = new Set(Object.values(secrets).join(""));
+  for (const r of records) {
+    if (r.record !== "Input" || !r.type.startsWith("key")) continue;
+    const p = propsOf(r);
+    expect(digits.has(String(p.key)), `${r.target} ${r.type}`).toBe(false);
+    expect(String(p.code).startsWith("Digit"), `${r.target} ${r.type}`).toBe(
+      false,
+    );
+  }
+}
+
+/** The secrets typed in `sensitive-focus.html`'s insert case. */
+interface InsertSecrets {
+  pinE: string;
+  pinF: string;
+}
+
+const INSERT_SECRETS: InsertSecrets = { pinE: "6182", pinF: "3956" };
+
+/** Typed into `pubE` and `pubF` after their secret's last character. */
+const AFTER_E = "qrs";
+const AFTER_F = "tu";
+
+/**
+ * The physical key an input method's `Process` keydown is of in the insert
+ * case, and the text it composes: neither may be in the log.
+ */
+const IME_CODE = "KeyJ";
+const IME_TEXT = "じ";
+
+/**
+ * Drive `sensitive-focus.html`'s insert case: `pinE`'s last key moves focus
+ * to the public `pubE` without being cancelled, so its character lands
+ * there, and `AFTER_E` follows it; `pinF`'s last key is cancelled and moves
+ * focus to the public `pubF`, then is held until it repeats there (its
+ * character landing in `pubF`), and `AFTER_F` follows; `ime` gets a
+ * composition through the DevTools protocol (a `Process` keydown, the
+ * composed text, the key's keyup, as Chromium dispatches an input method's
+ * keys); then `publicText` into the public field, and `send`.
+ */
+async function driveInsert(
+  page: SPage,
+  secrets: InsertSecrets,
+  publicText: string,
+): Promise<void> {
+  await page.click("#pinE");
+  await page.keyboard.type(secrets.pinE);
+  await page.keyboard.type(AFTER_E);
+  await page.click("#pinF");
+  await page.keyboard.type(secrets.pinF.slice(0, 3));
+  const held = secrets.pinF[3];
+  await page.keyboard.down(held);
+  // Already down: Playwright dispatches it again with `repeat` set.
+  await page.keyboard.down(held);
+  await page.keyboard.up(held);
+  await page.keyboard.type(AFTER_F);
+  await page.click("#ime");
+  const cdp = await (
+    page as unknown as {
+      context(): {
+        newCDPSession(p: unknown): Promise<{
+          send(method: string, params: object): Promise<unknown>;
+        }>;
+      };
+    }
+  )
+    .context()
+    .newCDPSession(page);
+  await cdp.send("Input.dispatchKeyEvent", {
+    type: "rawKeyDown",
+    key: "Process",
+    code: IME_CODE,
+    windowsVirtualKeyCode: 229,
+  });
+  await cdp.send("Input.insertText", { text: IME_TEXT });
+  await cdp.send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "j",
+    code: IME_CODE,
+    windowsVirtualKeyCode: 74,
+  });
+  await page.click("#pub");
+  await page.keyboard.type(publicText);
+  await page.click("#send");
+}
+
+/** How many keyups {@link driveInsert} makes. */
+const insertKeyups = (secrets: InsertSecrets, publicText: string) =>
+  secrets.pinE.length +
+  AFTER_E.length +
+  secrets.pinF.length +
+  AFTER_F.length +
+  1 +
+  publicText.length;
+
+/**
+ * The records of an insert-case session: the public fields a masked
+ * keystroke put its character into (`pubE`, `pubF`) are sensitive from
+ * the event that carried it on, a `Scrubbed` telling so before it, so
+ * every later event there is masked and their values are never written;
+ * the repeated keydown at `pubF` is masked; the input method's `Process`
+ * keys have their `code` masked. No record carries a key, a physical key or
+ * the text of a secret.
+ */
+function expectInsertMasked(
+  records: BoundaryRecord[],
+  secrets: InsertSecrets,
+): void {
+  for (const id of ["pubE", "pubF"]) {
+    const at = `path:#${id}`;
+    expect(valuesAt(records, at), at).toEqual([]);
+    const scrubbed = scrubbedAt(records, at);
+    expect(scrubbed.length, at).toBeGreaterThan(0);
+    // The `Scrubbed` that makes it sensitive comes before the first event
+    // that carries text there (the repeated keydown at `pubF` comes before
+    // it, masked as a repeat).
+    const firstText = records.findIndex(
+      (r) =>
+        r.record === "Input" &&
+        r.target === at &&
+        ["keypress", "beforeinput", "textInput", "input"].includes(r.type),
+    );
+    const firstScrubbed = records.findIndex(
+      (r) => r.record === "Scrubbed" && r.target === at,
+    );
+    expect(firstText, at).toBeGreaterThan(-1);
+    expect(firstScrubbed, at).toBeGreaterThan(-1);
+    expect(firstScrubbed, at).toBeLessThan(firstText);
+    const inputs = records.filter(
+      (r): r is RecordOf<"Input"> => r.record === "Input" && r.target === at,
+    );
+    expect(inputs.length, at).toBeGreaterThan(0);
+    for (const r of inputs) {
+      const p = propsOf(r);
+      if (typeof p.key === "string" && [...p.key].length === 1) {
+        expect(p.key, `${at} ${r.type}`).toBe("*");
+        expect(p.code, `${at} ${r.type}`).toBe("Masked");
+      }
+      if (typeof p.data === "string") {
+        expect(p.data, `${at} ${r.type}`).toMatch(/^\**$/);
+      }
+    }
+    // The character arrived: a beforeinput and an input carried it.
+    expect(inputsAt(records, at, "beforeinput").length, at).toBeGreaterThan(0);
+    expect(inputsAt(records, at, "input").length, at).toBeGreaterThan(0);
+  }
+  // The held key repeated at `pubF`, masked.
+  const repeats = inputsAt(records, "path:#pubF", "keydown")
+    .map(propsOf)
+    .filter((p) => p.repeat === true);
+  expect(repeats.length).toBe(1);
+  expect(repeats[0].key).toBe("*");
+  // The input method's keys at `ime`.
+  const imeDown = inputsAt(records, "path:#ime", "keydown").map(propsOf);
+  expect(imeDown.map((p) => [p.key, p.code])).toEqual([["Process", "Masked"]]);
+  const imeUp = inputsAt(records, "path:#ime", "keyup").map(propsOf);
+  expect(imeUp.map((p) => [p.key, p.code])).toEqual([["*", "Masked"]]);
+  // Nowhere a key, a physical key or the text of a secret.
+  const digits = new Set(Object.values(secrets).join(""));
+  for (const r of records) {
+    if (r.record === "DomEffect" && r.effect === 1) {
+      for (const d of digits) expect(r.value, r.target).not.toContain(d);
+    }
+    if (r.record !== "Input") continue;
+    const p = propsOf(r);
+    const at = `${r.target} ${r.type}`;
+    expect(digits.has(String(p.key)), at).toBe(false);
+    expect(String(p.code).startsWith("Digit"), at).toBe(false);
+    expect(p.code, at).not.toBe(IME_CODE);
+    if (typeof p.data === "string") {
+      for (const d of digits) expect(p.data, at).not.toContain(d);
+      expect(p.data, at).not.toContain(IME_TEXT);
+    }
+  }
+}
+
 describe("sensitive inputs on the upload route", () => {
   it(
     "sensitive_value_never_in_uploaded_bytes",
@@ -543,6 +796,90 @@ describe("sensitive inputs on the upload route", () => {
         // The control: the key pressed with nothing focused is kept.
         expect(props.at(-1)!.key, type).toBe("k");
         expect(props.at(-1)!.code, type).toBe("KeyK");
+      }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keystrokes_finished_after_focus_left_a_sensitive_field_never_uploaded",
+    async () => {
+      // Each secret's last key moves focus away from its sensitive field
+      // between the key's keydown and its keyup (by the page's keydown
+      // handler, or by its input handler auto-advancing a full field), so
+      // the browser finishes the keystroke at another element: a public
+      // field, a button, `body` (nothing focused).
+      const PUBLIC = "abcxyz";
+      const up = await upload(
+        "",
+        (page) => driveFocusMoves(page, FOCUS_SECRETS, PUBLIC),
+        { enabled: true },
+        () => document.getElementById("status")!.textContent,
+        "sensitive-focus.html",
+      );
+      // Vacuity guard: every keyup reached the window's listener.
+      const typed = Object.values(FOCUS_SECRETS).join("") + PUBLIC;
+      expect(up.inspected).toBe(`sent ${typed.length}`);
+      expectFocusMovesMasked(up.records, FOCUS_SECRETS);
+      // No key of a secret, nor its physical key, in any batch or in the
+      // container; the public field's keys are found by the same search
+      // (the vacuity guard).
+      const blobs = [...up.bodies, up.container];
+      for (const blob of [up.bodies, [up.container]]) {
+        for (const c of PUBLIC) {
+          expect(found(blob, `"key":"${c}"`), c).toBe(true);
+          expect(found(blob, `"code":"Key${c.toUpperCase()}"`), c).toBe(true);
+        }
+      }
+      for (const c of new Set(Object.values(FOCUS_SECRETS).join(""))) {
+        expect(found(blobs, `"key":"${c}"`), c).toBe(false);
+        expect(found(blobs, `"code":"Digit${c}"`), c).toBe(false);
+      }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "characters_a_masked_keystroke_puts_into_a_public_field_never_uploaded",
+    async () => {
+      // A keystroke typed into a sensitive field whose character the
+      // browser inserts into a public field, because the page moved focus
+      // there without cancelling the key or because the key was held until
+      // it repeated there, makes that field sensitive; an input method's
+      // keys keep their physical keys to themselves. The page then sends
+      // `pubE`'s value in a query string.
+      const PUBLIC = "abcxyz";
+      const up = await upload(
+        "case=insert",
+        (page) => driveInsert(page, INSERT_SECRETS, PUBLIC),
+        { enabled: true },
+        () => document.getElementById("status")!.textContent,
+        "sensitive-focus.html",
+      );
+      // Vacuity guard: every keyup reached the window's listener.
+      expect(up.inspected).toBe(`sent ${insertKeyups(INSERT_SECRETS, PUBLIC)}`);
+      expectInsertMasked(up.records, INSERT_SECRETS);
+      // The request went out, its query holed.
+      const req = up.records.filter(
+        (r): r is RecordOf<"NetRequest"> =>
+          r.record === "NetRequest" && r.url.includes("/api/data?q="),
+      );
+      expect(req.map((r) => r.url.split("?")[1])).toEqual([`q=${HOLE_TOKEN}`]);
+      const blobs = [...up.bodies, up.container];
+      for (const blob of [up.bodies, [up.container]]) {
+        for (const c of PUBLIC) {
+          expect(found(blob, `"key":"${c}"`), c).toBe(true);
+        }
+      }
+      const valueE = INSERT_SECRETS.pinE.at(-1)! + AFTER_E;
+      const valueF = INSERT_SECRETS.pinF.at(-1)! + AFTER_F;
+      for (const v of [valueE, valueF, IME_TEXT, `"code":"${IME_CODE}"`]) {
+        expect(found(blobs, v), v).toBe(false);
+      }
+      for (const c of new Set(Object.values(INSERT_SECRETS).join(""))) {
+        expect(found(blobs, `"key":"${c}"`), c).toBe(false);
+        expect(found(blobs, `"code":"Digit${c}"`), c).toBe(false);
+        expect(found(blobs, `"data":"${c}"`), c).toBe(false);
       }
     },
     TIMEOUT,
@@ -1006,6 +1343,134 @@ describe("sensitive inputs on the record-and-replay route", () => {
       expect(lastHash(a)).toBeDefined();
       expect(lastHash(a)).toEqual(lastHash(b));
       expectReplayed(await rr.replay(a), a);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keystrokes_finished_after_focus_left_a_sensitive_field_replay_masked",
+    async () => {
+      // The page of the upload test above, recorded twice with secrets of
+      // one shape: the checkpoints may depend on the typing's shape (the
+      // page counts the keyups) but never on its content.
+      const record = (secrets: FocusSecrets) =>
+        rr.record("sensitive-focus.html", async (p) =>
+          driveFocusMoves(p as unknown as SPage, secrets, "abcxyz"),
+        );
+      const first = FOCUS_SECRETS;
+      const second: FocusSecrets = {
+        pinA: "2630",
+        pinB: "0264",
+        pinC: "6203",
+        otp: "3026",
+      };
+      const a = await record(first);
+      const b = await record(second);
+      for (const [records, secrets] of [
+        [a, first],
+        [b, second],
+      ] as const) {
+        expectFocusMovesMasked(records, secrets);
+      }
+      // The document after the typing hashes the same whatever was typed.
+      const lastHash = (records: BoundaryRecord[]) =>
+        records
+          .filter((r): r is RecordOf<"Checkpoint"> => r.record === "Checkpoint")
+          .at(-1)?.state_hash;
+      expect(lastHash(a)).toBeDefined();
+      expect(lastHash(a)).toEqual(lastHash(b));
+      // Replayed with no secret at all: every checkpoint matches.
+      expectReplayed(await rr.replay(a), a);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "masked_keyup_at_a_public_field_diverges_substituted_sensitive",
+    async () => {
+      // The page branches on the key of the keyup that `pinA`'s last
+      // keystroke finishes at `pubA`, a public field: a digit reads
+      // `Math.random()`. On replay that key is `*`, as logged, so the read
+      // is missing, and the divergence names the substitution.
+      const records = await rr.record(
+        "sensitive-focus.html?case=keybranch",
+        async (p) => {
+          const page = p as unknown as SPage;
+          await page.click("#pinA");
+          await page.keyboard.type(FOCUS_SECRETS.pinA);
+          await page.click("#send");
+        },
+      );
+      const keyup = inputsAt(records, "path:#pubA", "keyup");
+      expect(keyup.map((r) => propsOf(r).key)).toEqual(["*"]);
+      const random = indexWhere(records, "Random");
+      expect(random).toBeGreaterThan(-1);
+      const report = await rr.replay(records);
+      expectDiverged(report, "MissingRead", seqAt(records, random));
+      expect(report.divergence?.cause).toBe("substituted-sensitive");
+      expect(report.divergence?.sensitiveRead).toMatchObject({
+        target: "path:#pubA",
+        what: "event.key",
+      });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "characters_a_masked_keystroke_puts_into_a_public_field_replay_masked",
+    async () => {
+      // The insert case of the upload test above, recorded twice with
+      // secrets of one shape: the fields made sensitive hash as the token,
+      // so the checkpoints do not depend on what was typed, and the replay
+      // makes them sensitive where the log's `Scrubbed` says, so it matches.
+      const record = (secrets: InsertSecrets) =>
+        rr.record("sensitive-focus.html?case=insert", async (p) =>
+          driveInsert(p as unknown as SPage, secrets, "abcxyz"),
+        );
+      const second: InsertSecrets = { pinE: "0274", pinF: "8021" };
+      const a = await record(INSERT_SECRETS);
+      const b = await record(second);
+      expectInsertMasked(a, INSERT_SECRETS);
+      expectInsertMasked(b, second);
+      const lastHash = (records: BoundaryRecord[]) =>
+        records
+          .filter((r): r is RecordOf<"Checkpoint"> => r.record === "Checkpoint")
+          .at(-1)?.state_hash;
+      expect(lastHash(a)).toBeDefined();
+      expect(lastHash(a)).toEqual(lastHash(b));
+      expectReplayed(await rr.replay(a), a);
+      expectReplayed(await rr.replay(b), b);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a_public_field_a_masked_keystroke_put_text_into_diverges_substituted_sensitive",
+    async () => {
+      // The page branches on `pubE`'s value after `pinE`'s last character
+      // landed there: a digit first reads `Math.random()`. On replay the
+      // field holds a placeholder, so the read is missing, and the
+      // divergence names the field's value as the substitution.
+      const records = await rr.record(
+        "sensitive-focus.html?case=insertbranch",
+        async (p) => {
+          const page = p as unknown as SPage;
+          await page.click("#pinE");
+          await page.keyboard.type(INSERT_SECRETS.pinE);
+          await page.click("#send");
+        },
+      );
+      expect(valuesAt(records, "path:#pubE")).toEqual([]);
+      expect(scrubbedAt(records, "path:#pubE").length).toBeGreaterThan(0);
+      const random = indexWhere(records, "Random");
+      expect(random).toBeGreaterThan(-1);
+      const report = await rr.replay(records);
+      expectDiverged(report, "MissingRead", seqAt(records, random));
+      expect(report.divergence?.cause).toBe("substituted-sensitive");
+      expect(report.divergence?.sensitiveRead).toMatchObject({
+        target: "path:#pubE",
+        what: "value",
+      });
     },
     TIMEOUT,
   );

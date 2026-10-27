@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>focus moved away from a sensitive field mid-keystroke</title>
+  </head>
+  <body id="page">
+    <main>
+      <input id="pinA" type="password" />
+      <input id="pubA" type="text" data-ct-public />
+      <input id="pinB" type="password" />
+      <button id="btn" type="button">Next</button>
+      <input id="pinC" type="password" />
+      <input id="otp" type="text" autocomplete="one-time-code" maxlength="4" />
+      <input id="pubD" type="text" data-ct-public />
+      <input id="pinE" type="password" />
+      <input id="pubE" type="text" data-ct-public />
+      <input id="pinF" type="password" />
+      <input id="pubF" type="text" data-ct-public />
+      <input id="ime" type="text" />
+      <input id="pub" type="text" data-ct-public />
+      <button id="send" type="button">Send</button>
+      <p id="status"></p>
+    </main>
+    <script src="sensitive-focus.js"></script>
+  </body>
+</html>
