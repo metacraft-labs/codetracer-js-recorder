@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>a closed shadow root on body</title>
+  </head>
+  <body id="page">
+    <template shadowrootmode="closed"
+      ><style>
+        input {
+          position: fixed;
+          left: 0;
+          top: 0;
+          width: 200px;
+          height: 30px;
+        }
+      </style>
+      <input type="text" /><slot></slot
+    ></template>
+    <main style="margin-top: 60px">
+      <p id="blank">nothing to focus here</p>
+      <button id="send" type="button">Send</button>
+      <p id="status"></p>
+    </main>
+    <script src="sensitive-body.js"></script>
+  </body>
+</html>

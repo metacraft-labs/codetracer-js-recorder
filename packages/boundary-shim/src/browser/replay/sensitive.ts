@@ -23,6 +23,7 @@ import {
   fieldOf,
   isEditingHostOrInside,
   isSensitive,
+  isValueField,
   makeCtApi,
   placeholder,
   rememberSensitive,
@@ -156,18 +157,41 @@ export function applyScrubbed(
 }
 
 /**
- * An injected event at a sensitive field (§11.3.3): its masked properties
- * (`key`, `code`, `data`) as the log has them, each read reported as a raw
- * sensitive read (on record the page read the visitor's character there).
+ * Whether the logged properties `props` of a text event were masked on
+ * record (§11.3.3): a printable key's `code` is `Masked`, and masked `data`
+ * is all `*`.
+ */
+function loggedMasked(props: Record<string, unknown>): boolean {
+  if (props.code === "Masked") return true;
+  return typeof props.data === "string" && /^\*+$/.test(props.data);
+}
+
+/**
+ * An injected event at a sensitive field (§11.3.3), or a masked one at an
+ * element that is not a field, which the record side masked because the
+ * event may have come from a field in a shadow tree it could not see into
+ * (`textEventMaskedAt`): its masked properties (`key`, `code`, `data`) as
+ * the log has them, each read reported as a raw sensitive read (on record
+ * the page read the visitor's character there). `props` are the event's
+ * logged properties. The second case is told by the log, not by the
+ * document: what the record side decided may depend on where focus was
+ * (`body`'s `:focus`), which an injected event does not reproduce.
  */
 export function watchMaskedProps(
   ctx: ReplayContext,
   ev: Event,
   target: EventTarget,
+  props: Record<string, unknown>,
 ): void {
   const { sensitive: s } = ctx;
   const field = fieldOf(s, target);
-  if (field === null || !isSensitive(s, field)) return;
+  if (field === null) return;
+  if (
+    !isSensitive(s, field) &&
+    !(!isValueField(s, field) && loggedMasked(props))
+  ) {
+    return;
+  }
   for (const name of ["key", "code", "data"]) {
     if (!(name in ev)) continue;
     const value = (ev as unknown as Record<string, unknown>)[name];

@@ -84,7 +84,11 @@ interface SPage {
   press(selector: string, key: string): Promise<void>;
   click(selector: string): Promise<void>;
   evaluate<T>(fn: () => T): Promise<T>;
-  keyboard: { type(text: string): Promise<void> };
+  keyboard: {
+    type(text: string): Promise<void>;
+    press(key: string): Promise<void>;
+  };
+  mouse: { click(x: number, y: number): Promise<void> };
 }
 interface SContext {
   newPage(): Promise<SPage>;
@@ -128,15 +132,16 @@ interface Uploaded {
 }
 
 /**
- * Record `sensitive-upload.html?<query>` with the shim uploading to a stub
- * ingest whose `config` is `config`, drive it, wait until it is done, stop
- * the session, and assemble what was uploaded.
+ * Record `<pageName>?<query>` (by default `sensitive-upload.html`) with the
+ * shim uploading to a stub ingest whose `config` is `config`, drive it, wait
+ * until it is done, stop the session, and assemble what was uploaded.
  */
 async function upload(
   query: string,
   drive: (page: SPage) => Promise<void>,
   config: unknown = { enabled: true },
   inspect: () => unknown = () => null,
+  pageName = "sensitive-upload.html",
 ): Promise<Uploaded> {
   const stub: StubIngest = await startStubIngest(config);
   closers.push(stub);
@@ -147,7 +152,7 @@ async function upload(
     [
       CLI,
       "boundary-shim",
-      path.join(dir, "sensitive-upload.html"),
+      path.join(dir, pageName),
       "--build-hash",
       FIXTURE_BUILD_HASH,
       "--ingest",
@@ -161,9 +166,9 @@ async function upload(
   let inspected: unknown;
   try {
     const page = await context.newPage();
-    await page.goto(`${server.origin}/sensitive-upload.html?${query}`);
+    await page.goto(`${server.origin}/${pageName}?${query}`);
     await drive(page);
-    await until(page, isDone, `sensitive-upload.html?${query} to finish`);
+    await until(page, isDone, `${pageName}?${query} to finish`);
     inspected = await page.evaluate(inspect);
     await page.evaluate(() =>
       (
@@ -403,6 +408,142 @@ describe("sensitive inputs on the upload route", () => {
           .filter((r): r is RecordOf<"Error"> => r.record === "Error")
           .map((e) => e.message),
       ).toEqual([`Uncaught Error: rejected ${HOLE_TOKEN}`]);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keystrokes_in_declarative_closed_roots_of_focusable_hosts_never_uploaded",
+    async () => {
+      // Two closed roots the HTML parser attached (no `attachShadow` call
+      // the shim could see), each on a host that is focusable itself, so
+      // the window's listeners cannot tell a keystroke into the field behind
+      // it from one at the host.
+      const DIV = "Dv6qp-closed";
+      const DELEGATES = "Df2mn-closed";
+      const PUBLIC = "Pz8hc-public";
+      const up = await upload(
+        "case=upload",
+        async (page) => {
+          // The field fills the host: the click lands on it.
+          await page.click("#dhost");
+          await page.keyboard.type(DIV);
+          // The host delegates focus to its field.
+          await page.evaluate(() => document.getElementById("dfhost")!.focus());
+          await page.keyboard.type(DELEGATES);
+          // A focusable element that cannot host a shadow root: its keys
+          // are its own.
+          await page.press("#item", "k");
+          // Focusable widgets with no shadow root that take their own
+          // keys: unmarked, and declared public by attribute and by call.
+          await page.press("#kneg", "k");
+          await page.press("#kpub", "k");
+          await page.press("#kct", "k");
+          await page.type("#pub", PUBLIC);
+          await page.click("#send");
+        },
+        { enabled: true },
+        () => document.getElementById("status")!.textContent,
+        "sensitive-closed.html",
+      );
+      const blobs = [...up.bodies, up.container];
+
+      // Vacuity guards: every keystroke reached the hosts' listeners, and
+      // the public field's text is found by the same search, in the bodies
+      // and in the container.
+      expect(up.inspected).toBe(`keys ${DIV.length + DELEGATES.length}`);
+      expect(found(up.bodies, PUBLIC)).toBe(true);
+      expect(found([up.container], PUBLIC)).toBe(true);
+      // The secrets, in every form, in no batch and not in the container.
+      for (const secret of [DIV, DELEGATES]) {
+        for (const f of forms(secret)) {
+          expect(found(blobs, f), f).toBe(false);
+        }
+      }
+      // The keystrokes at both hosts are masked, key and code.
+      for (const [host, typed] of [
+        ["path:#dhost", DIV],
+        ["path:#dfhost", DELEGATES],
+      ] as const) {
+        for (const type of ["keydown", "keypress", "keyup"]) {
+          const props = inputsAt(up.records, host, type).map(propsOf);
+          expect(props.length, `${host} ${type}`).toBe(typed.length);
+          for (const p of props) {
+            expect(p.key, `${host} ${type}`).toBe("*");
+            expect(p.code, `${host} ${type}`).toBe("Masked");
+          }
+        }
+      }
+      // The control: the list item's key is recorded as it was.
+      expect(
+        inputsAt(up.records, "path:#item", "keydown").map(
+          (r) => propsOf(r).key,
+        ),
+      ).toEqual(["k"]);
+      // The unmarked widget is taken for the host of a root the shim cannot
+      // see: its key is masked. The widgets the page declared public, by
+      // `data-ct-public` and by `ct.public`, keep their keys exactly.
+      for (const [host, key, code] of [
+        ["path:#kneg", "*", "Masked"],
+        ["path:#kpub", "k", "KeyK"],
+        ["path:#kct", "k", "KeyK"],
+      ] as const) {
+        for (const type of ["keydown", "keypress", "keyup"]) {
+          const props = inputsAt(up.records, host, type).map(propsOf);
+          expect(props.length, `${host} ${type}`).toBe(1);
+          expect(props[0].key, `${host} ${type}`).toBe(key);
+          expect(props[0].code, `${host} ${type}`).toBe(code);
+        }
+      }
+      // The component read its field's value through its own internals and
+      // sent it: the request is logged with the hole.
+      const request = up.records.find(
+        (r): r is RecordOf<"NetRequest"> =>
+          r.record === "NetRequest" && r.url.includes("/api/data"),
+      )!;
+      expect(request.url).toContain(`?d=${HOLE_TOKEN}`);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keystrokes_in_a_declarative_closed_root_on_body_never_uploaded",
+    async () => {
+      // A closed root the HTML parser attached to `body`: a keystroke into
+      // its field reaches the window at `body`, as one made while nothing
+      // has focus does.
+      const SECRET = "Bq7xz-bodyroot";
+      const up = await upload(
+        "case=upload",
+        async (page) => {
+          // The field is fixed at the top left of the viewport.
+          await page.mouse.click(20, 15);
+          await page.keyboard.type(SECRET);
+          // Nothing focused: the page's own shortcut at body.
+          await page.click("#blank");
+          await page.keyboard.press("k");
+          await page.click("#send");
+        },
+        { enabled: true },
+        () => document.getElementById("status")!.textContent,
+        "sensitive-body.html",
+      );
+      // Vacuity guard: every keystroke reached body's listener.
+      expect(up.inspected).toBe(`sent ${SECRET.length + 1}`);
+      const blobs = [...up.bodies, up.container];
+      for (const f of forms(SECRET)) expect(found(blobs, f), f).toBe(false);
+      for (const type of ["keydown", "keypress", "keyup"]) {
+        const props = inputsAt(up.records, "path:#page", type).map(propsOf);
+        expect(props.length, type).toBe(SECRET.length + 1);
+        // The typing into the field behind the root: masked, key and code.
+        for (const p of props.slice(0, SECRET.length)) {
+          expect(p.key, type).toBe("*");
+          expect(p.code, type).toBe("Masked");
+        }
+        // The control: the key pressed with nothing focused is kept.
+        expect(props.at(-1)!.key, type).toBe("k");
+        expect(props.at(-1)!.code, type).toBe("KeyK");
+      }
     },
     TIMEOUT,
   );
@@ -767,6 +908,150 @@ describe("sensitive inputs on the record-and-replay route", () => {
       // Replayed with placeholders: every checkpoint and every mutation
       // record matches.
       expectReplayed(await rr.replay(records), records);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keystrokes_in_declarative_closed_roots_replay_masked",
+    async () => {
+      // The page of the upload test above, recorded twice with secrets of
+      // one length: the checkpoints may depend on the typing's shape (the
+      // page counts the keystrokes) but never on its content.
+      const record = (div: string, delegates: string) =>
+        rr.record("sensitive-closed.html?case=replay", async (p) => {
+          const page = p as unknown as SPage;
+          await page.click("#dhost");
+          await page.keyboard.type(div);
+          await page.evaluate(() => document.getElementById("dfhost")!.focus());
+          await page.keyboard.type(delegates);
+          await page.click("#send");
+        });
+      const first = ["Dv6qp-closed", "Df2mn-closed"] as const;
+      const second = ["Rk4wb-hidden", "Tn9yx-hidden"] as const;
+      const a = await record(...first);
+      const b = await record(...second);
+      for (const [records, secrets] of [
+        [a, first],
+        [b, second],
+      ] as const) {
+        const text = records
+          .map((r) =>
+            JSON.stringify(r, (_k, v: unknown) =>
+              typeof v === "bigint" ? v.toString() : v,
+            ),
+          )
+          .join("\n");
+        for (const s of secrets) expect(text.includes(s), s).toBe(false);
+        // Vacuity guard: the keystrokes are in the log, masked.
+        for (const host of ["path:#dhost", "path:#dfhost"]) {
+          const keys = inputsAt(records, host, "keydown").map(
+            (r) => propsOf(r).key,
+          );
+          expect(keys, host).toEqual(Array(12).fill("*"));
+        }
+      }
+      // The document after the typing hashes the same whatever was typed.
+      const lastHash = (records: BoundaryRecord[]) =>
+        records
+          .filter((r): r is RecordOf<"Checkpoint"> => r.record === "Checkpoint")
+          .at(-1)?.state_hash;
+      expect(lastHash(a)).toBeDefined();
+      expect(lastHash(a)).toEqual(lastHash(b));
+      // Replayed with no secret at all: every checkpoint matches.
+      expectReplayed(await rr.replay(a), a);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keystrokes_in_a_declarative_closed_root_on_body_replay_masked",
+    async () => {
+      // The page of the upload test above, recorded twice with secrets of
+      // one length; the key pressed with nothing focused is the page's own.
+      const record = (secret: string) =>
+        rr.record("sensitive-body.html", async (p) => {
+          const page = p as unknown as SPage;
+          await page.mouse.click(20, 15);
+          await page.keyboard.type(secret);
+          await page.click("#blank");
+          await page.keyboard.press("k");
+          await page.click("#send");
+        });
+      const first = "Bq7xz-bodyroot";
+      const second = "Wm3kd-hiddenxx";
+      const a = await record(first);
+      const b = await record(second);
+      for (const [records, secret] of [
+        [a, first],
+        [b, second],
+      ] as const) {
+        const text = records
+          .map((r) =>
+            JSON.stringify(r, (_k, v: unknown) =>
+              typeof v === "bigint" ? v.toString() : v,
+            ),
+          )
+          .join("\n");
+        expect(text.includes(secret), secret).toBe(false);
+        const keys = inputsAt(records, "path:#page", "keydown").map(
+          (r) => propsOf(r).key,
+        );
+        expect(keys).toEqual([...Array(secret.length).fill("*"), "k"]);
+      }
+      const lastHash = (records: BoundaryRecord[]) =>
+        records
+          .filter((r): r is RecordOf<"Checkpoint"> => r.record === "Checkpoint")
+          .at(-1)?.state_hash;
+      expect(lastHash(a)).toBeDefined();
+      expect(lastHash(a)).toEqual(lastHash(b));
+      expectReplayed(await rr.replay(a), a);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "masked_keys_at_a_focusable_widget_diverge_substituted_sensitive",
+    async () => {
+      // A widget that takes its own keys and branches on one: `g` reads
+      // Math.random(). Unmarked, it is taken for the host of a closed root
+      // the shim cannot see, its key is masked, and the replay, which hands
+      // the page the logged `*`, takes the other branch and misses the read:
+      // a divergence the page's read of the masked `key` explains.
+      const press = (id: string) =>
+        rr.record("sensitive-closed.html?case=keybranch", async (p) => {
+          const page = p as unknown as SPage;
+          await page.press(`#${id}`, "g");
+          await page.click("#send");
+        });
+      const masked = await press("kneg");
+      const keydown = indexWhere(
+        masked,
+        "Input",
+        (r) => r.type === "keydown" && r.target === "path:#kneg",
+      );
+      expect(propsOf(masked[keydown] as RecordOf<"Input">).key).toBe("*");
+      const random = indexWhere(masked, "Random");
+      const report = await rr.replay(masked);
+      expectDiverged(report, "MissingRead", seqAt(masked, random));
+      expect(report.divergence?.cause).toBe("substituted-sensitive");
+      expect(report.divergence?.sensitiveRead).toMatchObject({
+        target: "path:#kneg",
+        what: "event.key",
+        afterSeq: seqAt(masked, keydown),
+      });
+
+      // The widgets the page declared public: the key is exact in the log
+      // and the replay takes the recorded branch.
+      for (const id of ["kpub", "kct"]) {
+        const exact = await press(id);
+        const keys = inputsAt(exact, `path:#${id}`, "keydown").map(
+          (r) => propsOf(r).key,
+        );
+        expect(keys, id).toEqual(["g"]);
+        expect(indexWhere(exact, "Random"), id).toBeGreaterThanOrEqual(0);
+        expectReplayed(await rr.replay(exact), exact);
+      }
     },
     TIMEOUT,
   );

@@ -59,6 +59,7 @@ import {
   currentSensitiveValues,
   makeCtApi,
   publishCtApi,
+  rememberShadowFieldReads,
   sensitiveState,
   trackShadowRoots,
 } from "./sensitive.js";
@@ -241,6 +242,9 @@ export function installBoundaryShim(
     // The shadow roots the page attaches, before it can attach one: the
     // field focused in a closed one is found through them (§11.3.3).
     (c: SeamContext) => trackShadowRoots(c.w, c.sensitive),
+    // A sensitive field in a shadow tree whose value the page reads: its
+    // value is holed wherever the page sends it (§11.3.1, §5.2.1).
+    (c: SeamContext) => rememberShadowFieldReads(c.w, c.sensitive),
     patchTimeSeams,
     patchNetSeams,
     patchDomSeams,

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>closed shadow roots in markup</title>
+  </head>
+  <body>
+    <main>
+      <div id="dhost" tabindex="0">
+        <template shadowrootmode="closed"><input type="text" /></template>
+      </div>
+      <x-dfocus id="dfhost" tabindex="0">
+        <template shadowrootmode="closed" shadowrootdelegatesfocus
+          ><input type="text"
+        /></template>
+      </x-dfocus>
+      <ul>
+        <li id="item" tabindex="0">item</li>
+      </ul>
+      <x-keys id="kneg" tabindex="0">unmarked widget</x-keys>
+      <x-keys id="kpub" tabindex="0" data-ct-public>public widget</x-keys>
+      <div id="kct" tabindex="0">widget made public by ct.public</div>
+      <input id="pub" type="text" data-ct-public />
+      <button id="send" type="button">Send</button>
+      <p id="status"></p>
+    </main>
+    <script src="sensitive-closed.js"></script>
+  </body>
+</html>

@@ -907,7 +907,7 @@ export function replayInput(ctx: ReplayContext): ReplayInjector {
       }
       // At a sensitive field the logged properties are masked (§11.3.3);
       // the page reading them is a raw sensitive read (§7.2 `cause`).
-      watchMaskedProps(ctx, ev, target);
+      watchMaskedProps(ctx, ev, target, props);
       // Until the injected event's own listener measures it, every trusted
       // event of a captured type is the platform's reaction.
       injection.depth = Infinity;

@@ -161,7 +161,12 @@ This is a monorepo managed with npm workspaces:
   so a test page that shows what was typed must mark the field
   `data-ct-public`. An input event's field is found through shadow trees
   (`eventField`: the composed path, the roots `attachShadow` made, and a
-  fail-closed rule for a tree the shim cannot see into), and what a
+  fail-closed rule for a tree the shim cannot see into, `textEventMaskedAt`:
+  a closed root the HTML parser attaches is invisible to scripts, so a
+  printable key at an element that could host one is masked, `body` only
+  while it matches `:focus`, unless the page declared that element public;
+  the recorder also remembers the values the page reads from sensitive
+  fields inside any shadow tree, `rememberShadowFieldReads`), and what a
   `MutationObserver` hands the page is holed where it names a sensitive
   field's text, on both sides by `mutationRecordsJson`, as `dom-v1` holes a
   sensitive field's value, its `value` attribute and a sensitive textarea's

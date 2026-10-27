@@ -76,6 +76,8 @@ export interface SensitiveState {
     hasAttribute: (this: Element, name: string) => boolean;
     isContentEditable: ((this: HTMLElement) => boolean) | undefined;
     parentElement: (this: Node) => Element | null;
+    rootNode: ((this: Node) => Node) | undefined;
+    matches: (this: Element, selectors: string) => boolean;
     querySelectorAll: (this: Document, s: string) => NodeListOf<Element>;
     composedPath: ((this: Event) => EventTarget[]) | undefined;
     shadowRoot: ((this: Element) => ShadowRoot | null) | undefined;
@@ -138,6 +140,9 @@ export function sensitiveState(w: Window & typeof globalThis): SensitiveState {
       hasAttribute: w.Element.prototype.hasAttribute,
       isContentEditable,
       parentElement: getter(w.Node.prototype, "parentElement"),
+      rootNode: (w.Node.prototype as { getRootNode?: (this: Node) => Node })
+        .getRootNode,
+      matches: w.Element.prototype.matches,
       querySelectorAll: w.Document.prototype
         .querySelectorAll as SensitiveState["getters"]["querySelectorAll"],
       composedPath: (
@@ -418,6 +423,62 @@ export function trackShadowRoots(
   });
 }
 
+/**
+ * Remember the value of a sensitive field inside a shadow tree each time the
+ * page reads it (an `input`'s or a `textarea`'s `value`), so that it is holed
+ * wherever the page then sends it (§5.2.1). The holing scan finds the
+ * document's own fields ({@link currentSensitiveValues}) and the fields
+ * input events were found at, but a field in a closed root the HTML parser
+ * attached is neither: a component reaches it through its own
+ * `ElementInternals`, the shim never does. Called by the recorder before any
+ * page code; replay patches the same getters to report raw reads instead.
+ */
+export function rememberShadowFieldReads(
+  w: Window & typeof globalThis,
+  s: SensitiveState,
+): void {
+  const rootNode = s.getters.rootNode;
+  const ShadowRootCtor = (w as unknown as { ShadowRoot?: typeof ShadowRoot })
+    .ShadowRoot;
+  if (rootNode === undefined || ShadowRootCtor === undefined) return;
+  for (const [proto, get] of [
+    [w.HTMLInputElement.prototype, s.getters.inputValue],
+    [w.HTMLTextAreaElement.prototype, s.getters.textareaValue],
+  ] as const) {
+    const d = Object.getOwnPropertyDescriptor(proto, "value");
+    if (d?.get === undefined) continue;
+    const read = get as (this: unknown) => string;
+    // Patched in place of the platform's accessor, keeping its setter, so
+    // that the page sees the same property shape.
+    const value = {
+      get value(): string {
+        // The platform's own getter first: a receiver that is no field
+        // throws as it would have.
+        const v = read.call(this);
+        try {
+          const el = this as unknown as Element;
+          if (
+            rootNode.call(el) instanceof ShadowRootCtor &&
+            isSensitive(s, el)
+          ) {
+            s.seen.add(el);
+            rememberSensitive(s, v);
+          }
+        } catch {
+          // A field the rule cannot read keeps the platform's answer.
+        }
+        return v;
+      },
+    };
+    Object.defineProperty(proto, "value", {
+      get: Object.getOwnPropertyDescriptor(value, "value")!.get,
+      set: d.set,
+      enumerable: d.enumerable ?? true,
+      configurable: d.configurable ?? true,
+    });
+  }
+}
+
 /** The events whose properties carry what was typed (§11.3.3). */
 function isTextEvent(type: string): boolean {
   return (
@@ -480,6 +541,140 @@ function shadowRootOf(s: SensitiveState, el: Element): ShadowRoot | null {
   }
 }
 
+const HTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
+
+/**
+ * The HTML elements that may host a shadow root besides the autonomous
+ * custom elements (DOM, "valid shadow host name"):
+ * https://dom.spec.whatwg.org/#valid-shadow-host-name. `body` is one too,
+ * but is not listed here: it is the target of every keystroke while nothing
+ * has focus, so it is taken for such a host only while it matches `:focus`
+ * (see {@link mayHostUnseenShadowRoot}).
+ */
+const SHADOW_HOST_NAMES = new Set([
+  "article",
+  "aside",
+  "blockquote",
+  "div",
+  "footer",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "header",
+  "main",
+  "nav",
+  "p",
+  "section",
+  "span",
+]);
+
+/**
+ * The hyphenated names HTML reserves, which are not valid custom element
+ * names (HTML, "valid custom element name"):
+ * https://html.spec.whatwg.org/multipage/custom-elements.html#valid-custom-element-name
+ */
+const RESERVED_HYPHENATED_NAMES = new Set([
+  "annotation-xml",
+  "color-profile",
+  "font-face",
+  "font-face-src",
+  "font-face-uri",
+  "font-face-format",
+  "font-face-name",
+  "missing-glyph",
+]);
+
+/**
+ * Whether `el` may host a shadow tree the shim cannot see into: an HTML
+ * element whose name may host a shadow root (an autonomous custom element,
+ * whose name has a hyphen, or one of {@link SHADOW_HOST_NAMES}) and whose
+ * root, if it has one, is neither open nor one the page attached with
+ * `attachShadow` ({@link trackShadowRoots}).
+ *
+ * A closed root the HTML parser attached from a declarative
+ * `<template shadowrootmode="closed">` is made without any call a script
+ * can see, and the platform gives a script that did not make it no way to
+ * reach it, or to tell that it exists; a keystroke into a field inside it
+ * reaches the window's listeners at the host, exactly as a keystroke at the
+ * host itself does. So the rule is structural: an element that could be such
+ * a host is treated as one (§11.3.1 fails closed).
+ *
+ * `body` is the exception, since every keystroke made while nothing has
+ * focus targets it. It is taken for such a host only while it matches
+ * `:focus`: a shadow host matches `:focus` while an element in its shadow
+ * tree has focus (CSS Scoping, "the :focus pseudo-class on shadow hosts":
+ * https://drafts.csswg.org/css-scoping/#host-selector-focus), and `body`
+ * does not match it while nothing has focus (the document's viewport is
+ * then the focused area, HTML "focused area of the document"). It also
+ * matches when `body` is focusable and focused itself (a `tabindex`), which
+ * cannot be told apart and is treated as a host too.
+ */
+function mayHostUnseenShadowRoot(s: SensitiveState, el: Element): boolean {
+  if (el.namespaceURI !== HTML_NAMESPACE) return false;
+  const name = localName(el);
+  if (name === "body") {
+    if (shadowRootOf(s, el) !== null) return false;
+    try {
+      return s.getters.matches.call(el, ":focus");
+    } catch {
+      // A platform that cannot answer: fail closed.
+      return true;
+    }
+  }
+  const hostName =
+    SHADOW_HOST_NAMES.has(name) ||
+    (name.includes("-") && !RESERVED_HYPHENATED_NAMES.has(name));
+  return hostName && shadowRootOf(s, el) === null;
+}
+
+/**
+ * Whether the page itself declared `el` public (§11.3.1): its last call was
+ * `ct.public(el)`, or, with no call, it carries `data-ct-public` and not
+ * `data-ct-sensitive`. Unlike {@link isSensitive}, an element that is merely
+ * not a free-text field is not public by this rule.
+ */
+function declaredPublic(s: SensitiveState, el: Element): boolean {
+  const mark = s.marks.get(el);
+  if (mark !== undefined) return mark === "public";
+  return (
+    !s.getters.hasAttribute.call(el, "data-ct-sensitive") &&
+    s.getters.hasAttribute.call(el, "data-ct-public")
+  );
+}
+
+/**
+ * Whether a text event of type `type` (§11.3.3) that the shim found at
+ * `field`, an element that is not a value field, is to be treated as at a
+ * sensitive field because it may come from a field inside a shadow tree the
+ * shim cannot see into:
+ *
+ * - an editing event (`beforeinput`, `input`, a composition event), which
+ *   the platform dispatches only at a field;
+ * - a keyboard event at an element that is not focusable itself, so cannot
+ *   be the focused element;
+ * - a keyboard event at an element that may host a shadow tree the shim
+ *   cannot see into ({@link mayHostUnseenShadowRoot}), focusable or not,
+ *   unless the page declared that element public ({@link declaredPublic}):
+ *   a focusable widget that takes its own keys is opted out that way, and
+ *   the declaration covers every key the window sees at it, those from a
+ *   closed tree it may host included.
+ */
+export function textEventMaskedAt(
+  s: SensitiveState,
+  type: string,
+  field: Element,
+): boolean {
+  if (!isTextEvent(type) || isValueField(s, field)) return false;
+  return (
+    isEditingEvent(type) ||
+    !focusableItself(s, field) ||
+    (mayHostUnseenShadowRoot(s, field) && !declaredPublic(s, field))
+  );
+}
+
 /**
  * The field an input event belongs to, and whether it is sensitive
  * (§11.3.1, §11.3.3), seen through shadow trees:
@@ -491,10 +686,12 @@ function shadowRootOf(s: SensitiveState, el: Element): ShadowRoot | null {
  *   `input` or composition event) at the host of a shadow tree the path
  *   hides (a closed one), the focused element inside it, through the roots
  *   the page attached ({@link trackShadowRoots});
- * - failing closed: such an event at an element that is neither a field nor
- *   focusable itself comes from inside a shadow tree the shim cannot see
- *   into, so it is treated as at a sensitive field (an editing event is
- *   only ever dispatched at a field).
+ * - failing closed ({@link textEventMaskedAt}): such an event at an element
+ *   that is not a field, when it may come from inside a shadow tree the
+ *   shim cannot see into, is treated as at a sensitive field: an editing
+ *   event, a keyboard event at an element that is not focusable itself,
+ *   and a keyboard event at an element that may host a tree the shim cannot
+ *   see (a closed root the HTML parser attached, on a focusable host).
  */
 export function eventField(
   s: SensitiveState,
@@ -527,14 +724,7 @@ export function eventField(
   }
   if (field === null) return { field, sensitive: false };
   if (isSensitive(s, field)) return { field, sensitive: true };
-  if (
-    text &&
-    !isValueField(s, field) &&
-    (isEditingEvent(ev.type) || !focusableItself(s, field))
-  ) {
-    return { field, sensitive: true };
-  }
-  return { field, sensitive: false };
+  return { field, sensitive: textEventMaskedAt(s, ev.type, field) };
 }
 
 /**
