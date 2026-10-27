@@ -111,6 +111,8 @@ export interface RecorderOptions {
    * URL, the holes of the sensitive values, the error template. Applied to
    * every record but the fault's own `Refusal`, so nothing the recorder
    * writes escapes it. Absent, records are written as given.
+   * The recorder owns `seq` and `End.last_seq`: it finalizes those fields
+   * after this callback, including any bounded ordinary nested writes.
    */
   sanitize?: (record: BoundaryRecord) => BoundaryRecord;
 }
@@ -468,7 +470,19 @@ export class Recorder {
       throw new Error("injected encoder fault");
     }
     const sanitize = scrub ? this.opts.sanitize : undefined;
-    return encodeFrame(sanitize === undefined ? record : sanitize(record));
+    if (sanitize === undefined) return encodeFrame(record);
+    const sanitized = sanitize(record);
+    // A sanitizer may write ordinary nested records before returning. Copy its
+    // output (which may be frozen), then finalize recorder-owned metadata for
+    // the order actually encoded. Do not reserve until encoding succeeds.
+    if ("seq" in record)
+      return encodeFrame({ ...sanitized, seq: this.nextSeq } as BoundaryRecord);
+    if (record.record === "End")
+      return encodeFrame({
+        ...sanitized,
+        last_seq: this.nextSeq - 1n,
+      } as BoundaryRecord);
+    return encodeFrame(sanitized);
   }
 
   private noteClock(c: SeqFields<"Clock">): void {
