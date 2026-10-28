@@ -37,6 +37,7 @@ import {
 } from "@codetracer/boundary-format";
 
 import { TaskKind } from "./recorder.js";
+import { prepareFetch } from "./fetch-preparation.js";
 import { markPageResponse } from "./seams-platform.js";
 import { holeBytes, holeText } from "./sensitive.js";
 import { sha256Hex } from "./sha256.js";
@@ -121,15 +122,25 @@ function headersJson(pairs: [string, string][]): string {
 }
 
 function patchFetch(ctx: SeamContext): void {
+  const fetch = createRecordFetch(ctx);
+  if (fetch !== undefined) replaceValue(ctx.w, "fetch", fetch);
+}
+
+/**
+ * Prepare native fetch recording without replacing global fetch or installing
+ * the other network seams. Prepares Response/Headers prototypes once per realm
+ * within this owner-library module instance. Share one instance and callable;
+ * independently bundled copies do not share the preparation reservation.
+ * Reuse the exact context/callable; another context or mode cannot replace its
+ * response maps. This does not start a recorder or install a session lifecycle.
+ */
+export function createRecordFetch(ctx: SeamContext): typeof fetch | undefined {
   const { w, rec, orig } = ctx;
   const origFetch = orig.fetch;
   if (origFetch === undefined) return;
-  const responses = patchResponses(ctx);
-
-  replaceValue(
-    w,
-    "fetch",
-    function fetch(input: RequestInfo | URL, init?: RequestInit) {
+  return prepareFetch(w, ctx, "record", () => {
+    const responses = patchResponses(ctx);
+    return function fetch(input: RequestInfo | URL, init?: RequestInit) {
       if (!rec.recording) return origFetch.call(w, input, init);
       const ids = rec.guard(() => {
         const isRequest = input instanceof w.Request;
@@ -227,8 +238,8 @@ function patchFetch(ctx: SeamContext): void {
           throw err;
         },
       );
-    },
-  );
+    };
+  });
 }
 
 /** `XMLHttpRequest.readyState` values (XHR standard). */

@@ -42,7 +42,7 @@ import { type ReplayContext, bitsToNumber } from "./context.js";
  * it there, where the record side wrote it, after the `Task`.
  */
 export function replayPlatformTask<T>(
-  ctx: ReplayContext,
+  ctx: Pick<ReplayContext, "replay" | "orig" | "nextTaskId">,
   settled: Promise<T>,
   check?: (taskId: bigint, result: { ok: boolean; value: unknown }) => void,
 ): Promise<T> {

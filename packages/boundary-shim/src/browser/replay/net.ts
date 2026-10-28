@@ -22,6 +22,7 @@ import {
 
 import { asConstructor, replaceAccessor, replaceValue } from "../context.js";
 import { TaskKind } from "../recorder.js";
+import { prepareFetch } from "../fetch-preparation.js";
 import {
   WS_EXTENSIONS_HEADER,
   WS_PROTOCOL_HEADER,
@@ -78,7 +79,7 @@ export function failureError(
 
 /** The `{"outcome": n}` of a body's end (`WsMessage{dir 4}`, §10.4). */
 export function endOutcome(
-  ctx: ReplayContext,
+  ctx: Pick<ReplayContext, "replay">,
   m: RecordOf<"WsMessage">,
 ): number {
   const text = new TextDecoder().decode(blobBytes(ctx.replay, m.data));
@@ -98,166 +99,184 @@ interface BodyRead {
 }
 
 function replayFetch(ctx: ReplayContext): void {
+  const fetch = createReplayFetch(ctx);
+  if (fetch !== undefined) replaceValue(ctx.w, "fetch", fetch);
+}
+
+/** Only the existing cursor, originals, holing and allocators fetch needs. */
+export type FetchReplayContext = Pick<
+  ReplayContext,
+  "w" | "replay" | "orig" | "holes" | "nextTaskId" | "nextReqId"
+>;
+
+/**
+ * Prepare the existing owned-loop fetch implementation without replacing global
+ * fetch or installing unrelated network seams. Response/Headers prototypes are
+ * prepared once per realm within this owner-library module instance. Share one
+ * instance/callable and this exact context across framework backends; independent
+ * bundles do not share the preparation reservation.
+ */
+export function createReplayFetch(
+  ctx: FetchReplayContext,
+): typeof fetch | undefined {
   const { w, replay, orig } = ctx;
   if (orig.fetch === undefined || orig.Response === undefined) return;
   const OrigResponse = orig.Response;
-  const OrigStream = orig.ReadableStream ?? w.ReadableStream;
-  const OrigPromise = orig.Promise;
-  const queueMicrotask = orig.queueMicrotask;
+  return prepareFetch(w, ctx, "replay", () => {
+    const OrigStream = orig.ReadableStream ?? w.ReadableStream;
+    const OrigPromise = orig.Promise;
+    const queueMicrotask = orig.queueMicrotask;
 
-  // A constructed Response cannot be given what only the platform sets on
-  // one: the Response accessors answer those from `meta` for a replayed
-  // response, and `clone()` carries them over (as stream-body.ts does on
-  // record). The log holds each of them (`NetResponse` `status_text`,
-  // `url`, `redirected`, `response_type`; §5.2).
-  const meta = new WeakMap<object, Record<string, unknown>>();
-  // A replayed response's headers (and its clones') -> headers the platform
-  // made immutable (a `Response.error()`'s, guard "immutable"; Fetch,
-  // "Headers class"): the mutators run on those and throw exactly as they
-  // do on a fetched response's headers.
-  const frozen = new WeakMap<object, Headers>();
-  const immutableHeaders = (): Headers => OrigResponse.error().headers;
-  for (const [name, f] of orig.headersMutators) {
-    const patched = function (this: unknown): unknown {
-      const platform = frozen.get(this as object);
-      return f.apply(platform ?? this, Array.from(arguments));
-    };
-    Object.defineProperty(patched, "name", { value: name });
-    replaceValue(w.Headers.prototype, name, patched);
-  }
-  for (const [name, g] of orig.responseGetters) {
-    const get = g.descriptor.get!;
-    replaceAccessor(
-      g.owner,
-      name,
-      function (this: unknown) {
-        const m = meta.get(this as object);
-        return m !== undefined && name in m ? m[name] : get.call(this);
-      },
-      g.descriptor.set,
-    );
-  }
-  // Whether this platform's response bodies are byte streams.
-  let byteBodies = false;
-  try {
-    new OrigResponse("").body!.getReader({ mode: "byob" }).releaseLock();
-    byteBodies = true;
-  } catch {
-    byteBodies = false;
-  }
-  // A streamed response (and its clones) -> the whole-body reads made of
-  // it, waiting for the tasks the recorder wrote when they settled.
-  const consuming = new WeakMap<object, BodyRead[]>();
-  const origClone = orig.responseClone;
-  if (origClone !== undefined) {
-    replaceValue(
-      OrigResponse.prototype,
-      "clone",
-      function clone(this: Response) {
-        const c = origClone.call(this);
-        const m = meta.get(this);
-        if (m !== undefined) {
-          meta.set(c, m);
-          frozen.set(c.headers, immutableHeaders());
-        }
-        const q = consuming.get(this);
-        if (q !== undefined) consuming.set(c, q);
-        return c;
-      },
-    );
-  }
-
-  // A whole-body read (`json()`, `text()`, …) of a streamed response settles
-  // in a task of the platform's own, which the recorder wrote as a `Task`
-  // of the request (stream-body.ts, BODY_CONSUMERS): the page's
-  // continuation runs only when the scheduler releases that task, and the
-  // scheduler waits for the read to settle.
-  const then = orig.promiseThen;
-  for (const name of BODY_CONSUMERS) {
-    const read = (OrigResponse.prototype as unknown as Record<string, unknown>)[
-      name
-    ];
-    if (typeof read !== "function") continue;
-    replaceValue(OrigResponse.prototype, name, function (this: Response) {
-      const settled = (read as (...a: unknown[]) => Promise<unknown>).apply(
-        this,
-        Array.from(arguments),
-      );
-      const q = consuming.get(this);
-      // A response no fetch of the page produced (or one with no body):
-      // its read settles in a platform task of its own (§6, Task kind 13).
-      if (q === undefined) return replayPlatformTask(ctx, settled);
-      const r: BodyRead = { released: false };
-      q.push(r);
-      return new OrigPromise((resolve, reject) => {
-        const settle = (go: () => void) => {
-          r.go = go;
-          if (r.released) {
-            go();
-            r.done?.();
-          }
-        };
-        (then as Promise<unknown>["then"]).call(
-          settled,
-          (v) => settle(() => resolve(v)),
-          (e: unknown) => settle(() => reject(e)),
-        );
-      });
-    });
-  }
-
-  /** The page's response for a logged head or whole response. */
-  const responseOf = (
-    r: RecordOf<"NetResponse">,
-    body: BodyInit | null,
-    reads?: BodyRead[],
-  ): Response => {
-    const headers = JSON.parse(r.headers) as [string, string][];
-    const status = r.status;
-    const type = RESPONSE_TYPE_NAMES.get(r.response_type);
-    if (type === undefined) {
-      replay.fail(
-        "ArgumentMismatch",
-        `a fetch response's NetResponse.response_type is ${r.response_type}, which names no response type`,
+    // A constructed Response cannot be given what only the platform sets on
+    // one: the Response accessors answer those from `meta` for a replayed
+    // response, and `clone()` carries them over (as stream-body.ts does on
+    // record). The log holds each of them (`NetResponse` `status_text`,
+    // `url`, `redirected`, `response_type`; §5.2).
+    const meta = new WeakMap<object, Record<string, unknown>>();
+    // A replayed response's headers (and its clones') -> headers the platform
+    // made immutable (a `Response.error()`'s, guard "immutable"; Fetch,
+    // "Headers class"): the mutators run on those and throw exactly as they
+    // do on a fetched response's headers.
+    const frozen = new WeakMap<object, Headers>();
+    const immutableHeaders = (): Headers => OrigResponse.error().headers;
+    for (const [name, f] of orig.headersMutators) {
+      const patched = function (this: unknown): unknown {
+        const platform = frozen.get(this as object);
+        return f.apply(platform ?? this, Array.from(arguments));
+      };
+      Object.defineProperty(patched, "name", { value: name });
+      replaceValue(w.Headers.prototype, name, patched);
+    }
+    for (const [name, g] of orig.responseGetters) {
+      const get = g.descriptor.get!;
+      replaceAccessor(
+        g.owner,
+        name,
+        function (this: unknown) {
+          const m = meta.get(this as object);
+          return m !== undefined && name in m ? m[name] : get.call(this);
+        },
+        g.descriptor.set,
       );
     }
-    const m: Record<string, unknown> = {
-      url: r.url,
-      redirected: r.redirected === 1,
-      type,
-      statusText: r.status_text,
-    };
-    const init = (statusText: boolean): ResponseInit => ({
-      status,
-      headers,
-      ...(statusText ? { statusText: r.status_text } : {}),
-    });
-    const content = NULL_BODY.has(status) ? null : body;
-    let resp: Response;
+    // Whether this platform's response bodies are byte streams.
+    let byteBodies = false;
     try {
-      try {
-        resp = new OrigResponse(content, init(true));
-      } catch {
-        // A reason phrase the constructor refuses: the accessor answers
-        // it from the log anyway.
-        resp = new OrigResponse(content, init(false));
-      }
-      if (reads !== undefined && body !== null) consuming.set(resp, reads);
+      new OrigResponse("").body!.getReader({ mode: "byob" }).releaseLock();
+      byteBodies = true;
     } catch {
-      // A status the constructor refuses (an opaque response's 0).
-      resp = new OrigResponse(null, { headers });
-      Object.defineProperty(resp, "status", { value: status });
-      Object.defineProperty(resp, "ok", { value: false });
+      byteBodies = false;
     }
-    meta.set(resp, m);
-    frozen.set(resp.headers, immutableHeaders());
-    return resp;
-  };
+    // A streamed response (and its clones) -> the whole-body reads made of
+    // it, waiting for the tasks the recorder wrote when they settled.
+    const consuming = new WeakMap<object, BodyRead[]>();
+    const origClone = orig.responseClone;
+    if (origClone !== undefined) {
+      replaceValue(
+        OrigResponse.prototype,
+        "clone",
+        function clone(this: Response) {
+          const c = origClone.call(this);
+          const m = meta.get(this);
+          if (m !== undefined) {
+            meta.set(c, m);
+            frozen.set(c.headers, immutableHeaders());
+          }
+          const q = consuming.get(this);
+          if (q !== undefined) consuming.set(c, q);
+          return c;
+        },
+      );
+    }
 
-  replaceValue(
-    w,
-    "fetch",
-    function fetch(input: RequestInfo | URL, init?: RequestInit) {
+    // A whole-body read (`json()`, `text()`, …) of a streamed response settles
+    // in a task of the platform's own, which the recorder wrote as a `Task`
+    // of the request (stream-body.ts, BODY_CONSUMERS): the page's
+    // continuation runs only when the scheduler releases that task, and the
+    // scheduler waits for the read to settle.
+    const then = orig.promiseThen;
+    for (const name of BODY_CONSUMERS) {
+      const read = (
+        OrigResponse.prototype as unknown as Record<string, unknown>
+      )[name];
+      if (typeof read !== "function") continue;
+      replaceValue(OrigResponse.prototype, name, function (this: Response) {
+        const settled = (read as (...a: unknown[]) => Promise<unknown>).apply(
+          this,
+          Array.from(arguments),
+        );
+        const q = consuming.get(this);
+        // A response no fetch of the page produced (or one with no body):
+        // its read settles in a platform task of its own (§6, Task kind 13).
+        if (q === undefined) return replayPlatformTask(ctx, settled);
+        const r: BodyRead = { released: false };
+        q.push(r);
+        return new OrigPromise((resolve, reject) => {
+          const settle = (go: () => void) => {
+            r.go = go;
+            if (r.released) {
+              go();
+              r.done?.();
+            }
+          };
+          (then as Promise<unknown>["then"]).call(
+            settled,
+            (v) => settle(() => resolve(v)),
+            (e: unknown) => settle(() => reject(e)),
+          );
+        });
+      });
+    }
+
+    /** The page's response for a logged head or whole response. */
+    const responseOf = (
+      r: RecordOf<"NetResponse">,
+      body: BodyInit | null,
+      reads?: BodyRead[],
+    ): Response => {
+      const headers = JSON.parse(r.headers) as [string, string][];
+      const status = r.status;
+      const type = RESPONSE_TYPE_NAMES.get(r.response_type);
+      if (type === undefined) {
+        replay.fail(
+          "ArgumentMismatch",
+          `a fetch response's NetResponse.response_type is ${r.response_type}, which names no response type`,
+        );
+      }
+      const m: Record<string, unknown> = {
+        url: r.url,
+        redirected: r.redirected === 1,
+        type,
+        statusText: r.status_text,
+      };
+      const init = (statusText: boolean): ResponseInit => ({
+        status,
+        headers,
+        ...(statusText ? { statusText: r.status_text } : {}),
+      });
+      const content = NULL_BODY.has(status) ? null : body;
+      let resp: Response;
+      try {
+        try {
+          resp = new OrigResponse(content, init(true));
+        } catch {
+          // A reason phrase the constructor refuses: the accessor answers
+          // it from the log anyway.
+          resp = new OrigResponse(content, init(false));
+        }
+        if (reads !== undefined && body !== null) consuming.set(resp, reads);
+      } catch {
+        // A status the constructor refuses (an opaque response's 0).
+        resp = new OrigResponse(null, { headers });
+        Object.defineProperty(resp, "status", { value: status });
+        Object.defineProperty(resp, "ok", { value: false });
+      }
+      meta.set(resp, m);
+      frozen.set(resp.headers, immutableHeaders());
+      return resp;
+    };
+
+    return function fetch(input: RequestInfo | URL, init?: RequestInit) {
       const isRequest = input instanceof w.Request;
       const method = normaliseMethod(
         init?.method ?? (isRequest ? (input as Request).method : "GET"),
@@ -425,8 +444,8 @@ function replayFetch(ctx: ReplayContext): void {
             });
         }
       });
-    },
-  );
+    };
+  });
 }
 
 function replayBeacon({
