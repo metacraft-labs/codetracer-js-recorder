@@ -119,10 +119,30 @@ export type FetchReplayContext = Pick<
 export function createReplayFetch(
   ctx: FetchReplayContext,
 ): typeof fetch | undefined {
+  return prepareReplayFetch(ctx, "realm");
+}
+
+/**
+ * Reuse fetch replay while leaving foreign Response consumers native. The
+ * existing metadata WeakMap owns every response this callable creates, including
+ * whole/null bodies and clones. Backend selection never transfers that ownership.
+ * Share this exact context/callable; realm-wide preparation is a scope conflict.
+ */
+export function createFrameworkReplayFetch(
+  ctx: FetchReplayContext,
+): typeof fetch | undefined {
+  return prepareReplayFetch(ctx, "fetch");
+}
+
+/** One body/metadata/task implementation, with a fixed preparation scope. */
+function prepareReplayFetch(
+  ctx: FetchReplayContext,
+  scope: "realm" | "fetch",
+): typeof fetch | undefined {
   const { w, replay, orig } = ctx;
   if (orig.fetch === undefined || orig.Response === undefined) return;
   const OrigResponse = orig.Response;
-  return prepareFetch(w, ctx, "replay", () => {
+  const make = () => {
     const OrigStream = orig.ReadableStream ?? w.ReadableStream;
     const OrigPromise = orig.Promise;
     const queueMicrotask = orig.queueMicrotask;
@@ -205,6 +225,10 @@ export function createReplayFetch(
           this,
           Array.from(arguments),
         );
+        // A framework can select a native backend after preparation. Only our
+        // own responses belong to replay; do not allocate a task or wrap the
+        // native Promise for another response, even after replay has finished.
+        if (scope === "fetch" && !meta.has(this)) return settled;
         const q = consuming.get(this);
         // A response no fetch of the page produced (or one with no body):
         // its read settles in a platform task of its own (§6, Task kind 13).
@@ -445,7 +469,8 @@ export function createReplayFetch(
         }
       });
     };
-  });
+  };
+  return prepareFetch(w, ctx, "replay", make, scope);
 }
 
 function replayBeacon({

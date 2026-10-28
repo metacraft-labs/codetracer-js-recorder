@@ -9,6 +9,7 @@
 interface Preparation {
   context: object;
   mode: "record" | "replay";
+  scope: "realm" | "fetch";
   fetch?: typeof fetch;
 }
 let preparations: WeakMap<object, Preparation> | undefined;
@@ -19,6 +20,7 @@ export function prepareFetch(
   context: object,
   mode: Preparation["mode"],
   make: () => typeof fetch,
+  scope: Preparation["scope"] = "realm",
 ): typeof fetch {
   const previous = preparations?.get(realm);
   if (previous !== undefined) {
@@ -27,12 +29,17 @@ export function prepareFetch(
         "fetch preparation belongs to another context or mode",
       );
     }
+    if (previous.scope !== scope) {
+      throw new TypeError(
+        "fetch preparation belongs to another response scope",
+      );
+    }
     if (previous.fetch === undefined) {
       throw new TypeError("fetch preparation is incomplete or failed");
     }
     return previous.fetch;
   }
-  const preparation: Preparation = { context, mode };
+  const preparation: Preparation = { context, mode, scope };
   (preparations ??= new WeakMap()).set(realm, preparation);
   // A failed setup may have changed a prototype. Retain the reservation rather
   // than retrying over a partial installation; propagate its original error.

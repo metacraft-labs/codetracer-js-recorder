@@ -47,6 +47,82 @@ const later = (fn: () => void, ms: number) => {
 const html =
   '<!doctype html><input type="password" value="native-sensitive-value"><main id="out"></main>';
 
+// Append ownership probes to the existing genuine fixture's lexical helpers.
+// Only its import alias selects the fixed framework factory; the actual owner
+// implementation, native HTTP, Recorder, codec and owned loop remain unchanged.
+async function isolationBundle(mutation?: string): Promise<string> {
+  const original = fs.readFileSync(fixture, "utf8");
+  const anchor =
+    'import { createReplayFetch } from "../../../packages/boundary-shim/src/browser/replay/net.js";';
+  expect(original.split(anchor)).toHaveLength(2);
+  const contents =
+    original.replace(
+      anchor,
+      anchor.replace(
+        "{ createReplayFetch }",
+        "{ createFrameworkReplayFetch as createReplayFetch }",
+      ),
+    ) +
+    "\n" +
+    fs.readFileSync(
+      path.join(__dirname, "fixtures/fetch-response-isolation.inc.js"),
+      "utf8",
+    );
+  const plugins = mutation
+    ? [
+        {
+          name: "actual-owner-isolation-inverse",
+          setup(plugin: import("esbuild").PluginBuild) {
+            plugin.onLoad(
+              { filter: /\/(replay\/net|fetch-preparation)\.ts$/ },
+              async (args) => {
+                let source = await fs.promises.readFile(args.path, "utf8");
+                let from: string, to: string;
+                if (mutation === "scope") {
+                  if (!args.path.endsWith("fetch-preparation.ts")) return;
+                  from = "previous.scope !== scope";
+                  to = "false";
+                } else {
+                  if (!args.path.endsWith("/replay/net.ts")) return;
+                  from =
+                    'if (scope === "fetch" && !meta.has(this)) return settled;';
+                  to =
+                    mutation === "foreign-task"
+                      ? "if (false) return settled;"
+                      : mutation === "identity"
+                        ? 'if (scope === "fetch" && !meta.has(this)) return settled.then(v => v);'
+                        : 'if (scope === "fetch" && !consuming.has(this)) return settled;';
+                }
+                expect(source.split(from), "exact inverse anchor").toHaveLength(
+                  2,
+                );
+                source = source.replace(from, to);
+                return {
+                  contents: source,
+                  loader: "ts",
+                  resolveDir: path.dirname(args.path),
+                };
+              },
+            );
+          },
+        },
+      ]
+    : [];
+  return (
+    await build({
+      stdin: { contents, resolveDir: path.dirname(fixture) },
+      absWorkingDir: root,
+      bundle: true,
+      platform: "browser",
+      format: "iife",
+      target: "es2020",
+      write: false,
+      define: { __FETCH_LEGACY__: "false" },
+      plugins,
+    })
+  ).outputFiles[0].text;
+}
+
 async function bundled(mutation?: string): Promise<string> {
   if (mutation === "legacy") {
     const output = await build({
@@ -231,6 +307,15 @@ beforeAll(async () => {
         body,
         header: req.headers["x-factory-test"] as string | undefined,
       });
+      if (req.url!.startsWith("/api/foreign")) {
+        res.setHeader("Content-Type", "application/x-www-form-urlencoded");
+        res.end(
+          req.url!.includes("consumer=json")
+            ? '{"foreign":true}'
+            : "field=value",
+        );
+        return;
+      }
       if (req.url === "/api/fail") {
         req.socket.destroy();
         return;
@@ -844,4 +929,352 @@ describe("direct owner fetch library", () => {
       },
       TIMEOUT,
     );
+});
+
+// Fixed framework entry only; generic/immutable legacy tests above stay intact.
+describe("framework fetch response ownership", () => {
+  let scoped: string;
+  beforeAll(async () => {
+    scoped = await isolationBundle();
+  }, TIMEOUT);
+  for (const consumer of [
+    "text",
+    "json",
+    "arrayBuffer",
+    "blob",
+    "formData",
+    "bytes",
+  ])
+    for (const copy of ["native", "clone", "constructed"])
+      for (const state of ["pending", "done", "diverged"])
+        it(
+          `${consumer}/${copy}/${state} keeps the exact foreign native Promise and cursor`,
+          async () => {
+            const native = await page(scoped);
+            const available = await native.evaluate(() =>
+              (window as any).factoryAvailable(),
+            );
+            expect(available).toContain(consumer);
+            const log = await native.evaluate(() =>
+              (window as any).factoryNeutralLog(),
+            );
+            const p = await page(scoped),
+              beforeRequests = requests.length;
+            const out: any = await p.evaluate(
+              (input) => (window as any).factoryIsolation(input),
+              { log, consumer, copy, state, scope: "fetch" },
+            );
+            expect(out.error).toBeUndefined();
+            expect(out.identity).toBe(true);
+            expect(out.sameReceiver).toBe(true);
+            expect(out.sameArgs).toBe(true);
+            expect(out.sameCallable).toBe(true);
+            expect(out.unchanged).toBe(true);
+            expect(out.globalFetchUnchanged).toBe(true);
+            expect(out.wrongScope).toEqual({
+              name: "TypeError",
+              message: "fetch preparation belongs to another response scope",
+            });
+            expect(out.wrongContext).toEqual({
+              name: "TypeError",
+              message: "fetch preparation belongs to another context or mode",
+            });
+            expect(out.after).toEqual(out.before);
+            expect(out.failedUnchanged).toBe(true);
+            expect(out.counters).toEqual(["1", "1"]);
+            expect(requests.length).toBe(
+              beforeRequests + (copy === "constructed" ? 0 : 1),
+            );
+            const bytes = Array.from(Buffer.from("field=value"));
+            expect(out.value).toEqual(
+              consumer === "text"
+                ? "field=value"
+                : consumer === "json"
+                  ? { foreign: true }
+                  : consumer === "formData"
+                    ? [["field", "value"]]
+                    : consumer === "blob"
+                      ? { size: 11, type: "application/x-www-form-urlencoded" }
+                      : bytes,
+            );
+            if (state === "diverged") {
+              expect(out.status.state).toBe("diverged");
+              expect(out.before.record).toMatchObject({
+                record: "Clock",
+                src: 2,
+              });
+            } else {
+              expect(out.neutral.storage).toMatchObject({
+                record: "StorageRead",
+                area: 1,
+                key: "foreign-neutral",
+                value: "neutral",
+              });
+              expect(out.neutral.clock).toMatchObject({
+                record: "Clock",
+                src: 2,
+              });
+              expect(out.neutral.status.state).toBe("done");
+              expect(out.neutral.status.checkpoints).toBe(1);
+            }
+          },
+          TIMEOUT,
+        );
+  for (const mode of [
+    "delayed-text",
+    "ready-text",
+    "clone-meta",
+    "opaque-null",
+    "abort-head",
+    "abort-body",
+    "failure-head",
+    "invalid-json",
+  ])
+    it(
+      mode + " preserves actual owned replay with fixed response scope",
+      async () => {
+        const r = await record(mode),
+          count = requests.length;
+        const out = await replay(mode, r, scoped);
+        expect(out.status.state, JSON.stringify(out)).toBe("done");
+        expect(out.status.checkpoints).toBe(1);
+        expect(out.result).toEqual(r.result);
+        expect(out.status.tasks).toBe(
+          r.records.filter((r) => r.record === "Task").length,
+        );
+        expect(out.witnessed).toBe(true);
+        expect(out.raw).toBe(0);
+        expect(out.error).toBeUndefined();
+        expect(requests.length).toBe(count);
+      },
+      TIMEOUT,
+    );
+  for (const mutation of ["foreign-task", "identity", "scope"])
+    it(
+      "compiled owner " +
+        mutation +
+        " inverse fails its exact ownership assertion",
+      async () => {
+        const source = await isolationBundle(mutation),
+          r = await page(scoped),
+          log = await r.evaluate(() => (window as any).factoryNeutralLog()),
+          p = await page(source);
+        const out: any = await p.evaluate(
+          (input) => (window as any).factoryIsolation(input),
+          {
+            log,
+            consumer: "text",
+            copy: "constructed",
+            state: "pending",
+            scope: "fetch",
+          },
+        );
+        if (mutation === "foreign-task") {
+          expect(out.error.divergence.kind).toBe("ExtraRead");
+          expect(out.error.divergence.seq).toBe("1");
+          expect(out.after).toEqual(out.before);
+          expect(out.counters).toEqual(["2", "1"]);
+        } else if (mutation === "identity") {
+          expect(out.identity).toBe(false);
+          expect(out.value).toBe("field=value");
+          expect(out.after).toEqual(out.before);
+          expect(out.neutral.status.state).toBe("done");
+        } else {
+          expect(out.wrongScope).toBeNull();
+          expect(out.sameCallable).toBe(true);
+          expect(out.value).toBe("field=value");
+          expect(out.neutral.status.state).toBe("done");
+        }
+      },
+      TIMEOUT,
+    );
+});
+
+describe("framework foreign failure and null-body controls", () => {
+  for (const consumer of [
+    "text",
+    "json",
+    "arrayBuffer",
+    "blob",
+    "formData",
+    "bytes",
+  ])
+    for (const failure of ["used", "receiver"])
+      it(
+        consumer +
+          " " +
+          failure +
+          " retains exact native rejection and Promise",
+        async () => {
+          const scoped = await isolationBundle(),
+            r = await page(scoped),
+            log = await r.evaluate(() => (window as any).factoryNeutralLog()),
+            p = await page(scoped);
+          const out: any = await p.evaluate(
+            (input) => (window as any).factoryIsolation(input),
+            {
+              log,
+              consumer,
+              copy: "constructed",
+              state: "pending",
+              scope: "fetch",
+              failure,
+            },
+          );
+          expect(out.baselineError).toMatchObject({ name: "TypeError" });
+          expect(out.error).toEqual(out.baselineError);
+          expect(out.identity).toBe(true);
+          expect(out.sameReceiver).toBe(true);
+          expect(out.sameArgs).toBe(true);
+          expect(out.after).toEqual(out.before);
+          expect(out.counters).toEqual(["1", "1"]);
+          expect(out.neutral.status.state).toBe("done");
+        },
+        TIMEOUT,
+      );
+  it(
+    "compiled stream-membership inverse leaves the exact owned null-body TaskReg pending",
+    async () => {
+      const mutated = await isolationBundle("stream-membership"),
+        r = await record("opaque-null"),
+        count = requests.length;
+      const out = await replay("opaque-null", r, mutated, true);
+      expect(out.result).toEqual(r.result);
+      expect(out.error).toBeUndefined();
+      expect(out.raw).toBe(0);
+      expect(out.witnessed).toBe(true);
+      expect(out.next).toMatchObject({
+        kind: "TaskReg",
+        record: { record: "TaskReg", kind: 13 },
+      });
+      const pending = r.records.find(
+        (record) => record.record === "TaskReg" && record.kind === 13,
+      );
+      expect(pending).toBeDefined();
+      expect(out.next.record).toEqual(pending);
+      expect(out.status.state).not.toBe("done");
+      expect(out.status.checkpoints).toBe(0);
+      expect(requests.length).toBe(count);
+    },
+    TIMEOUT,
+  );
+});
+
+describe("framework preparation scope lifecycle", () => {
+  for (const key of ["fetch", "Response"])
+    it(
+      "missing " + key + " retains existing no-op without reserving scope",
+      async () => {
+        const source = await isolationBundle(),
+          r = await page(source),
+          log = await r.evaluate(() => (window as any).factoryNeutralLog()),
+          p = await page(source);
+        expect(
+          await p.evaluate(
+            (input) =>
+              (window as any).factoryScopeSetup(
+                input.log,
+                "missing",
+                input.key,
+              ),
+            { log, key },
+          ),
+        ).toEqual({
+          absent: true,
+          unchanged: true,
+          restored: "function",
+          reuse: true,
+        });
+      },
+      TIMEOUT,
+    );
+  it(
+    "rejects reverse realm-to-framework scope before prototype changes",
+    async () => {
+      const source = await isolationBundle(),
+        r = await page(source),
+        log = await r.evaluate(() => (window as any).factoryNeutralLog()),
+        p = await page(source);
+      expect(
+        await p.evaluate(
+          (log) => (window as any).factoryScopeSetup(log, "reverse"),
+          log,
+        ),
+      ).toEqual({
+        conflict: {
+          name: "TypeError",
+          message: "fetch preparation belongs to another response scope",
+        },
+        unchanged: true,
+      });
+    },
+    TIMEOUT,
+  );
+  it(
+    "retains original failure and refuses scoped reentry and retry",
+    async () => {
+      const source = await isolationBundle(),
+        r = await page(source),
+        log = await r.evaluate(() => (window as any).factoryNeutralLog()),
+        p = await page(source);
+      expect(
+        await p.evaluate(
+          (log) => (window as any).factoryScopeSetup(log, "failure"),
+          log,
+        ),
+      ).toEqual({
+        same: true,
+        partialChanged: true,
+        reentry: {
+          name: "TypeError",
+          message: "fetch preparation is incomplete or failed",
+        },
+        retry: {
+          name: "TypeError",
+          message: "fetch preparation is incomplete or failed",
+        },
+        unchanged: true,
+      });
+    },
+    TIMEOUT,
+  );
+  it(
+    "native foreign read preserves the following genuine owned request and neutral records",
+    async () => {
+      const source = await isolationBundle(),
+        r = await page(source),
+        recorded: any = await r.evaluate(() =>
+          (window as any).factoryIsolationRecordSequence(),
+        ),
+        p = await page(source),
+        count = requests.length;
+      await p.evaluate(() => {
+        document.querySelector("input")!.value = "replay-placeholder-value";
+      });
+      const out: any = await p.evaluate(
+        (log) => (window as any).factoryIsolationReplaySequence(log),
+        recorded.log,
+      );
+      expect(out.before).toEqual(out.after);
+      expect(out.before.kind).toBe("NetRequest");
+      expect(out.text).toBe("field=value");
+      expect(out.clock).toMatchObject({ record: "Clock", src: 2 });
+      expect(out.storage).toMatchObject({
+        record: "StorageRead",
+        key: "foreign-neutral",
+        value: "neutral",
+      });
+      expect(out.result).toEqual(recorded.result);
+      expect(out.raw).toBe(0);
+      expect(out.witnessed).toBe(true);
+      expect(out.status.state).toBe("done");
+      expect(out.status.checkpoints).toBe(1);
+      expect(out.status.tasks).toBe(
+        recorded.records.filter((r: any) => r.record === "Task").length,
+      );
+      expect(requests.length).toBe(count + 1);
+      expect(requests.at(-1)!.url).toBe("/api/foreign?consumer=text");
+    },
+    TIMEOUT,
+  );
 });
