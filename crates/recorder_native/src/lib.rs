@@ -2347,7 +2347,7 @@ fn write_binary_trace(
         if !virtual_path.ends_with(".fmt.js") {
             continue;
         }
-        let map_key = format!("{}.map", virtual_path);
+        let map_key = format!("{virtual_path}.map");
         let Some(path_id) = state.manifest.paths.iter().position(|p| p == virtual_path) else {
             // Virtual path didn't make it into manifest.paths — leave
             // the sidecar fallback in place so the formatted view is
@@ -2383,9 +2383,8 @@ fn write_binary_trace(
                 // just won't appear in the canonical srcviews stream
                 // for this file.
                 eprintln!(
-                    "[codetracer-js-recorder] register_source_view failed for {}: {} \
+                    "[codetracer-js-recorder] register_source_view failed for {virtual_path}: {err} \
                      (falling back to <trace>/files/ sidecar)",
-                    virtual_path, err,
                 );
             }
         }

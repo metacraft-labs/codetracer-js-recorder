@@ -79,7 +79,7 @@ format:
 # Lint Rust code
 lint-rust:
     cargo fmt --check --manifest-path crates/recorder_native/Cargo.toml
-    cargo clippy --manifest-path crates/recorder_native/Cargo.toml
+    cargo clippy --manifest-path crates/recorder_native/Cargo.toml -- -D warnings
 
 # Lint TypeScript/JavaScript code with the lockfile's prettier (never npx;
 # see scripts/prettier.sh)
