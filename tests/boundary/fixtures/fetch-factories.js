@@ -227,6 +227,44 @@ async function workflow(mode, call, delay, reuse) {
       });
     }
     await stop;
+  } else if (mode.startsWith("json-body:")) {
+    const [, body, timing, copy, state] = mode.split(":"),
+      r = await call("/api/json-body?body=" + body + "&timing=" + timing),
+      target = copy === "clone" ? r.clone() : r;
+    // Drain the sibling branch, proving all bytes/end are already available
+    // to the target. A timer on a contended test host proves no such thing.
+    if (timing === "ready") await target.clone().text();
+    let reader;
+    if (state === "locked") reader = target.body.getReader();
+    if (state === "disturbed") await target.text();
+    const parse = JSON.parse;
+    if (state === "replaced-parser") {
+      JSON.parse = (text, ...args) => {
+        if (text === '{"value":"☃"}') {
+          throw new Error("page JSON.parse must not be called");
+        }
+        return parse(text, ...args);
+      };
+    }
+    try {
+      const reading = target.json().then(
+        (value) => ({ value }),
+        (e) => ({ name: e.name, message: e.message }),
+      );
+      // The real server holds the body until json() is pending. The release
+      // is an ordinary recorded request, replayed through the same owner.
+      if (timing === "pending") {
+        const released = await call(
+          "/api/json-release?id=" + r.headers.get("x-json-body"),
+        );
+        await released.text();
+      }
+      out.push(await reading);
+    } finally {
+      JSON.parse = parse;
+      reader?.releaseLock();
+    }
+    out.push({ bodyUsed: target.bodyUsed });
   } else if (mode === "invalid-json") {
     const r = await call("/api/invalid-json");
     try {

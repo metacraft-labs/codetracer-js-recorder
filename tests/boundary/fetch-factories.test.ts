@@ -5,6 +5,9 @@
  * exception differences are diagnostics, not claimed native parity. No mocked transport,
  * cursor, Response or runner. A setup-only iterator fault is explicitly injected
  * in the fixture to witness original exception identity/reentry/failed retry.
+ * JSON cases hold the HTTP body until json() starts or drain a sibling clone
+ * first, comparing exact parser diagnostics and owned replay while retaining
+ * native buffered-body WebIDL context as a strict counterexample.
  * Native timer observation shares Recorder/Replay ids with fetch, not a fake
  * wire tape. This is bounded library preparation, not framework conformance.
  */
@@ -37,6 +40,11 @@ const requests: { url: string; body: string; header: string | undefined }[] =
   [];
 const contexts: BrowserContext[] = [];
 const timers = new Set<ReturnType<typeof setTimeout>>();
+const jsonBodies = new Map<
+  string,
+  { response: http.ServerResponse; body: string }
+>();
+let jsonBodyId = 0;
 const later = (fn: () => void, ms: number) => {
   const timer = setTimeout(() => {
     timers.delete(timer);
@@ -139,6 +147,20 @@ async function bundled(mutation?: string): Promise<string> {
         {
           name: "immutable-original-fetch",
           setup(plugin) {
+            // Fetch originally shared this module with the extracted factory.
+            // Freeze it too: later body fixes must not rewrite the historical
+            // close-context diagnostic that this baseline witnesses.
+            plugin.onLoad({ filter: /\/stream-body\.ts$/ }, (args) => {
+              const saved = legacy.modules.streamBody;
+              expect(
+                createHash("sha256").update(saved.source).digest("hex"),
+              ).toBe(saved.sha256);
+              return {
+                contents: saved.source,
+                loader: "ts",
+                resolveDir: path.dirname(args.path),
+              };
+            });
             plugin.onLoad(
               { filter: /\/(seams-net|replay\/net)\.ts$/ },
               async (args) => {
@@ -344,6 +366,39 @@ beforeAll(async () => {
         res.end();
         return;
       }
+      if (req.url!.startsWith("/api/json-body?")) {
+        const params = new URL(req.url!, "http://fixture").searchParams;
+        const bodies: Record<string, string> = {
+          invalid: "not JSON",
+          empty: "",
+          whitespace: "  \n",
+          valid: '{"value":"☃"}',
+          bom: '\uFEFF{"value":"☃"}',
+        };
+        const body = bodies[params.get("body")!];
+        if (body === undefined) throw new Error("unknown JSON body fixture");
+        const id = String(++jsonBodyId);
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "X-Content-Type-Options": "nosniff",
+          "X-Json-Body": id,
+        });
+        if (params.get("timing") === "pending") {
+          jsonBodies.set(id, { response: res, body });
+          res.on("close", () => jsonBodies.delete(id));
+          res.flushHeaders();
+        } else res.end(body);
+        return;
+      }
+      if (req.url!.startsWith("/api/json-release?")) {
+        const id = new URL(req.url!, "http://fixture").searchParams.get("id")!;
+        const held = jsonBodies.get(id);
+        if (!held) throw new Error("missing held JSON body " + id);
+        jsonBodies.delete(id);
+        held.response.end(held.body);
+        res.end("released");
+        return;
+      }
       res.writeHead(200, {
         "Content-Type": req.url!.includes("consumer=formData")
           ? "application/x-www-form-urlencoded"
@@ -434,6 +489,107 @@ async function replay(
 }
 
 describe("direct owner fetch library", () => {
+  for (const body of ["invalid", "empty", "whitespace", "valid", "bom"])
+    for (const timing of ["pending", "ready"])
+      for (const copy of ["original", "clone"])
+        it(
+          `JSON ${body}/${timing}/${copy} preserves exact parser and replay diagnostics`,
+          async () => {
+            const mode = `json-body:${body}:${timing}:${copy}:normal`;
+            const nativePage = await page();
+            const native = await nativePage.evaluate(
+              (mode) => (window as any).factoryPlain(mode),
+              mode,
+            );
+            const invalid = ["invalid", "empty", "whitespace"].includes(body);
+            const message =
+              body === "invalid"
+                ? `Unexpected token 'o', "not JSON" is not valid JSON`
+                : "Unexpected end of JSON input";
+            const parsed = [
+              invalid
+                ? { name: "SyntaxError", message }
+                : { value: { value: "☃" } },
+              { bodyUsed: true },
+            ];
+            // The native ready-body WebIDL context is a strict counterexample,
+            // not normalized away or claimed as parser-context parity (§10.1).
+            expect(native).toEqual(
+              invalid && timing === "ready"
+                ? [
+                    {
+                      name: "SyntaxError",
+                      message:
+                        "Failed to execute 'json' on 'Response': " + message,
+                    },
+                    { bodyUsed: true },
+                  ]
+                : parsed,
+            );
+            const recorded = await record(mode);
+            expect(recorded.result).toEqual(parsed);
+            expect(
+              recorded.records.filter((r) => r.record === "Refusal"),
+            ).toEqual([]);
+            const replayed = await replay(mode, recorded);
+            expect(replayed.status.state, JSON.stringify(replayed.status)).toBe(
+              "done",
+            );
+            expect(replayed.result).toEqual(parsed);
+            expect(replayed.status.checkpoints).toBe(1);
+            expect(replayed.raw).toBe(0);
+            expect(replayed.status.tasks).toBe(
+              recorded.records.filter((r) => r.record === "Task").length,
+            );
+          },
+          TIMEOUT,
+        );
+  for (const state of ["locked", "disturbed", "replaced-parser"])
+    for (const copy of ["original", "clone"])
+      it(
+        `JSON ${state}/${copy} retains native behavior and actual replay`,
+        async () => {
+          const mode = `json-body:valid:ready:${copy}:${state}`;
+          const nativePage = await page();
+          const native = await nativePage.evaluate(
+            (mode) => (window as any).factoryPlain(mode),
+            mode,
+          );
+          const recorded = await record(mode);
+          expect(recorded.result).toEqual(native);
+          expect(native[0]).toMatchObject(
+            state === "replaced-parser"
+              ? { value: { value: "☃" } }
+              : { name: "TypeError" },
+          );
+          const replayed = await replay(mode, recorded);
+          expect(replayed.status.state, JSON.stringify(replayed.status)).toBe(
+            "done",
+          );
+          expect(replayed.result).toEqual(native);
+          expect(replayed.raw).toBe(0);
+        },
+        TIMEOUT,
+      );
+  it(
+    "preserves native JSON parse errors through actual owned replay",
+    async () => {
+      const nativePage = await page();
+      const native = await nativePage.evaluate(() =>
+        (window as any).factoryPlain("invalid-json"),
+      );
+      const recorded = await record("invalid-json");
+      expect(recorded.result).toEqual(native);
+      const replayed = await replay("invalid-json", recorded);
+      expect(replayed.status.state, JSON.stringify(replayed.status)).toBe(
+        "done",
+      );
+      expect(replayed.result).toEqual(native);
+      expect(replayed.status.checkpoints).toBe(1);
+      expect(replayed.raw).toBe(0);
+    },
+    TIMEOUT,
+  );
   for (const mode of [
     "delayed-text",
     "ready-text",
@@ -458,7 +614,7 @@ describe("direct owner fetch library", () => {
         const before = requests.length,
           r = await record(mode);
         const old = await record(mode, legacyBundle);
-        expect(r.result).toEqual(old.result);
+        if (mode !== "invalid-json") expect(r.result).toEqual(old.result);
         if (mode === "abort-body") {
           expect(native).toEqual([
             {
@@ -471,6 +627,7 @@ describe("direct owner fetch library", () => {
             { error: "TypeError", message: "Failed to fetch", same: false },
           ]);
         } else if (mode === "invalid-json") {
+          expect(r.result).toEqual(native);
           expect(native).toEqual([
             {
               name: "SyntaxError",

@@ -48,6 +48,7 @@ import {
 import { RESPONSE_TYPE, WS_FRAME } from "@codetracer/boundary-format";
 
 import { HEADERS_MUTATORS, RESPONSE_GETTERS } from "./originals.js";
+import { prepareJsonBodyRead } from "./json-body.js";
 import { type Recorder, TaskKind } from "./recorder.js";
 import {
   BODY_READS,
@@ -207,6 +208,7 @@ export function patchResponses(
   const OrigPromise = orig.Promise;
   const then = orig.promiseThen;
   const queueMicrotask = orig.queueMicrotask;
+  const readJson = prepareJsonBodyRead(w, orig);
 
   const meta = new WeakMap<object, ResponseMeta>();
   // A rebuilt response (and its clones) -> the task id of its request.
@@ -253,11 +255,12 @@ export function patchResponses(
       if (isUserContent(this)) {
         ctx.refuseOnce(FILE_CONTENT, `Response.${name} of a user's file`);
       }
-      const settled = (read as (...a: unknown[]) => Promise<unknown>).apply(
-        this,
-        Array.from(arguments),
-      );
       const taskId = tasks.get(this);
+      const args = Array.from(arguments);
+      const settled =
+        name === "json" && taskId !== undefined && readJson
+          ? readJson(this, args)
+          : (read as (...a: unknown[]) => Promise<unknown>).apply(this, args);
       if (taskId === undefined) {
         // A response the page holds that no `fetch` streamed (one it made,
         // or a null-body response passed through as it came): its read

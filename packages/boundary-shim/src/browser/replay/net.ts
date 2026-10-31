@@ -35,6 +35,7 @@ import {
 } from "../seams-net.js";
 import { holeBytes } from "../sensitive.js";
 import { BODY_CONSUMERS, Dir, Outcome } from "../stream-body.js";
+import { prepareJsonBodyRead } from "../json-body.js";
 import { type ReplayContext, blobBytes } from "./context.js";
 import { replayPlatformTask } from "./platform.js";
 
@@ -215,21 +216,23 @@ function prepareReplayFetch(
     // continuation runs only when the scheduler releases that task, and the
     // scheduler waits for the read to settle.
     const then = orig.promiseThen;
+    const readJson = prepareJsonBodyRead(w, orig);
     for (const name of BODY_CONSUMERS) {
       const read = (
         OrigResponse.prototype as unknown as Record<string, unknown>
       )[name];
       if (typeof read !== "function") continue;
       replaceValue(OrigResponse.prototype, name, function (this: Response) {
-        const settled = (read as (...a: unknown[]) => Promise<unknown>).apply(
-          this,
-          Array.from(arguments),
-        );
+        const q = consuming.get(this);
+        const args = Array.from(arguments);
+        const settled =
+          name === "json" && q !== undefined && readJson
+            ? readJson(this, args)
+            : (read as (...a: unknown[]) => Promise<unknown>).apply(this, args);
         // A framework can select a native backend after preparation. Only our
         // own responses belong to replay; do not allocate a task or wrap the
         // native Promise for another response, even after replay has finished.
         if (scope === "fetch" && !meta.has(this)) return settled;
-        const q = consuming.get(this);
         // A response no fetch of the page produced (or one with no body):
         // its read settles in a platform task of its own (§6, Task kind 13).
         if (q === undefined) return replayPlatformTask(ctx, settled);
