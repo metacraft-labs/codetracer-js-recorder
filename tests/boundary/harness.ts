@@ -130,6 +130,7 @@ const RELEASE_SETTLE_MS = 250;
  * with `n=forever`, the response never ends: only the client closing it
  * stops the writes. `nosniff` keeps Chromium from holding the first bytes
  * back to sniff a MIME type.
+ * `first=<ms>` flushes headers immediately and delays the first body piece.
  *
  * `/api/sse` takes `event=<name>` (every event named so) and `id=1` (each
  * event with an id, 1, 2, …).
@@ -192,7 +193,11 @@ function serveStream(
     if (hold !== null) held.delete(hold);
     streamEnds.push({ url: url.pathname + url.search, written, finished });
   });
-  write();
+  const first = Number(url.searchParams.get("first") ?? "0");
+  if (first > 0) {
+    res.flushHeaders();
+    timer = setTimeout(write, first);
+  } else write();
 }
 
 /**

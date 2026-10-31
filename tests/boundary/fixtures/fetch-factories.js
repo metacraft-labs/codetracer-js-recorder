@@ -141,7 +141,34 @@ function bridgeDelay(ctx, record) {
 }
 async function workflow(mode, call, delay, reuse) {
   const out = [];
-  if (mode.startsWith("abort-consumer:")) {
+  if (mode.startsWith("abort-body-state:")) {
+    const [, consumer, state] = mode.split(":"),
+      ac = new AbortController(),
+      r = await call(
+        "/api/slow?consumer=" + (state === "mime" ? "text" : consumer),
+        { signal: ac.signal },
+      ),
+      reader = state === "mime" ? undefined : r.body.getReader();
+    // A pending reader disturbs the body; a merely acquired reader locks it.
+    const pending =
+      state === "disturbed" ? reader.read().catch(() => {}) : undefined;
+    reader?.closed.catch(() => {});
+    await delay(15);
+    ac.abort();
+    // Drain abort reactions before invoking a consumer on the failed body.
+    await delay(0);
+    if (pending) {
+      await pending;
+      reader.releaseLock();
+    }
+    try {
+      await r[consumer]();
+      out.push({ ok: true });
+    } catch (e) {
+      out.push({ name: e.name, message: e.message });
+    }
+    if (!pending) reader?.releaseLock();
+  } else if (mode.startsWith("abort-consumer:")) {
     const [, consumer, copy, reason] = mode.split(":"),
       ac = new AbortController();
     const r = await call("/api/slow?consumer=" + consumer, {

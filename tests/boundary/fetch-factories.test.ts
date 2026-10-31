@@ -489,6 +489,41 @@ async function replay(
 }
 
 describe("direct owner fetch library", () => {
+  for (const consumer of [
+    "text",
+    "json",
+    "arrayBuffer",
+    "blob",
+    "formData",
+    "bytes",
+  ])
+    for (const state of consumer === "formData"
+      ? ["locked", "disturbed", "mime"]
+      : ["locked", "disturbed"])
+      it(
+        `failed body ${consumer}/${state} retains native consumer-state errors`,
+        async () => {
+          const mode = `abort-body-state:${consumer}:${state}`;
+          const nativePage = await page();
+          const native = await nativePage.evaluate(
+            (mode) => (window as any).factoryPlain(mode),
+            mode,
+          );
+          expect(native).toHaveLength(1);
+          expect(native[0]).toMatchObject({
+            name: state === "mime" ? "AbortError" : "TypeError",
+          });
+          const recorded = await record(mode);
+          expect(recorded.result).toEqual(native);
+          const replayed = await replay(mode, recorded);
+          expect(replayed.status.state, JSON.stringify(replayed.status)).toBe(
+            "done",
+          );
+          expect(replayed.result).toEqual(native);
+          expect(replayed.raw).toBe(0);
+        },
+        TIMEOUT,
+      );
   for (const body of ["invalid", "empty", "whitespace", "valid", "bom"])
     for (const timing of ["pending", "ready"])
       for (const copy of ["original", "clone"])
@@ -614,7 +649,8 @@ describe("direct owner fetch library", () => {
         const before = requests.length,
           r = await record(mode);
         const old = await record(mode, legacyBundle);
-        if (mode !== "invalid-json") expect(r.result).toEqual(old.result);
+        if (!["invalid-json", "abort-body"].includes(mode))
+          expect(r.result).toEqual(old.result);
         if (mode === "abort-body") {
           expect(native).toEqual([
             {
@@ -626,6 +662,7 @@ describe("direct owner fetch library", () => {
           expect(old.result).toEqual([
             { error: "TypeError", message: "Failed to fetch", same: false },
           ]);
+          expect(r.result).toEqual(native);
         } else if (mode === "invalid-json") {
           expect(r.result).toEqual(native);
           expect(native).toEqual([
@@ -737,7 +774,7 @@ describe("direct owner fetch library", () => {
       },
       TIMEOUT,
     );
-  it("keeps immutable legacy callbacks identical to extracted callback ASTs", () => {
+  it("keeps immutable legacy callback ASTs except the explicit body-abort correction", () => {
     for (const saved of Object.values(legacy.functions) as {
       file: string;
       source: string;
@@ -766,8 +803,37 @@ describe("direct owner fetch library", () => {
           .createPrinter({ removeComments: false })
           .printNode(ts.EmitHint.Unspecified, found[0], sf);
       };
+      let currentSource = fs.readFileSync(path.join(root, saved.file), "utf8");
+      if (saved.file.endsWith("/replay/net.ts")) {
+        // This separately specified repair adds only a body-failure cell to
+        // the extracted callback. Keep the historical snapshot immutable and
+        // require every other statement to remain exactly its original AST.
+        const corrections: [string, string][] = [
+          ["        const failure: BodyFailure = { failed: false };\n", ""],
+          [
+            "              // Once headers were delivered, Chromium's body failure is its\n" +
+              "              // own AbortError, independent of the page's custom signal reason.\n" +
+              "              failure.failed = true;\n" +
+              "              failure.error = failureError(w, outcome, undefined);\n",
+            "",
+          ],
+          [
+            "              const response = responseOf(r, stream, reads);\n" +
+              "              bodyFailures.bind(response, failure);\n" +
+              "              resolve(response);",
+            "              resolve(responseOf(r, stream, reads));",
+          ],
+        ];
+        for (const [from, to] of corrections) {
+          expect(
+            currentSource.split(from),
+            "exact body-abort correction anchor",
+          ).toHaveLength(2);
+          currentSource = currentSource.replace(from, to);
+        }
+      }
       const old = printed(saved.source),
-        current = printed(fs.readFileSync(path.join(root, saved.file), "utf8"));
+        current = printed(currentSource);
       expect(createHash("sha256").update(old).digest("hex")).toBe(
         saved.callbackPrintedSha256,
       );
@@ -791,7 +857,7 @@ describe("direct owner fetch library", () => {
             copy +
             " " +
             reason +
-            " retains exact legacy record and owned replay",
+            " preserves native rejection and owned replay",
           async () => {
             const mode =
               "abort-consumer:" + consumer + ":" + copy + ":" + reason;
@@ -814,7 +880,7 @@ describe("direct owner fetch library", () => {
             );
             const old = await record(mode, legacyBundle),
               current = await record(mode);
-            expect(current.result).toEqual(old.result);
+            expect(current.result).toEqual(native);
             expect(old.result).toEqual([
               {
                 ok: false,

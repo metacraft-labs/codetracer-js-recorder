@@ -32,6 +32,24 @@
   var decoder = new TextDecoder();
 
   var cases = {
+    // Headers arrive before any body bytes; abort while text() is pending.
+    "fetch-abort-pending-text": async function () {
+      var ac = new AbortController();
+      var r = await fetch("/api/stream?n=3&interval=100&first=50", {
+        signal: ac.signal,
+      });
+      var pending = r.text();
+      setTimeout(function () {
+        ac.abort();
+      }, 15);
+      try {
+        await pending;
+        slot("result", "unexpected success");
+      } catch (e) {
+        slot("result", JSON.stringify({ name: e.name, message: e.message }));
+      }
+      done();
+    },
     // A body that never ends: the page reads three pieces as they arrive,
     // then cancels its reader.
     "fetch-forever": function () {

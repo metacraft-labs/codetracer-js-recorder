@@ -385,6 +385,36 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
   );
 
   it(
+    "jsbound_shim_preserves_a_pending_body_consumers_native_abort_error",
+    async () => {
+      const plain = await open(
+        plainDir,
+        "streams.html?case=fetch-abort-pending-text",
+      );
+      const shimmed = await open(
+        shimDir,
+        "streams.html?case=fetch-abort-pending-text",
+      );
+      const expected = {
+        "r-result":
+          'result={"name":"AbortError","message":"The user aborted a request."}',
+      };
+      expect(await slots(plain.page)).toEqual(expected);
+      expect(await slots(shimmed.page)).toEqual(expected);
+      expect(shimmed.pageErrors).toEqual([]);
+      const log = await stopAndDecode(shimmed.page);
+      expect(recordsOf(log, "Refusal")).toEqual([]);
+      expect(recordsOf(log, "WsMessage", (r) => r.dir === 1)).toEqual([]);
+      const ends = recordsOf(log, "WsMessage", (r) => r.dir === 4);
+      expect(ends).toHaveLength(1);
+      expect(blobText(ends[0].data)).toBe('{"outcome":3}');
+      await plain.context.close();
+      await shimmed.context.close();
+    },
+    TIMEOUT,
+  );
+
+  it(
     "jsbound_shim_errors_an_aborted_body_at_once_as_the_platform_does",
     async () => {
       const plain = await open(plainDir, "streams.html?case=fetch-abort");

@@ -49,6 +49,7 @@ import { RESPONSE_TYPE, WS_FRAME } from "@codetracer/boundary-format";
 
 import { HEADERS_MUTATORS, RESPONSE_GETTERS } from "./originals.js";
 import { prepareJsonBodyRead } from "./json-body.js";
+import { prepareBodyFailures, type BodyFailure } from "./body-failure.js";
 import { type Recorder, TaskKind } from "./recorder.js";
 import {
   BODY_READS,
@@ -209,6 +210,7 @@ export function patchResponses(
   const then = orig.promiseThen;
   const queueMicrotask = orig.queueMicrotask;
   const readJson = prepareJsonBodyRead(w, orig);
+  const bodyFailures = prepareBodyFailures(w, orig);
 
   const meta = new WeakMap<object, ResponseMeta>();
   // A rebuilt response (and its clones) -> the task id of its request.
@@ -235,6 +237,7 @@ export function patchResponses(
     "clone",
     function clone(this: Response): Response {
       const c = origClone.call(this);
+      bodyFailures.clone(this, c);
       const m = meta.get(this);
       if (m !== undefined) {
         meta.set(c, m);
@@ -257,10 +260,11 @@ export function patchResponses(
       }
       const taskId = tasks.get(this);
       const args = Array.from(arguments);
-      const settled =
+      const settled = bodyFailures.read(this, () =>
         name === "json" && taskId !== undefined && readJson
           ? readJson(this, args)
-          : (read as (...a: unknown[]) => Promise<unknown>).apply(this, args);
+          : (read as (...a: unknown[]) => Promise<unknown>).apply(this, args),
+      );
       if (taskId === undefined) {
         // A response the page holds that no `fetch` streamed (one it made,
         // or a null-body response passed through as it came): its read
@@ -319,6 +323,7 @@ export function patchResponses(
       let cancelled = false;
       /** The body's end (or failure) has been recorded and delivered. */
       let ended = false;
+      const failure: BodyFailure = { failed: false };
       const readerOf = () => (reader ??= body.getReader());
 
       /** Record a piece (or the end) unless the page cancelled. */
@@ -390,6 +395,8 @@ export function patchResponses(
                 return;
               }
               ended = true;
+              failure.failed = true;
+              failure.error = err;
               const outcome = failureOutcome(err);
               // An abort is the page's own call (its AbortController),
               // made inside one of its tasks, not a task of its own.
@@ -453,6 +460,7 @@ export function patchResponses(
       });
       frozen.set(page.headers, resp.headers);
       tasks.set(page, taskId);
+      bodyFailures.bind(page, failure);
 
       // A failure (an abort, a network error) errors the platform's body at
       // once, discarding what it had queued, whether or not anyone reads:
@@ -466,6 +474,8 @@ export function patchResponses(
         (err: unknown) => {
           if (ended || cancelled) return;
           ended = true;
+          failure.failed = true;
+          failure.error = err;
           const outcome = failureOutcome(err);
           // An abort is the page's own call (its AbortController), made
           // inside one of its tasks; a network error arrives in a network

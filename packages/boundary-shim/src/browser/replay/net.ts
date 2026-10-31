@@ -35,6 +35,7 @@ import {
 } from "../seams-net.js";
 import { holeBytes } from "../sensitive.js";
 import { BODY_CONSUMERS, Dir, Outcome } from "../stream-body.js";
+import { prepareBodyFailures, type BodyFailure } from "../body-failure.js";
 import { prepareJsonBodyRead } from "../json-body.js";
 import { type ReplayContext, blobBytes } from "./context.js";
 import { replayPlatformTask } from "./platform.js";
@@ -191,6 +192,7 @@ function prepareReplayFetch(
     // A streamed response (and its clones) -> the whole-body reads made of
     // it, waiting for the tasks the recorder wrote when they settled.
     const consuming = new WeakMap<object, BodyRead[]>();
+    const bodyFailures = prepareBodyFailures(w, orig);
     const origClone = orig.responseClone;
     if (origClone !== undefined) {
       replaceValue(
@@ -198,6 +200,7 @@ function prepareReplayFetch(
         "clone",
         function clone(this: Response) {
           const c = origClone.call(this);
+          bodyFailures.clone(this, c);
           const m = meta.get(this);
           if (m !== undefined) {
             meta.set(c, m);
@@ -225,10 +228,11 @@ function prepareReplayFetch(
       replaceValue(OrigResponse.prototype, name, function (this: Response) {
         const q = consuming.get(this);
         const args = Array.from(arguments);
-        const settled =
+        const settled = bodyFailures.read(this, () =>
           name === "json" && q !== undefined && readJson
             ? readJson(this, args)
-            : (read as (...a: unknown[]) => Promise<unknown>).apply(this, args);
+            : (read as (...a: unknown[]) => Promise<unknown>).apply(this, args),
+        );
         // A framework can select a native backend after preparation. Only our
         // own responses belong to replay; do not allocate a task or wrap the
         // native Promise for another response, even after replay has finished.
@@ -339,6 +343,7 @@ function prepareReplayFetch(
         let cancelled = false;
         /** The whole-body reads of the response, in the order made. */
         const reads: BodyRead[] = [];
+        const failure: BodyFailure = { failed: false };
 
         // The request's task stays claimed after the body ended: a
         // whole-body read settles in one more.
@@ -363,6 +368,10 @@ function prepareReplayFetch(
                 0,
               );
             } else {
+              // Once headers were delivered, Chromium's body failure is its
+              // own AbortError, independent of the page's custom signal reason.
+              failure.failed = true;
+              failure.error = failureError(w, outcome, undefined);
               controller!.error(failureError(w, outcome, signal));
             }
           } else {
@@ -414,7 +423,9 @@ function prepareReplayFetch(
             const r = replay.next("NetResponse", { req_id: reqId });
             if (r.outcome === Outcome.head) {
               phase = "body";
-              resolve(responseOf(r, stream, reads));
+              const response = responseOf(r, stream, reads);
+              bodyFailures.bind(response, failure);
+              resolve(response);
             } else if (r.outcome === Outcome.response) {
               finish();
               resolve(responseOf(r, blobBytes(replay, r.body) as BodyInit));
