@@ -37,7 +37,9 @@ import { codetracerBoundaryShimPlugin } from "../../packages/vite-plugin/src/ind
 const CLI = path.resolve(__dirname, "..", "..", "packages/cli/dist/index.js");
 const tmpDirs: string[] = [];
 function tmp(prefix: string): string {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  // The real path: vite's root and the HTML paths it resolves must agree,
+  // and on macOS os.tmpdir() can be under the /tmp -> /private/tmp symlink.
+  const d = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), prefix));
   tmpDirs.push(d);
   return d;
 }

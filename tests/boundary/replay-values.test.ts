@@ -1289,8 +1289,8 @@ describe("replay gives a page the values it read", () => {
   it(
     "replay_gives_a_page_the_logged_devices_as_objects_of_their_interface",
     async () => {
-      // Headless Chromium lists no devices, so the visitor's are written
-      // into the log: one input device with capabilities, one output.
+      // The devices are the visitor's, written into the log: one input
+      // device with capabilities, one output.
       const rs = await record("values.html?case=device");
       const at = indexWhere(
         rs,
@@ -1300,7 +1300,25 @@ describe("replay gives a page the values it read", () => {
       const read = indexWhere(rs, "StorageRead", (r) =>
         r.key.startsWith("devices:"),
       );
-      expect((rs[read] as RecordOf<"StorageRead">).key).toBe("devices:");
+      // The recording saw the devices it logged: each one's kind, label, id
+      // and group, in order. Their number depends on the host (headless
+      // Chromium lists none on Linux, its default devices on macOS).
+      const logged = (
+        JSON.parse((rs[at] as RecordOf<"PlatformValue">).value) as {
+          resolved: {
+            kind: string;
+            label: string;
+            deviceId: string;
+            groupId: string;
+          }[];
+        }
+      ).resolved;
+      const seen = (rs[read] as RecordOf<"StorageRead">).key.slice(
+        "devices:".length,
+      );
+      expect(
+        seen === "" ? [] : seen.split(";").map((d) => d.split("/").slice(0, 4)),
+      ).toEqual(logged.map((d) => [d.kind, d.label, d.deviceId, d.groupId]));
       // The page reads storage under a key naming what it saw of each
       // device (kind, label, id, group, whether it is a MediaDeviceInfo and
       // an InputDeviceInfo, toJSON()'s label, getCapabilities()'s width),
