@@ -229,11 +229,17 @@ for (const kind of ["throw-body", "throw-method", "request-shadow"])
     },
   );
 
-for (const validation of ["signal", "url", "method", "body", "header"])
+// The one native difference Record and Replay share by construction: both
+// convert with the captured Request constructor (JS-Boundary-Recording §9.7,
+// "Fetch argument conversion"), so a native validation TypeError carries the
+// constructor's diagnostic context instead of fetch's, with the same detail.
+const FETCH_CONTEXT = "Failed to execute 'fetch' on 'Window': ",
+  CONSTRUCTOR_CONTEXT = "Failed to construct 'Request': ";
+for (const validation of ["signal", "url", "method", "body", "header", "init"])
   it(
     "native-generated validation " +
       validation +
-      " keeps its existing mapping, distinct from a user TypeError",
+      " replays the TypeError Record's page received",
     async () => {
       const kind = "validation-" + validation,
         mode = "argument:" + kind,
@@ -242,32 +248,114 @@ for (const validation of ["signal", "url", "method", "body", "header"])
         (mode) => (window as any).factoryArgumentNative(mode),
         mode,
       );
-      expect(native).toEqual(baseline.cases[kind].native);
+      if (validation !== "init")
+        expect(native).toEqual(baseline.cases[kind].native);
       expect(native.value.name).toBe("TypeError");
+      expect(native.value.message.startsWith(FETCH_CONTEXT)).toBe(true);
+      const constructed: any = await p.evaluate(
+        (mode) => (window as any).factoryArgumentConstructed(mode),
+        mode,
+      );
+      expect(constructed.value.message.startsWith(CONSTRUCTOR_CONTEXT)).toBe(
+        true,
+      );
       const q = await page();
       const recorded: any = await q.evaluate(
         (mode) => (window as any).factoryRecord(mode),
         mode,
       );
-      expect(recorded.result).toEqual(baseline.cases[kind].record);
-      expect(recorded.result).toEqual(native);
-      const replay = await ownedReplay(mode, recorded.log);
-      // Explicit retained counterexample, not native diagnostic parity or DONE.
-      expect(replay.status.state).toBe("diverged");
-      expect(replay.status.divergence).toMatchObject({
-        kind: "CheckpointMismatch",
-        seq: "5",
+      expect(recorded.result).toEqual({
+        ...native,
+        value: {
+          ...native.value,
+          message:
+            CONSTRUCTOR_CONTEXT +
+            native.value.message.slice(FETCH_CONTEXT.length),
+        },
       });
-      expect(replay.result.value).toEqual({
-        name: "TypeError",
-        message: "Failed to fetch",
-        sameReason: false,
-        sameThrown: false,
-      });
+      expect(recorded.result).toEqual(constructed);
       expect(
         recorded.records.filter((r: any) => r.record === "Refusal"),
       ).toEqual([]);
+      expect(recorded.records.at(-1).record).toBe("End");
+      const replay = await ownedReplay(mode, recorded.log);
+      expect(replay.status.state, "actual owned replay endpoint").toBe("done");
+      expect(replay.next.kind).toBe("End");
+      expect(replay.status.checkpoints).toBe(1);
+      expect(replay.result).toEqual(recorded.result);
+      expect(replay.error).toBeUndefined();
     },
+    60_000,
+  );
+
+// Application code that only native conversion runs: a header value's
+// coercion and a headers iterable's iterator, throwing an Error, a TypeError,
+// a Symbol and an object whose name/message reads are themselves observed.
+for (const kind of [
+  "nested-header",
+  "nested-header-typeerror",
+  "nested-header-symbol",
+  "nested-header-observed",
+  "nested-iterator",
+  "nested-iterator-null",
+])
+  it(
+    kind + " delivers the identical application throw in Record and Replay",
+    async () => {
+      const mode = "argument:" + kind,
+        nativePage = await page(),
+        native: any = await nativePage.evaluate(
+          (mode) => (window as any).factoryArgumentNative(mode),
+          mode,
+        );
+      const observed = kind.endsWith("-observed")
+        ? ["thrown.name", "thrown.message"]
+        : [];
+      expect(native, "independent native control").toEqual({
+        trace: [
+          kind.startsWith("nested-iterator")
+            ? "headers.iterator"
+            : "header.toString",
+          ...observed,
+        ],
+        receivers: kind.startsWith("nested-iterator") ? [true] : [],
+        returnedPromise: true,
+        value: {
+          name: kind.endsWith("-observed")
+            ? "Observed"
+            : kind.endsWith("-typeerror")
+              ? "TypeError"
+              : kind.endsWith("-symbol") || kind.endsWith("-null")
+                ? undefined
+                : "Error",
+          message:
+            kind.endsWith("-symbol") || kind.endsWith("-null")
+              ? undefined
+              : "argument getter sentinel",
+          sameReason: false,
+          sameThrown: true,
+        },
+      });
+      const recordPage = await page(),
+        recorded: any = await recordPage.evaluate(
+          (mode) => (window as any).factoryRecord(mode),
+          mode,
+        );
+      expect(recorded.result, "Record preserves native conversion").toEqual(
+        native,
+      );
+      expect(
+        recorded.records.filter((r: any) => r.record === "Refusal"),
+      ).toEqual([]);
+      expect(recorded.records.at(-1).record).toBe("End");
+      const replay = await ownedReplay(mode, recorded.log);
+      expect(replay.status.state, "actual owned replay endpoint").toBe("done");
+      expect(replay.next.kind).toBe("End");
+      expect(replay.status.checkpoints).toBe(1);
+      expect(replay.result).toEqual(recorded.result);
+      expect(replay.error).toBeUndefined();
+    },
+    60_000,
   );
 
 for (const inverse of ["prefix", "signal-shadow"])

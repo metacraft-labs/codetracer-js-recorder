@@ -169,7 +169,7 @@ globalThis.factoryCancellationRecord = async (mode) => {
 };
 
 /** Observe the captured cancellation listener lifecycle without replacing any
- * platform behavior. Both wrappers delegate their exact arguments/receiver to
+ * platform behavior. These wrappers delegate their exact arguments/receiver to
  * the actual captured native functions. No fake stream or event is dispatched.
  */
 globalThis.factoryCancellationCleanup = async (kind) => {
@@ -191,8 +191,15 @@ globalThis.factoryCancellationCleanup = async (kind) => {
     return remove.apply(this, args);
   };
   orig.fetch = function (...args) {
-    rawInit = args[1];
+    if (args.length > 1) rawInit = args[1];
     return raw.apply(this, args);
+  };
+  // Record converts with the captured constructor, then fetches the Request
+  // alone (JS-Boundary-Recording §9.7): its init is the native conversion's.
+  const RawRequest = orig.Request;
+  orig.Request = function Request(input, init) {
+    rawInit = init;
+    return new RawRequest(input, init);
   };
   if (kind === "low-capability") orig.abortSignalAny = undefined;
   const ctx = recordContext(orig),

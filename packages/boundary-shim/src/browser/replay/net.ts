@@ -322,34 +322,23 @@ function prepareReplayFetch(
         body_digest: digest ?? "",
       });
       replay.registerTask(taskId, TaskKind.networkCompletion, 0);
-      // Native conversion supplies the suffix Record's real fetch performed.
-      // Capture only an actual top-level application getter throw. Constructor
-      // validation and nested coercion errors keep the existing failure mapping;
-      // an Error/TypeError's name or message never establishes its provenance.
-      let applicationThrew = false;
-      let applicationError: unknown;
-      const observedInit =
-        init !== null &&
-        (typeof init === "object" || typeof init === "function")
-          ? new Proxy(Object.create(null) as RequestInit, {
-              get(_target, key) {
-                try {
-                  return Reflect.get(init, key, init);
-                } catch (error) {
-                  applicationThrew = true;
-                  applicationError = error;
-                  throw error;
-                }
-              },
-            })
-          : init;
+      // Record converts the page's arguments with this same captured
+      // constructor before its native fetch (seams-net.ts, convertedFetch), so
+      // conversion runs the page's getters and coercions once, as Record did,
+      // and its exception (a value application code threw, of any type, or the
+      // platform's own validation TypeError) is the value Record's page
+      // received. Its provenance is never classified.
+      let conversionThrew = false;
+      let conversionError: unknown;
       let signal: AbortSignal | undefined;
       try {
-        const request = new orig.Request(input, observedInit);
+        const request = new orig.Request(input, init);
         signal = orig.requestSignal?.descriptor.get?.call(request);
-      } catch {
+      } catch (error) {
         // The recorded network completion, not this synchronous constructor,
         // owns delivery of the request's rejection.
+        conversionThrew = true;
+        conversionError = error;
       }
 
       // Pre-header cancellation returns the actual page reason, including
@@ -476,8 +465,8 @@ function prepareReplayFetch(
                     "abort",
                     () => {
                       reject(
-                        applicationThrew
-                          ? applicationError
+                        conversionThrew
+                          ? conversionError
                           : requestFailure(r.outcome),
                       );
                       done();
@@ -487,7 +476,7 @@ function prepareReplayFetch(
                 });
               }
               reject(
-                applicationThrew ? applicationError : requestFailure(r.outcome),
+                conversionThrew ? conversionError : requestFailure(r.outcome),
               );
             }
             return;

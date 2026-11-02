@@ -201,8 +201,13 @@ export function createRecordFetch(ctx: SeamContext): typeof fetch | undefined {
         ids !== undefined && responses !== undefined
           ? prepareFetchCancellation(orig, input, init)
           : undefined;
-      const p = origFetch.call(w, input, cancellation?.init ?? init);
-      if (ids === undefined) return p;
+      if (ids === undefined) return origFetch.call(w, input, init);
+      const p = convertedFetch(
+        ctx,
+        origFetch,
+        input,
+        cancellation?.init ?? init,
+      );
       return p.then(
         (resp: Response) => {
           cancellation?.head();
@@ -275,6 +280,36 @@ export function createRecordFetch(ctx: SeamContext): typeof fetch | undefined {
       );
     };
   });
+}
+
+/**
+ * Native fetch of the page's arguments, converted first by the captured
+ * Request constructor: the conversion fetch itself performs (Fetch, "fetch()"
+ * step 2, https://fetch.spec.whatwg.org/#fetch-method), so every getter,
+ * coercion and validation runs once, in the same order, on the same
+ * receivers. Replay converts with the same constructor (replay/net.ts), so a
+ * conversion exception, whether a value application code threw or the
+ * platform's own validation TypeError, is the identical value in both legs.
+ * The page sees the constructor's diagnostic context ("Failed to construct
+ * 'Request'" in Chromium) rather than fetch's, the one native difference
+ * (JS-Boundary-Recording §9.7, "Fetch argument conversion"). Like fetch, an
+ * exception rejects the returned Promise instead of being thrown.
+ */
+function convertedFetch(
+  { w, orig }: SeamContext,
+  fetch: typeof globalThis.fetch,
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+): Promise<Response> {
+  // A realm without a captured constructor keeps native conversion.
+  if (orig.Request === undefined) return fetch.call(w, input, init);
+  let request: Request;
+  try {
+    request = new orig.Request(input, init);
+  } catch (error) {
+    return new orig.Promise<Response>((_, reject) => reject(error));
+  }
+  return fetch.call(w, request);
 }
 
 /** `XMLHttpRequest.readyState` values (XHR standard). */

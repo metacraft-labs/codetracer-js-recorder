@@ -16,7 +16,21 @@ workflow = async function (mode, call, delay, reuse) {
         ? undefined
         : kind.endsWith("-typeerror")
           ? new TypeError("argument getter sentinel")
-          : new Error("argument getter sentinel"),
+          : kind.endsWith("-symbol")
+            ? Symbol("argument getter sentinel")
+            : kind.endsWith("-observed")
+              ? {
+                  // An unusual thrown object: its observation is the page's.
+                  get name() {
+                    trace.push("thrown.name");
+                    return "Observed";
+                  },
+                  get message() {
+                    trace.push("thrown.message");
+                    return "argument getter sentinel";
+                  },
+                }
+              : new Error("argument getter sentinel"),
     reasonGet = Object.getOwnPropertyDescriptor(
       AbortSignal.prototype,
       "reason",
@@ -28,17 +42,44 @@ workflow = async function (mode, call, delay, reuse) {
     methodReads = 0;
   if (kind === "plain-abort") {
     init = { signal: ac.signal };
+  } else if (kind.startsWith("nested-")) {
+    // Plain data members: only native conversion runs this application code.
+    init = kind.startsWith("nested-iterator")
+      ? {
+          headers: {
+            [Symbol.iterator]() {
+              trace.push("headers.iterator");
+              receivers.push(this === init.headers);
+              throw sentinel;
+            },
+          },
+        }
+      : {
+          headers: [
+            [
+              "X-Argument",
+              {
+                toString() {
+                  trace.push("header.toString");
+                  throw sentinel;
+                },
+              },
+            ],
+          ],
+        };
   } else if (kind.startsWith("validation-")) {
     init =
-      kind === "validation-signal"
-        ? { signal: 42 }
-        : kind === "validation-method"
-          ? { method: "bad method" }
-          : kind === "validation-body"
-            ? { method: "GET", body: "body" }
-            : kind === "validation-header"
-              ? { headers: { "bad\nheader": "value" } }
-              : undefined;
+      kind === "validation-init"
+        ? 5
+        : kind === "validation-signal"
+          ? { signal: 42 }
+          : kind === "validation-method"
+            ? { method: "bad method" }
+            : kind === "validation-body"
+              ? { method: "GET", body: "body" }
+              : kind === "validation-header"
+                ? { headers: { "bad\nheader": "value" } }
+                : undefined;
     if (kind === "validation-url") input = "http://[";
   } else if (kind.startsWith("request-")) {
     input = new Request(input, { signal: ac.signal });
@@ -196,3 +237,14 @@ globalThis.factoryArgumentFault = async (mode) => {
     ),
   };
 };
+
+// Independent native control of the Request constructor's own conversion,
+// which Record and Replay both perform (JS-Boundary-Recording §9.7).
+globalThis.factoryArgumentConstructed = (mode) =>
+  workflow(mode, function (input, init) {
+    try {
+      return fetch(new Request(input, init));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  });

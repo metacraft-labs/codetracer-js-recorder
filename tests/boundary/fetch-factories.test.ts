@@ -774,7 +774,7 @@ describe("direct owner fetch library", () => {
       },
       TIMEOUT,
     );
-  it("keeps immutable legacy callback ASTs except the published body-abort and argument corrections", () => {
+  it("keeps immutable legacy callback ASTs except the published body-abort, argument and conversion corrections", () => {
     const fragments = JSON.parse(
       fs.readFileSync(
         path.join(__dirname, "fixtures/fetch-argument-corrections.json"),
@@ -872,6 +872,31 @@ describe("direct owner fetch library", () => {
         ).toHaveLength(2);
         currentSource = currentSource.replace(from, to);
       };
+      // The shared Request-constructor conversion correction is qualified by
+      // tests/boundary/fetch-arguments.test.ts. Like the causal correction
+      // below, its inverse must restore the ENTIRE published parent file.
+      const conversion = JSON.parse(
+        fs.readFileSync(
+          path.join(__dirname, "fixtures/fetch-conversion-corrections.json"),
+          "utf8",
+        ),
+      );
+      expect(conversion.parent).toBe(
+        "316baab32d176b42180409b7ec3be34fb4a1bc39",
+      );
+      const converted = conversion.entries.filter(
+        (entry: any) => entry.file === saved.file,
+      );
+      expect(converted).toHaveLength(1);
+      for (const change of converted[0].changes)
+        project(
+          change.current,
+          change.parent,
+          "exact argument conversion correction",
+        );
+      expect(createHash("sha256").update(currentSource).digest("hex")).toBe(
+        converted[0].parentSha256,
+      );
       // The causal pre-header correction is independently qualified by actual
       // owner/native tests and compiled production inverses. Its precise inverse
       // must first restore the ENTIRE published parent file, not merely the
