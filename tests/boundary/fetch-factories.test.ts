@@ -774,7 +774,68 @@ describe("direct owner fetch library", () => {
       },
       TIMEOUT,
     );
-  it("keeps immutable legacy callback ASTs except the explicit body-abort correction", () => {
+  it("keeps immutable legacy callback ASTs except the published body-abort and argument corrections", () => {
+    const fragments = JSON.parse(
+      fs.readFileSync(
+        path.join(__dirname, "fixtures/fetch-argument-corrections.json"),
+        "utf8",
+      ),
+    );
+    const metadata = (source: string, record: boolean) => {
+      const start = source.indexOf(
+        "const isRequest = input instanceof w.Request;",
+      );
+      expect(start).toBeGreaterThan(0);
+      const end = source.indexOf(
+        record ? "if (digest === null)" : "const reqId",
+        start,
+      );
+      expect(end).toBeGreaterThan(start);
+      return source.slice(start, end);
+    };
+    // Independently bind the entire extracted helper body (including its return
+    // shape) to the immutable Record prefix. Projecting call sites alone could
+    // otherwise hide an incorrect or disconnected extraction.
+    const helperSource = fs.readFileSync(
+      path.join(root, legacy.functions.patchFetch.file),
+      "utf8",
+    );
+    const helperFile = ts.createSourceFile(
+      "metadata.ts",
+      helperSource,
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const helpers = helperFile.statements.filter(
+      (node): node is ts.FunctionDeclaration =>
+        ts.isFunctionDeclaration(node) &&
+        node.name?.text === "fetchRequestMetadata",
+    );
+    expect(helpers).toHaveLength(1);
+    expect(
+      helpers[0].parameters.map((p) => p.name.getText(helperFile)),
+    ).toEqual(["w", "ctx", "input", "init"]);
+    expect(
+      helpers[0].parameters.every((p) => p.initializer === undefined),
+    ).toBe(true);
+    const expectedHelper = ts.createSourceFile(
+      "expected.ts",
+      "function metadata(){" +
+        metadata(legacy.functions.patchFetch.source, true) +
+        "return { method, url, digest };}",
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const printer = ts.createPrinter({ removeComments: false });
+    expect(
+      printer.printNode(ts.EmitHint.Unspecified, helpers[0].body!, helperFile),
+    ).toBe(
+      printer.printNode(
+        ts.EmitHint.Unspecified,
+        (expectedHelper.statements[0] as ts.FunctionDeclaration).body!,
+        expectedHelper,
+      ),
+    );
     for (const saved of Object.values(legacy.functions) as {
       file: string;
       source: string;
@@ -804,6 +865,43 @@ describe("direct owner fetch library", () => {
           .printNode(ts.EmitHint.Unspecified, found[0], sf);
       };
       let currentSource = fs.readFileSync(path.join(root, saved.file), "utf8");
+      const project = (from: string, to: string, label: string) => {
+        expect(
+          currentSource.split(from),
+          label + " exact one-occurrence anchor",
+        ).toHaveLength(2);
+        currentSource = currentSource.replace(from, to);
+      };
+      if (saved.file.endsWith("/seams-net.ts")) {
+        project(
+          fragments.recordPrefix,
+          metadata(saved.source, true),
+          "shared Record prefix",
+        );
+      } else {
+        project(
+          fragments.replayPrefix,
+          metadata(saved.source, false),
+          "shared Replay prefix",
+        );
+        const start = saved.source.indexOf("const signal =");
+        const end = saved.source.indexOf(
+          "return new OrigPromise<Response>",
+          start,
+        );
+        expect(start).toBeGreaterThan(0);
+        expect(end).toBeGreaterThan(start);
+        project(
+          fragments.replayConversion,
+          saved.source.slice(start, end),
+          "native argument conversion suffix",
+        );
+        project(
+          fragments.applicationThrow,
+          "reject(failureError(w, r.outcome, signal));",
+          "application getter throw delivery",
+        );
+      }
       if (saved.file.endsWith("/replay/net.ts")) {
         // This separately specified repair adds only a body-failure cell to
         // the extracted callback. Keep the historical snapshot immutable and
@@ -838,6 +936,27 @@ describe("direct owner fetch library", () => {
         saved.callbackPrintedSha256,
       );
       expect(current).toBe(old);
+      // A genuine successful source companion precedes the negative control.
+      // The SAME whole-callback identity rule must reject an unrelated edit;
+      // named correction projections never authorize arbitrary body changes.
+      const requireIdentical = (source: string) => {
+        if (printed(source) !== old)
+          throw new Error("unrelated callback change");
+      };
+      requireIdentical(currentSource);
+      const anchor = saved.file.endsWith("/replay/net.ts")
+        ? "let cancelled = false;"
+        : "return page;";
+      expect(currentSource.split(anchor)).toHaveLength(2);
+      const unrelated = currentSource.replace(
+        anchor,
+        saved.file.endsWith("/replay/net.ts")
+          ? "let cancelled = true;"
+          : "return resp;",
+      );
+      expect(() => requireIdentical(unrelated)).toThrow(
+        "unrelated callback change",
+      );
     }
   });
   for (const consumer of [

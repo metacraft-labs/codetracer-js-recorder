@@ -43,6 +43,9 @@ export interface ShimOriginals {
   getRandomValues: Crypto["getRandomValues"];
   randomUUID: Crypto["randomUUID"] | undefined;
   fetch: typeof fetch | undefined;
+  /** Replay performs native argument conversion without starting a request. */
+  Request: typeof Request;
+  requestSignal: CapturedGetter | undefined;
   /**
    * What a streamed fetch response is rebuilt from (seams-net.ts): the
    * `Response` and `ReadableStream` constructors, the `Response`
@@ -223,6 +226,8 @@ export function captureOriginals(w: Window & typeof globalThis): ShimOriginals {
     getRandomValues: w.Crypto.prototype.getRandomValues,
     randomUUID: w.Crypto.prototype.randomUUID,
     fetch: w.fetch,
+    Request: w.Request,
+    requestSignal: getter(w.Request?.prototype, "signal"),
     Response: w.Response,
     ReadableStream: w.ReadableStream,
     responseGetters,

@@ -29,6 +29,7 @@ import {
   absoluteUrl,
   bufferedAmountQuery,
   bodyDigest,
+  fetchRequestMetadata,
   frameOf,
   messageBytes,
   normaliseMethod,
@@ -308,17 +309,7 @@ function prepareReplayFetch(
     };
 
     return function fetch(input: RequestInfo | URL, init?: RequestInit) {
-      const isRequest = input instanceof w.Request;
-      const method = normaliseMethod(
-        init?.method ?? (isRequest ? (input as Request).method : "GET"),
-      );
-      const url = isRequest
-        ? (input as Request).url
-        : absoluteUrl(w, input instanceof URL ? input.href : input);
-      let digest: string | null;
-      if (init?.body !== undefined) digest = bodyDigest(init.body, ctx.holes);
-      else if (isRequest && (input as Request).body !== null) digest = null;
-      else digest = "";
+      const { method, url, digest } = fetchRequestMetadata(w, ctx, input, init);
       const reqId = ctx.nextReqId();
       const taskId = ctx.nextTaskId();
       replay.next("NetRequest", {
@@ -331,10 +322,35 @@ function prepareReplayFetch(
         body_digest: digest ?? "",
       });
       replay.registerTask(taskId, TaskKind.networkCompletion, 0);
-      const signal =
-        init?.signal ??
-        (isRequest ? (input as Request).signal : undefined) ??
-        undefined;
+      // Native conversion supplies the suffix Record's real fetch performed.
+      // Capture only an actual top-level application getter throw. Constructor
+      // validation and nested coercion errors keep the existing failure mapping;
+      // an Error/TypeError's name or message never establishes its provenance.
+      let applicationThrew = false;
+      let applicationError: unknown;
+      const observedInit =
+        init !== null &&
+        (typeof init === "object" || typeof init === "function")
+          ? new Proxy(Object.create(null) as RequestInit, {
+              get(_target, key) {
+                try {
+                  return Reflect.get(init, key, init);
+                } catch (error) {
+                  applicationThrew = true;
+                  applicationError = error;
+                  throw error;
+                }
+              },
+            })
+          : init;
+      let signal: AbortSignal | undefined;
+      try {
+        const request = new orig.Request(input, observedInit);
+        signal = orig.requestSignal?.descriptor.get?.call(request);
+      } catch {
+        // The recorded network completion, not this synchronous constructor,
+        // owns delivery of the request's rejection.
+      }
 
       return new OrigPromise<Response>((resolve, reject) => {
         let phase: "head" | "body" | "done" = "head";
@@ -431,7 +447,11 @@ function prepareReplayFetch(
               resolve(responseOf(r, blobBytes(replay, r.body) as BodyInit));
             } else {
               finish();
-              reject(failureError(w, r.outcome, signal));
+              reject(
+                applicationThrew
+                  ? applicationError
+                  : failureError(w, r.outcome, signal),
+              );
             }
             return;
           }

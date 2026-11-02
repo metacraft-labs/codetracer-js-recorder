@@ -121,6 +121,35 @@ function headersJson(pairs: [string, string][]): string {
   return JSON.stringify(pairs);
 }
 
+/**
+ * The existing recording metadata prefix, shared with replay. These reads are
+ * intentionally preserved, including the extra body read and supported-body
+ * digest policy; this is not native RequestInit conversion or native parity.
+ */
+export function fetchRequestMetadata(
+  w: SeamContext["w"],
+  ctx: Pick<SeamContext, "holes">,
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): { method: string; url: string; digest: string | null } {
+  const isRequest = input instanceof w.Request;
+  const method = normaliseMethod(
+    init?.method ?? (isRequest ? (input as Request).method : "GET"),
+  );
+  const url = isRequest
+    ? (input as Request).url
+    : absoluteUrl(w, input instanceof URL ? input.href : input);
+  let digest: string | null;
+  if (init?.body !== undefined) {
+    digest = bodyDigest(init.body, ctx.holes);
+  } else if (isRequest && (input as Request).body !== null) {
+    digest = null; // a Request's own body is a stream
+  } else {
+    digest = "";
+  }
+  return { method, url, digest };
+}
+
 function patchFetch(ctx: SeamContext): void {
   const fetch = createRecordFetch(ctx);
   if (fetch !== undefined) replaceValue(ctx.w, "fetch", fetch);
@@ -143,21 +172,7 @@ export function createRecordFetch(ctx: SeamContext): typeof fetch | undefined {
     return function fetch(input: RequestInfo | URL, init?: RequestInit) {
       if (!rec.recording) return origFetch.call(w, input, init);
       const ids = rec.guard(() => {
-        const isRequest = input instanceof w.Request;
-        const method = normaliseMethod(
-          init?.method ?? (isRequest ? (input as Request).method : "GET"),
-        );
-        const url = isRequest
-          ? (input as Request).url
-          : absoluteUrl(w, input instanceof URL ? input.href : input);
-        let digest: string | null;
-        if (init?.body !== undefined) {
-          digest = bodyDigest(init.body, ctx.holes);
-        } else if (isRequest && (input as Request).body !== null) {
-          digest = null; // a Request's own body is a stream
-        } else {
-          digest = "";
-        }
+        let { method, url, digest } = fetchRequestMetadata(w, ctx, input, init);
         if (digest === null) {
           ctx.refuseOnce(
             UNRECORDABLE_REQUEST_BODY,
