@@ -139,16 +139,27 @@ afterAll(async () => {
   if (server)
     await new Promise<void>((resolve) => server.close(() => resolve()));
 });
-async function page(source = bundle) {
+/** Engines without AbortSignal.any (Chromium before 116, Firefox before 124,
+ * Safari before 17.4) are recreated in actual Chromium by deleting that one
+ * static operation before the shim captures its originals. Nothing else is
+ * replaced: every remaining signal, Request and fetch operation is native.
+ */
+type Capability = "native" | "without-any";
+async function page(source = bundle, capability: Capability = "native") {
   const context = await browser.newContext();
   contexts.push(context);
   const result = await context.newPage();
   await result.goto(origin);
+  if (capability === "without-any")
+    await result.evaluate(() => {
+      delete (AbortSignal as any).any;
+      if ("any" in AbortSignal) throw new Error("AbortSignal.any remains");
+    });
   await result.evaluate((source) => (0, eval)(source), source);
   return result;
 }
-async function qualify(mode: string) {
-  const nativePage = await page();
+async function qualify(mode: string, capability: Capability = "native") {
+  const nativePage = await page(bundle, capability);
   const native: any = await nativePage.evaluate(
     (mode) => (window as any).factoryPlain(mode),
     mode,
@@ -160,12 +171,18 @@ async function qualify(mode: string) {
     native.trace,
     "native does not read arbitrary own reason/signal getters",
   ).toEqual([]);
+  // The inherited getters are live: the page's own dictionary reaches them.
+  if (mode.includes(":proto-getters:")) expect(native.inheritedLive).toBe(true);
   expect(native.abortEvents).toBe(1);
   expect(native.signalAborted).toBe(true);
-  if (mode.includes(":pending:") || mode.includes(":stopped-event:"))
+  if (
+    mode.includes(":pending:") ||
+    mode.includes(":stopped-event:") ||
+    mode.includes(":proto-getters:")
+  )
     expect(native.pendingBeforeAbort).toBe(true);
 
-  const recordPage = await page();
+  const recordPage = await page(bundle, capability);
   const recorded: any = await recordPage.evaluate(
     (mode) => (window as any).factoryRecord(mode),
     mode,
@@ -184,7 +201,7 @@ async function qualify(mode: string) {
   );
   const timed = mode.endsWith(":timeout") || mode.endsWith(":native-timeout");
 
-  const replayPage = await page();
+  const replayPage = await page(bundle, capability);
   const pageErrors: string[] = [];
   replayPage.on("pageerror", (error) => pageErrors.push(error.message));
   const beforeRequests = requests;
@@ -231,133 +248,145 @@ async function qualify(mode: string) {
   expect(replay.result).toEqual(native);
   expect(response.outcome).toBe(timed ? 4 : 3);
 }
-for (const timing of ["pre-aborted", "pending"])
-  for (const reason of [
-    "default",
-    "error",
-    "dom",
-    "timeout",
-    "string",
-    "number",
-    "null",
-    "name-getter",
+for (const capability of ["native", "without-any"] as const)
+  for (const timing of ["pre-aborted", "pending"])
+    for (const reason of [
+      "default",
+      "error",
+      "dom",
+      "timeout",
+      "string",
+      "number",
+      "null",
+      "name-getter",
+    ])
+      it(
+        timing +
+          " preserves " +
+          reason +
+          " cancellation through actual owned replay" +
+          (capability === "native" ? "" : " " + capability),
+        async () => {
+          await qualify("cancellation:" + timing + ":" + reason, capability);
+        },
+        60_000,
+      );
+for (const capability of ["native", "without-any"] as const)
+  for (const [timing, reason] of [
+    ["stopped-event", "error"],
+    ["own-signal-getters", "null"],
+    ["proto-getters", "error"],
+    ["native-timeout", "native-timeout"],
+    ["expired-timeout", "native-timeout"],
   ])
     it(
       timing +
-        " preserves " +
-        reason +
-        " cancellation through actual owned replay",
+        " preserves actual native signal behavior" +
+        (capability === "native" ? "" : " " + capability),
       async () => {
-        await qualify("cancellation:" + timing + ":" + reason);
+        await qualify("cancellation:" + timing + ":" + reason, capability);
       },
       60_000,
     );
-for (const [timing, reason] of [
-  ["stopped-event", "error"],
-  ["own-signal-getters", "null"],
-  ["native-timeout", "native-timeout"],
-  ["expired-timeout", "native-timeout"],
-])
-  it(
-    timing + " preserves actual native signal behavior",
-    async () => {
-      await qualify("cancellation:" + timing + ":" + reason);
-    },
-    60_000,
-  );
 
-for (const timing of ["failure-equal", "getter-error"])
-  it(
-    timing +
-      " remains a noncausal failure despite signal equality or AbortError name",
-    async () => {
-      const mode = "cancellation:" + timing + ":dom";
-      const nativePage = await page();
-      const native: any = await nativePage.evaluate(
-        ({ mode, timing }) =>
-          timing === "failure-equal"
-            ? (window as any).factoryCancellationNative(mode)
-            : (window as any).factoryPlain(mode),
-        { mode, timing },
-      );
-      expect(native.value).toMatchObject(
-        timing === "failure-equal"
-          ? {
-              name: "TypeError",
-              message: "Failed to fetch",
-              sameReason: true,
-              sameThrown: false,
-            }
-          : {
-              name: "AbortError",
-              message: "page cancellation",
-              sameReason: false,
-              sameThrown: true,
-            },
-      );
-      expect(native.abortEvents).toBe(timing === "failure-equal" ? 1 : 0);
-      expect(native.signalAborted).toBe(timing === "failure-equal");
-      expect(native.trace).toEqual(
-        timing === "getter-error" ? ["init.headers"] : [],
-      );
-      const recordPage = await page();
-      const recorded: any = await recordPage.evaluate(
-        ({ mode, timing }) =>
-          timing === "failure-equal"
-            ? (window as any).factoryCancellationRecord(mode)
-            : (window as any).factoryRecord(mode),
-        { mode, timing },
-      );
-      expect(
-        recorded.records.filter((record: any) => record.record === "Refusal"),
-      ).toEqual([]);
-      expect(recorded.records.at(-1).record).toBe("End");
-      const replayPage = await page(),
-        pageErrors: string[] = [];
-      replayPage.on("pageerror", (error) => pageErrors.push(error.message));
-      const beforeRequests = requests;
-      await replayPage.evaluate(
-        ({ mode, log }) => void (window as any).factoryReplay({ mode, log }),
-        { mode, log: recorded.log },
-      );
-      let replay: any;
-      for (let i = 0; i < 200; i++) {
-        replay = await replayPage.evaluate(() =>
-          (window as any).factoryFinal(),
+for (const capability of ["native", "without-any"] as const)
+  for (const timing of ["failure-equal", "getter-error"])
+    it(
+      timing +
+        " remains a noncausal failure despite signal equality or AbortError name" +
+        (capability === "native" ? "" : " " + capability),
+      async () => {
+        const mode = "cancellation:" + timing + ":dom";
+        const nativePage = await page(bundle, capability);
+        const native: any = await nativePage.evaluate(
+          ({ mode, timing }) =>
+            timing === "failure-equal"
+              ? (window as any).factoryCancellationNative(mode)
+              : (window as any).factoryPlain(mode),
+          { mode, timing },
         );
-        if (replay.error || ["done", "diverged"].includes(replay.status.state))
-          break;
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      console.log(
-        JSON.stringify({
-          mode,
-          native,
-          record: recorded.result,
-          replay: {
-            result: replay.result,
-            status: replay.status,
-            error: replay.error,
-          },
-        }),
-      );
-      expect(pageErrors).toEqual([]);
-      expect(requests).toBe(beforeRequests);
-      expect(replay.raw).toBe(0);
-      expect(replay.witnessed).toBe(true);
-      expect(recorded.result).toEqual(native);
-      expect(replay.error).toBeUndefined();
-      expect(replay.status.state).toBe("done");
-      expect(replay.status.checkpoints).toBe(1);
-      expect(replay.next.kind).toBe("End");
-      expect(replay.result).toEqual(native);
-      expect(
-        recorded.records.find((record: any) => record.record === "NetResponse")
-          .outcome,
-      ).toBe(2);
-    },
-    60_000,
-  );
+        expect(native.value).toMatchObject(
+          timing === "failure-equal"
+            ? {
+                name: "TypeError",
+                message: "Failed to fetch",
+                sameReason: true,
+                sameThrown: false,
+              }
+            : {
+                name: "AbortError",
+                message: "page cancellation",
+                sameReason: false,
+                sameThrown: true,
+              },
+        );
+        expect(native.abortEvents).toBe(timing === "failure-equal" ? 1 : 0);
+        expect(native.signalAborted).toBe(timing === "failure-equal");
+        expect(native.trace).toEqual(
+          timing === "getter-error" ? ["init.headers"] : [],
+        );
+        const recordPage = await page(bundle, capability);
+        const recorded: any = await recordPage.evaluate(
+          ({ mode, timing }) =>
+            timing === "failure-equal"
+              ? (window as any).factoryCancellationRecord(mode)
+              : (window as any).factoryRecord(mode),
+          { mode, timing },
+        );
+        expect(
+          recorded.records.filter((record: any) => record.record === "Refusal"),
+        ).toEqual([]);
+        expect(recorded.records.at(-1).record).toBe("End");
+        const replayPage = await page(bundle, capability),
+          pageErrors: string[] = [];
+        replayPage.on("pageerror", (error) => pageErrors.push(error.message));
+        const beforeRequests = requests;
+        await replayPage.evaluate(
+          ({ mode, log }) => void (window as any).factoryReplay({ mode, log }),
+          { mode, log: recorded.log },
+        );
+        let replay: any;
+        for (let i = 0; i < 200; i++) {
+          replay = await replayPage.evaluate(() =>
+            (window as any).factoryFinal(),
+          );
+          if (
+            replay.error ||
+            ["done", "diverged"].includes(replay.status.state)
+          )
+            break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        console.log(
+          JSON.stringify({
+            mode,
+            native,
+            record: recorded.result,
+            replay: {
+              result: replay.result,
+              status: replay.status,
+              error: replay.error,
+            },
+          }),
+        );
+        expect(pageErrors).toEqual([]);
+        expect(requests).toBe(beforeRequests);
+        expect(replay.raw).toBe(0);
+        expect(replay.witnessed).toBe(true);
+        expect(recorded.result).toEqual(native);
+        expect(replay.error).toBeUndefined();
+        expect(replay.status.state).toBe("done");
+        expect(replay.status.checkpoints).toBe(1);
+        expect(replay.next.kind).toBe("End");
+        expect(replay.result).toEqual(native);
+        expect(
+          recorded.records.find(
+            (record: any) => record.record === "NetResponse",
+          ).outcome,
+        ).toBe(2);
+      },
+      60_000,
+    );
 
 for (const kind of [
   "reject",
@@ -367,7 +396,8 @@ for (const kind of [
   "clone",
   "body-abort",
   "reader-closed",
-  "low-capability",
+  "without-any",
+  "without-reason",
 ])
   it(
     kind +
@@ -380,11 +410,14 @@ for (const kind of [
       );
       expect(observed.refusals).toEqual([]);
       expect(observed.last).toBe("End");
-      expect(observed.added).toBe(kind === "low-capability" ? 0 : 1);
-      expect(observed.removed).toBe(kind === "low-capability" ? 0 : 1);
+      // Without AbortSignal.reason nothing is mirrored: the page's own
+      // arguments reach the native fetch and its AbortError classifies.
+      const mirrored = kind !== "without-reason";
+      expect(observed.added).toBe(mirrored ? 1 : 0);
+      expect(observed.removed).toBe(mirrored ? 1 : 0);
       expect(observed.sameRegistration).toBe(true);
       expect(observed.privateTarget).toBe(true);
-      expect(observed.rawArguments).toBe(kind === "low-capability");
+      expect(observed.rawArguments).toBe(!mirrored);
       if (
         ["cancel", "eof", "clone", "body-abort", "reader-closed"].includes(kind)
       )
@@ -394,9 +427,13 @@ for (const kind of [
         ).toBe(0);
       if (kind === "null") expect(observed.beforeCompletion).toBe(1);
       if (
-        ["reject", "low-capability", "body-abort", "reader-closed"].includes(
-          kind,
-        )
+        [
+          "reject",
+          "without-any",
+          "without-reason",
+          "body-abort",
+          "reader-closed",
+        ].includes(kind)
       )
         expect(observed.error.name).toBe("AbortError");
     },
@@ -413,7 +450,7 @@ it("actual native nonnull204 keeps exact Refusal and raw cancellation on its exc
   expect(observed.added).toBe(1);
   expect(
     observed.removed,
-    "already-refused raw body retains its once-only mirror until abort",
+    "already-refused raw body retains its once-only mirror while reachable",
   ).toBe(0);
   expect(observed.refusals).toEqual([
     {
@@ -425,6 +462,54 @@ it("actual native nonnull204 keeps exact Refusal and raw cancellation on its exc
   ]);
   expect(observed.last).toBe("End");
 }, 60_000);
+
+for (const hold of [false, true])
+  it(
+    "a refused raw body's mirror is released once that native body is " +
+      (hold ? "unreachable (held control)" : "unreachable"),
+    async () => {
+      const observedPage = await page();
+      const observed: any = await observedPage.evaluate(
+        (hold) => (window as any).factoryCancellationCollected(hold),
+        hold,
+      );
+      expect(observed).toMatchObject({
+        status: 204,
+        bodyNull: false,
+        text: "",
+        added: 1,
+        removedAtEnd: 0,
+        last: "End",
+      });
+      expect(observed.refusals).toEqual([
+        {
+          record: "Refusal",
+          seq: "4",
+          feature: "unrecordable-response-body",
+          detail: "fetch response basic 204",
+        },
+      ]);
+      // The engine's own collector, driven until finalization has had tasks
+      // to run. A held body must never release; a dropped one must.
+      const cdp = await observedPage.context().newCDPSession(observedPage);
+      let removed = 0;
+      for (let i = 0; i < 50; i++) {
+        await cdp.send("HeapProfiler.collectGarbage");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        removed = await observedPage.evaluate(
+          () => (window as any).cancellationCollected.removed,
+        );
+        if (!hold && removed > 0) break;
+      }
+      expect(removed).toBe(hold ? 0 : 1);
+      expect(
+        await observedPage.evaluate(
+          () => (window as any).cancellationLongLived.signal.aborted,
+        ),
+      ).toBe(false);
+    },
+    60_000,
+  );
 
 for (const inverse of ["cause", "null"])
   it(

@@ -872,6 +872,33 @@ describe("direct owner fetch library", () => {
         ).toHaveLength(2);
         currentSource = currentSource.replace(from, to);
       };
+      // The pre-header cancellation fallback (no AbortSignal.any, no
+      // rebuilder) and its unreachable-body release are qualified by
+      // tests/boundary/fetch-cancellation.test.ts. Its inverse must restore
+      // the ENTIRE published parent file before the older layers below.
+      const fallback = JSON.parse(
+        fs.readFileSync(
+          path.join(
+            __dirname,
+            "fixtures/fetch-preheader-fallback-corrections.json",
+          ),
+          "utf8",
+        ),
+      );
+      expect(fallback.parent).toBe("aabe50a815833b94eb922f90d990896ea0929341");
+      const fellBack = fallback.entries.filter(
+        (entry: any) => entry.file === saved.file,
+      );
+      expect(fellBack).toHaveLength(1);
+      for (const change of fellBack[0].changes)
+        project(
+          change.current,
+          change.parent,
+          "exact pre-header cancellation fallback correction",
+        );
+      expect(createHash("sha256").update(currentSource).digest("hex")).toBe(
+        fellBack[0].parentSha256,
+      );
       // The shared Request-constructor conversion correction is qualified by
       // tests/boundary/fetch-arguments.test.ts. Like the causal correction
       // below, its inverse must restore the ENTIRE published parent file.

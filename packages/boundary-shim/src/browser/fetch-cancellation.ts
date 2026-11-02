@@ -3,7 +3,11 @@
  * operation's cancellation from an unrelated failure followed by a page abort,
  * including one with the identical error. Native dependent signals bypass a
  * source's stopImmediatePropagation listener (DOM, abort dependent signals).
+ * Where AbortSignal.any is absent, a private Request's signal is that
+ * dependent: the Request constructor makes its signal follow init.signal
+ * (Fetch, new Request(), the step that creates a dependent abort signal).
  * https://fetch.spec.whatwg.org/#fetch-method
+ * https://fetch.spec.whatwg.org/#dom-request
  * https://dom.spec.whatwg.org/#abortsignal-dependent-signals
  */
 import type { ShimOriginals } from "./originals.js";
@@ -11,12 +15,73 @@ import { Outcome } from "./stream-body.js";
 
 export interface FetchCancellation {
   init: RequestInit | undefined;
-  head(): void;
+  /** The response head arrived; `resp` is the native fetch's own Response. */
+  head(resp: Response): void;
   release(): void;
   rejection(error: unknown): { error: unknown; outcome: number };
 }
 
-/** The original low-capability path remains when captured operations lack. */
+/**
+ * Per captured realm: releases the mirror of a body nobody tracked (a raw
+ * Refused body, a page-shadowed body) once that native body stream is
+ * unreachable. Every reader, tee branch (clone) and the Response itself
+ * retain that stream, so collection proves nothing can observe its later
+ * error. Tracked bodies are released deterministically first.
+ * https://tc39.es/ecma262/#sec-finalization-registry-objects
+ */
+const bodyRegistries = new WeakMap<
+  ShimOriginals,
+  FinalizationRegistry<() => void>
+>();
+
+function bodyRegistry(
+  orig: ShimOriginals,
+): FinalizationRegistry<() => void> | undefined {
+  const captured = orig.finalizationRegistry;
+  if (!captured) return undefined;
+  let registry = bodyRegistries.get(orig);
+  if (!registry) {
+    registry = new captured.ctor<() => void>((release) => release());
+    bodyRegistries.set(orig, registry);
+  }
+  return registry;
+}
+
+/** A URL the private follower Request parses without network or page state. */
+const FOLLOWER_URL = "data:,";
+
+/**
+ * A native signal that aborts, with the same reason, when `source` aborts and
+ * that page listeners on `source` cannot stop. `undefined` only when neither
+ * AbortSignal.any nor a captured Request constructor and signal getter exist.
+ */
+function dependentSignalFactory(
+  orig: ShimOriginals,
+): ((source: AbortSignal) => AbortSignal) | undefined {
+  const any = orig.abortSignalAny;
+  if (any) return (source) => any.call(orig.AbortSignal, [source]);
+  const OrigRequest = orig.Request;
+  const requestSignal = orig.requestSignal?.descriptor.get;
+  if (!OrigRequest || !requestSignal) return undefined;
+  // A dictionary of our own with no prototype: WebIDL reads every RequestInit
+  // member through the chain, so an Object.prototype getter of the page's
+  // would otherwise observe (or alter) this private conversion. Only the
+  // brand-checked signal is present.
+  // https://webidl.spec.whatwg.org/#js-dictionary
+  return (source) => {
+    const init = { __proto__: null, signal: source } as RequestInit;
+    return requestSignal.call(
+      new OrigRequest(FOLLOWER_URL, init),
+    ) as AbortSignal;
+  };
+}
+
+/**
+ * The native operations proving causal cancellation, or `undefined` where the
+ * engine predates AbortSignal.reason: there every cancellation rejects with
+ * the platform's own AbortError, whose name already classifies it in Record
+ * and Replay alike (stream-body.ts failureOutcome).
+ */
 export function prepareFetchCancellation(
   orig: ShimOriginals,
   input: RequestInfo | URL,
@@ -26,13 +91,13 @@ export function prepareFetchCancellation(
   const reason = orig.abortSignalReason?.descriptor.get;
   const controllerSignal = orig.abortControllerSignal?.descriptor.get;
   const exceptionName = orig.domExceptionName?.descriptor.get;
-  const any = orig.abortSignalAny;
+  const follow = dependentSignalFactory(orig);
   if (
     !aborted ||
     !reason ||
     !controllerSignal ||
     !exceptionName ||
-    !any ||
+    !follow ||
     !orig.requestSignal?.descriptor.get ||
     !orig.responseBody?.descriptor.get ||
     !orig.DOMException ||
@@ -59,9 +124,14 @@ export function prepareFetchCancellation(
   let stop: (() => void) | undefined;
   let head = false;
   let released = false;
+  // The unregister token: never the body itself, which it must not retain.
+  const registration = {};
+  let registered: FinalizationRegistry<() => void> | undefined;
   const release = () => {
     if (released) return;
     released = true;
+    if (registered)
+      orig.finalizationRegistry?.unregister.call(registered, registration);
     if (dependent && stop)
       orig.removeEventListener.call(dependent, "abort", stop);
   };
@@ -87,7 +157,7 @@ export function prepareFetchCancellation(
       pageSignal = candidate as AbortSignal;
       const controller = new orig.AbortController();
       nativeSignal = controllerSignal.call(controller);
-      dependent = any.call(orig.AbortSignal, [pageSignal]);
+      dependent = follow(pageSignal);
       const source = pageSignal;
       stop = () => {
         orig.abortControllerAbort.call(
@@ -102,8 +172,20 @@ export function prepareFetchCancellation(
   });
   return {
     init: observedInit,
-    head() {
+    head(resp) {
       head = true;
+      if (released || !dependent) return;
+      // The captured internal accessor: no page-observable body Get.
+      const body = orig.responseBody?.descriptor.get?.call(resp);
+      if (body === null || typeof body !== "object") return;
+      registered = bodyRegistry(orig);
+      if (registered)
+        orig.finalizationRegistry?.register.call(
+          registered,
+          body,
+          release,
+          registration,
+        );
     },
     release,
     rejection(error) {

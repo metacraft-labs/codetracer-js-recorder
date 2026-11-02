@@ -83,10 +83,50 @@ workflow = async function (mode, call, delay, reuse) {
           signal,
         }
       : { signal };
-  const pending = call(
-    timing === "failure-equal" ? "/api/fail" : "/api/late-head",
-    init,
-  );
+  // Inherited RequestInit members observe every dictionary read the call
+  // makes. Reads through the page's own init are its native conversion (the
+  // count Record reads them is the separate argument-consistency concern); a
+  // read through any other dictionary is the recorder's, and must not reach
+  // the page.
+  const inherited = [];
+  let inheritedLive;
+  if (timing === "proto-getters")
+    for (const key of [
+      "body",
+      "cache",
+      "credentials",
+      "duplex",
+      "headers",
+      "integrity",
+      "keepalive",
+      "method",
+      "mode",
+      "priority",
+      "redirect",
+      "referrer",
+      "referrerPolicy",
+      "window",
+    ]) {
+      if (Object.prototype.hasOwnProperty.call(Object.prototype, key)) continue;
+      inherited.push(key);
+      Object.defineProperty(Object.prototype, key, {
+        configurable: true,
+        get() {
+          if (this === init) inheritedLive = true;
+          else trace.push("foreign." + key);
+          return undefined;
+        },
+      });
+    }
+  let pending;
+  try {
+    pending = call(
+      timing === "failure-equal" ? "/api/fail" : "/api/late-head",
+      init,
+    );
+  } finally {
+    for (const key of inherited) delete Object.prototype[key];
+  }
   pending.then(
     () => {
       settled = true;
@@ -95,7 +135,9 @@ workflow = async function (mode, call, delay, reuse) {
       settled = true;
     },
   );
-  const stopping = ["pending", "stopped-event"].includes(timing)
+  const stopping = ["pending", "stopped-event", "proto-getters"].includes(
+    timing,
+  )
     ? delay(15).then(() => {
         pendingBeforeAbort = !settled;
         stop();
@@ -128,6 +170,7 @@ workflow = async function (mode, call, delay, reuse) {
     abortEvents,
     signalAborted: getAborted.call(signal),
     ...(pendingBeforeAbort === undefined ? {} : { pendingBeforeAbort }),
+    ...(inheritedLive === undefined ? {} : { inheritedLive }),
   };
   document.querySelector("#out").textContent = JSON.stringify(result);
   return result;
@@ -198,16 +241,20 @@ globalThis.factoryCancellationCleanup = async (kind) => {
   // alone (JS-Boundary-Recording §9.7): its init is the native conversion's.
   const RawRequest = orig.Request;
   orig.Request = function Request(input, init) {
-    rawInit = init;
+    // The first construction is the page's conversion; an engine without
+    // AbortSignal.any constructs a private follower Request after it.
+    if (rawInit === undefined) rawInit = init;
     return new RawRequest(input, init);
   };
-  if (kind === "low-capability") orig.abortSignalAny = undefined;
+  if (kind === "without-any") orig.abortSignalAny = undefined;
+  // An engine before AbortSignal.reason keeps the unchanged native path.
+  if (kind === "without-reason") orig.abortSignalReason = undefined;
   const ctx = recordContext(orig),
     call = createRecordFetch(ctx);
   suppliedInit = { signal: controller.signal };
   if (kind === "null") suppliedInit.mode = "no-cors";
   let error, beforeCompletion;
-  if (kind === "reject" || kind === "low-capability") {
+  if (["reject", "without-any", "without-reason"].includes(kind)) {
     controller.abort();
     try {
       await call("/api/late-head", suppliedInit);
@@ -521,4 +568,48 @@ globalThis.factoryCancellationForeignBody = async () => {
       decodeLog(ctx.rec.log(), { inlineBodies: "batch" }).records,
     ),
   };
+};
+
+/** A Refused raw body (Chromium's non-null 204 stream) on a long-lived page
+ * signal that is never aborted. Its mirror can only be released once nothing
+ * can read that native body; `hold` keeps the Response as the control. The
+ * genuine engine collector decides reachability (the test drives it through
+ * CDP); only the captured listener functions are observed, as in the cleanup
+ * fixture above.
+ */
+globalThis.factoryCancellationCollected = async (hold) => {
+  const orig = captureOriginals(window),
+    remove = orig.removeEventListener,
+    observed = { added: 0, removed: 0 };
+  const add = orig.addEventListener;
+  orig.addEventListener = function (...args) {
+    if (args[0] === "abort") observed.added++;
+    return add.apply(this, args);
+  };
+  orig.removeEventListener = function (...args) {
+    if (args[0] === "abort") observed.removed++;
+    return remove.apply(this, args);
+  };
+  const ctx = recordContext(orig),
+    call = createRecordFetch(ctx),
+    controller = new AbortController();
+  await (async () => {
+    const response = await call("/api/empty", { signal: controller.signal });
+    observed.status = response.status;
+    observed.bodyNull = response.body === null;
+    observed.text = await response.text();
+    if (hold) globalThis.cancellationHeldResponse = response;
+  })();
+  ctx.rec.end(2);
+  const records = decodeLog(ctx.rec.log(), { inlineBodies: "batch" }).records;
+  observed.refusals = serial(
+    records.filter((record) => record.record === "Refusal"),
+  );
+  observed.last = records.at(-1).record;
+  observed.removedAtEnd = observed.removed;
+  // The long-lived page signal outlives the request, as an application's
+  // component-lifetime controller does.
+  globalThis.cancellationLongLived = controller;
+  globalThis.cancellationCollected = observed;
+  return { ...observed };
 };

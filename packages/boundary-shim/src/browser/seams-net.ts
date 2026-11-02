@@ -197,8 +197,10 @@ export function createRecordFetch(ctx: SeamContext): typeof fetch | undefined {
         });
         return { reqId, taskId };
       });
+      // Cancellation is proved without the rebuilder: an untracked body keeps
+      // its mirror until that body is unreachable (fetch-cancellation.ts).
       const cancellation =
-        ids !== undefined && responses !== undefined
+        ids !== undefined
           ? prepareFetchCancellation(orig, input, init)
           : undefined;
       if (ids === undefined) return origFetch.call(w, input, init);
@@ -210,7 +212,7 @@ export function createRecordFetch(ctx: SeamContext): typeof fetch | undefined {
       );
       return p.then(
         (resp: Response) => {
-          cancellation?.head();
+          cancellation?.head(resp);
           // The head has arrived: the network task that resolves the
           // platform's promise. The page gets its response now; its body is
           // recorded piece by piece as the page reads it (stream-body.ts).

@@ -57,6 +57,18 @@ export interface ShimOriginals {
   DOMException: typeof DOMException;
   domExceptionName: CapturedGetter | undefined;
   /**
+   * Releases a cancellation mirror once its native body is unreachable
+   * (fetch-cancellation.ts). Captured before the page's own constructor is
+   * refused (seams-refusals.ts); `undefined` in engines without it.
+   */
+  finalizationRegistry:
+    | {
+        ctor: typeof FinalizationRegistry;
+        register: FinalizationRegistry<unknown>["register"];
+        unregister: FinalizationRegistry<unknown>["unregister"];
+      }
+    | undefined;
+  /**
    * What a streamed fetch response is rebuilt from (seams-net.ts): the
    * `Response` and `ReadableStream` constructors, the `Response`
    * accessors a constructed response cannot be given, `clone`, and the
@@ -250,6 +262,14 @@ export function captureOriginals(w: Window & typeof globalThis): ShimOriginals {
     abortSignalReason: getter(w.AbortSignal?.prototype, "reason"),
     DOMException: w.DOMException,
     domExceptionName: getter(w.DOMException?.prototype, "name"),
+    finalizationRegistry:
+      typeof w.FinalizationRegistry === "function"
+        ? {
+            ctor: w.FinalizationRegistry,
+            register: w.FinalizationRegistry.prototype.register,
+            unregister: w.FinalizationRegistry.prototype.unregister,
+          }
+        : undefined,
     Response: w.Response,
     responseBody: getter(w.Response?.prototype, "body"),
     ReadableStream: w.ReadableStream,
