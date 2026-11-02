@@ -183,7 +183,12 @@ export interface StreamedResponses {
    * `resp` has no body or cannot be rebuilt, in which case `resp` is left
    * untouched (its body neither read nor locked).
    */
-  rebuild(resp: Response, reqId: bigint, taskId: bigint): Response | undefined;
+  rebuild(
+    resp: Response,
+    reqId: bigint,
+    taskId: bigint,
+    completed?: () => void,
+  ): Response | undefined;
 }
 
 /**
@@ -302,11 +307,22 @@ export function patchResponses(
   }
 
   return {
-    rebuild(resp, reqId, taskId) {
+    rebuild(resp, reqId, taskId, completed) {
       const body = resp.body;
       if (body === null || resp.status < 200 || resp.status > 599) {
         return undefined;
       }
+      // The observable getter can supply a different page-created stream.
+      // Its EOF/cancel says nothing about the native fetch body's lifetime.
+      // Compare the stream ALREADY read above through a captured accessor;
+      // never add another observable body Get or lock/read the native body.
+      const nativeBody = orig.responseBody?.descriptor.get;
+      const complete =
+        completed !== undefined &&
+        nativeBody !== undefined &&
+        body === nativeBody.call(resp)
+          ? completed
+          : undefined;
       // The platform's body is a byte stream in current engines; the page's
       // must be one exactly when it is, so a BYOB reader works or fails as
       // it would.
@@ -359,6 +375,7 @@ export function patchResponses(
               }
               if (res.done) {
                 ended = true;
+                complete?.();
                 record(!queued, () =>
                   emitBodyEnd(rec, reqId, Outcome.response),
                 );
@@ -395,6 +412,7 @@ export function patchResponses(
                 return;
               }
               ended = true;
+              complete?.();
               failure.failed = true;
               failure.error = err;
               const outcome = failureOutcome(err);
@@ -425,6 +443,7 @@ export function patchResponses(
         pull,
         cancel(reason: unknown): Promise<void> {
           cancelled = true;
+          complete?.();
           return readerOf().cancel(reason);
         },
       };
@@ -474,6 +493,7 @@ export function patchResponses(
         (err: unknown) => {
           if (ended || cancelled) return;
           ended = true;
+          complete?.();
           failure.failed = true;
           failure.error = err;
           const outcome = failureOutcome(err);

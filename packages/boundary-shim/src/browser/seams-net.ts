@@ -38,6 +38,7 @@ import {
 
 import { TaskKind } from "./recorder.js";
 import { prepareFetch } from "./fetch-preparation.js";
+import { prepareFetchCancellation } from "./fetch-cancellation.js";
 import { markPageResponse } from "./seams-platform.js";
 import { holeBytes, holeText } from "./sensitive.js";
 import { sha256Hex } from "./sha256.js";
@@ -196,10 +197,15 @@ export function createRecordFetch(ctx: SeamContext): typeof fetch | undefined {
         });
         return { reqId, taskId };
       });
-      const p = origFetch.call(w, input, init);
+      const cancellation =
+        ids !== undefined && responses !== undefined
+          ? prepareFetchCancellation(orig, input, init)
+          : undefined;
+      const p = origFetch.call(w, input, cancellation?.init ?? init);
       if (ids === undefined) return p;
       return p.then(
         (resp: Response) => {
+          cancellation?.head();
           // The head has arrived: the network task that resolves the
           // platform's promise. The page gets its response now; its body is
           // recorded piece by piece as the page reads it (stream-body.ts).
@@ -211,7 +217,12 @@ export function createRecordFetch(ctx: SeamContext): typeof fetch | undefined {
             rec.task(ids.taskId, TaskKind.networkCompletion);
             let outcome = Outcome.response;
             if (resp.body !== null) {
-              const rebuilt = responses?.rebuild(resp, ids.reqId, ids.taskId);
+              const rebuilt = responses?.rebuild(
+                resp,
+                ids.reqId,
+                ids.taskId,
+                cancellation?.release,
+              );
               if (rebuilt === undefined) {
                 // The page reads the platform's body directly, unseen.
                 ctx.refuseOnce(
@@ -222,6 +233,13 @@ export function createRecordFetch(ctx: SeamContext): typeof fetch | undefined {
                 page = rebuilt;
                 outcome = Outcome.head;
               }
+            } else if (
+              cancellation !== undefined &&
+              orig.responseBody?.descriptor.get?.call(resp) === null
+            ) {
+              // An own body getter can hide a live native body. Only the
+              // captured internal null body makes cancellation irrelevant.
+              cancellation?.release();
             }
             rec.emit("NetResponse", {
               req_id: ids.reqId,
@@ -235,8 +253,10 @@ export function createRecordFetch(ctx: SeamContext): typeof fetch | undefined {
           return page;
         },
         (err: unknown) => {
+          const failure = cancellation?.rejection(err);
+          cancellation?.release();
           rec.guard(() => {
-            const outcome = failureOutcome(err);
+            const outcome = failure?.outcome ?? failureOutcome(err);
             // An abort is the page's own call, made inside one of its tasks.
             if (outcome !== Outcome.abort) {
               rec.task(ids.taskId, TaskKind.networkCompletion);
@@ -250,7 +270,7 @@ export function createRecordFetch(ctx: SeamContext): typeof fetch | undefined {
               body: inline(EMPTY),
             });
           });
-          throw err;
+          throw failure === undefined ? err : failure.error;
         },
       );
     };

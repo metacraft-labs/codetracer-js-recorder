@@ -872,6 +872,32 @@ describe("direct owner fetch library", () => {
         ).toHaveLength(2);
         currentSource = currentSource.replace(from, to);
       };
+      // The causal pre-header correction is independently qualified by actual
+      // owner/native tests and compiled production inverses. Its precise inverse
+      // must first restore the ENTIRE published parent file, not merely the
+      // callback fragment compared with the older immutable extraction snapshot.
+      const cancellation = JSON.parse(
+        fs.readFileSync(
+          path.join(__dirname, "fixtures/fetch-cancellation-corrections.json"),
+          "utf8",
+        ),
+      );
+      expect(cancellation.parent).toBe(
+        "e275e1f1957de4d13cbe511e79daec42cfccdc94",
+      );
+      const correction = cancellation.entries.filter(
+        (entry: any) => entry.file === saved.file,
+      );
+      expect(correction).toHaveLength(1);
+      for (const change of correction[0].changes)
+        project(
+          change.current,
+          change.parent,
+          "exact causal cancellation correction",
+        );
+      expect(createHash("sha256").update(currentSource).digest("hex")).toBe(
+        correction[0].parentSha256,
+      );
       if (saved.file.endsWith("/seams-net.ts")) {
         project(
           fragments.recordPrefix,

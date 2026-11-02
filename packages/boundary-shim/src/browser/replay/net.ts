@@ -352,6 +352,21 @@ function prepareReplayFetch(
         // owns delivery of the request's rejection.
       }
 
+      // Pre-header cancellation returns the actual page reason, including
+      // explicit null. Body/XHR diagnostics retain their separate mapping.
+      const aborted = () =>
+        signal !== undefined &&
+        (orig.abortSignalAborted?.descriptor.get?.call(signal) ??
+          signal.aborted);
+      const signalReason = () =>
+        orig.abortSignalReason?.descriptor.get
+          ? orig.abortSignalReason.descriptor.get.call(signal)
+          : signal?.reason;
+      const requestFailure = (outcome: number) =>
+        (outcome === Outcome.abort || outcome === Outcome.timeout) && aborted()
+          ? signalReason()
+          : failureError(w, outcome, signal);
+
       return new OrigPromise<Response>((resolve, reject) => {
         let phase: "head" | "body" | "done" = "head";
         let controller: ReadableStreamController<Uint8Array> | undefined;
@@ -447,10 +462,32 @@ function prepareReplayFetch(
               resolve(responseOf(r, blobBytes(replay, r.body) as BodyInit));
             } else {
               finish();
+              if (
+                r.outcome === Outcome.timeout &&
+                signal !== undefined &&
+                !aborted()
+              ) {
+                // AbortSignal.timeout is a real native signal, not a page
+                // timer task. The existing scheduler awaits this task's
+                // returned promise until that native operation has settled.
+                return new OrigPromise<void>((done) => {
+                  orig.addEventListener.call(
+                    signal,
+                    "abort",
+                    () => {
+                      reject(
+                        applicationThrew
+                          ? applicationError
+                          : requestFailure(r.outcome),
+                      );
+                      done();
+                    },
+                    { once: true },
+                  );
+                });
+              }
               reject(
-                applicationThrew
-                  ? applicationError
-                  : failureError(w, r.outcome, signal),
+                applicationThrew ? applicationError : requestFailure(r.outcome),
               );
             }
             return;
@@ -488,14 +525,14 @@ function prepareReplayFetch(
               ) {
                 const r = replay.next("NetResponse", { req_id: reqId });
                 finish();
-                reject(failureError(w, r.outcome, signal));
+                reject(requestFailure(r.outcome));
               }
             } else if (phase === "body" && bodyRecordNext()) {
               deliver();
             }
           });
         if (signal !== undefined && signal !== null) {
-          if (signal.aborted) onAbort();
+          if (aborted()) onAbort();
           else
             orig.addEventListener.call(signal, "abort", onAbort, {
               once: true,

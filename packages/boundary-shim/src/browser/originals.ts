@@ -46,6 +46,16 @@ export interface ShimOriginals {
   /** Replay performs native argument conversion without starting a request. */
   Request: typeof Request;
   requestSignal: CapturedGetter | undefined;
+  /** Native cancellation operations, never page-owned signal/reason getters. */
+  AbortController: typeof AbortController;
+  abortControllerAbort: AbortController["abort"];
+  abortControllerSignal: CapturedGetter | undefined;
+  AbortSignal: typeof AbortSignal;
+  abortSignalAny: typeof AbortSignal.any | undefined;
+  abortSignalAborted: CapturedGetter | undefined;
+  abortSignalReason: CapturedGetter | undefined;
+  DOMException: typeof DOMException;
+  domExceptionName: CapturedGetter | undefined;
   /**
    * What a streamed fetch response is rebuilt from (seams-net.ts): the
    * `Response` and `ReadableStream` constructors, the `Response`
@@ -53,6 +63,8 @@ export interface ShimOriginals {
    * `Headers` mutators.
    */
   Response: typeof Response | undefined;
+  /** Native internal body identity, independent of an own `body` accessor. */
+  responseBody: CapturedGetter | undefined;
   ReadableStream: typeof ReadableStream | undefined;
   responseGetters: Map<string, CapturedGetter>;
   responseClone: Response["clone"] | undefined;
@@ -101,6 +113,7 @@ export interface ShimOriginals {
   pushState: History["pushState"];
   replaceState: History["replaceState"];
   addEventListener: EventTarget["addEventListener"];
+  removeEventListener: EventTarget["removeEventListener"];
   /**
    * `MessageChannel` and the `MessagePort` methods the shim makes a task of
    * its own with (seams-environment.ts `ownTask`); `undefined` where the
@@ -228,7 +241,17 @@ export function captureOriginals(w: Window & typeof globalThis): ShimOriginals {
     fetch: w.fetch,
     Request: w.Request,
     requestSignal: getter(w.Request?.prototype, "signal"),
+    AbortController: w.AbortController,
+    abortControllerAbort: w.AbortController?.prototype.abort,
+    abortControllerSignal: getter(w.AbortController?.prototype, "signal"),
+    AbortSignal: w.AbortSignal,
+    abortSignalAny: w.AbortSignal?.any,
+    abortSignalAborted: getter(w.AbortSignal?.prototype, "aborted"),
+    abortSignalReason: getter(w.AbortSignal?.prototype, "reason"),
+    DOMException: w.DOMException,
+    domExceptionName: getter(w.DOMException?.prototype, "name"),
     Response: w.Response,
+    responseBody: getter(w.Response?.prototype, "body"),
     ReadableStream: w.ReadableStream,
     responseGetters,
     responseClone: w.Response?.prototype.clone,
@@ -263,6 +286,7 @@ export function captureOriginals(w: Window & typeof globalThis): ShimOriginals {
     pushState: w.History.prototype.pushState,
     replaceState: w.History.prototype.replaceState,
     addEventListener: w.EventTarget.prototype.addEventListener,
+    removeEventListener: w.EventTarget.prototype.removeEventListener,
     messageChannel:
       typeof w.MessageChannel === "function" && w.MessagePort !== undefined
         ? {
