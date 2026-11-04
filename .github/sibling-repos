@@ -2,3 +2,7 @@
 # revisions (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
 codetracer-trace-format
 codetracer-trace-format-nim
+# The boundary replay tests run two codetracer binaries, `ct-jsbound`
+# (libs/jsbound) and `session-manager` (src/backend-manager); CI builds them
+# with `just build-codetracer-test-bins`. Neither crate needs a submodule.
+codetracer
