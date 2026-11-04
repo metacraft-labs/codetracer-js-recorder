@@ -131,6 +131,10 @@ const RELEASE_SETTLE_MS = 250;
  * stops the writes. `nosniff` keeps Chromium from holding the first bytes
  * back to sniff a MIME type.
  * `first=<ms>` flushes headers immediately and delays the first body piece.
+ * `first=never` flushes headers and writes no body piece at all: only the
+ * client closing the response ends it. A page that aborts such a response
+ * therefore aborts it with its body pending, however late its abort runs,
+ * which a `first=<ms>` deadline cannot promise on a loaded host.
  *
  * `/api/sse` takes `event=<name>` (every event named so) and `id=1` (each
  * event with an id, 1, 2, …).
@@ -193,7 +197,13 @@ function serveStream(
     if (hold !== null) held.delete(hold);
     streamEnds.push({ url: url.pathname + url.search, written, finished });
   });
-  const first = Number(url.searchParams.get("first") ?? "0");
+  const firstParam = url.searchParams.get("first");
+  if (firstParam === "never") {
+    // The `close` listener above records the end (`written: 0`).
+    res.flushHeaders();
+    return;
+  }
+  const first = Number(firstParam ?? "0");
   if (first > 0) {
     res.flushHeaders();
     timer = setTimeout(write, first);
