@@ -61,13 +61,18 @@ package codetracer_js_recorder:
     # ``crates/recorder_native/Cargo.toml`` (there is no workspace
     # ``Cargo.toml`` at the repo root). Pin the manifest path so cargo
     # finds it from the recipe's CWD (the repo root).
-    const dylibExt =
-      when defined(windows): "dll"
-      elif defined(macosx): "dylib"
-      else: "so"
-    const addonBinary =
-      "crates/recorder_native/target/release/codetracer_js_recorder_native." &
-      dylibExt
+    #
+    # Cargo names a cdylib after the platform's shared-library
+    # convention: `lib<crate>.so` / `lib<crate>.dylib` on Linux and
+    # macOS, `<crate>.dll` (no `lib` prefix) on Windows. The declared
+    # output must match that file exactly, or the engine fails the
+    # action for not producing what it declared.
+    # https://doc.rust-lang.org/reference/linkage.html
+    const addonFile =
+      when defined(windows): "codetracer_js_recorder_native.dll"
+      elif defined(macosx): "libcodetracer_js_recorder_native.dylib"
+      else: "libcodetracer_js_recorder_native.so"
+    const addonBinary = "crates/recorder_native/target/release/" & addonFile
     const cargoManifest = "crates/recorder_native/Cargo.toml"
     const cargoLockfile = "crates/recorder_native/Cargo.lock"
 
