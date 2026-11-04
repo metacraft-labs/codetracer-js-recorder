@@ -33,9 +33,13 @@
 
   var cases = {
     // Headers arrive before any body bytes; abort while text() is pending.
+    // The first body piece is due a minute after the headers, so the abort
+    // always comes first, however late a loaded host runs the 15 ms timer:
+    // the abort closes the response, which cancels that piece (a 50 ms
+    // delay lost the race under load and logged a body chunk).
     "fetch-abort-pending-text": async function () {
       var ac = new AbortController();
-      var r = await fetch("/api/stream?n=3&interval=100&first=50", {
+      var r = await fetch("/api/stream?n=3&interval=100&first=60000", {
         signal: ac.signal,
       });
       var pending = r.text();
