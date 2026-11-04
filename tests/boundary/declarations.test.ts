@@ -37,19 +37,51 @@ interface TypingPage extends Page {
   textContent(selector: string): Promise<string | null>;
 }
 
+/**
+ * Valid arms whose experiment keys an ordinary object loses or reorders:
+ * `__proto__` (assigning a string to it on an ordinary object creates no
+ * member), integer-index keys (an object enumerates them first and
+ * numerically, whatever the insertion order) and non-ASCII keys, written as
+ * JSON escapes so the page's encoding does not matter: U+00E9, U+FF61 and
+ * U+1F600, whose UTF-16 order (U+1F600's lead surrogate 0xD83D sorts before
+ * 0xFF61) is not their code-point order.
+ */
+const ODD_ARMS =
+  '{"checkout":"A","__proto__":"B","10":"A","2":"B","\\u00e9":"C",' +
+  '"\\uff61":"D","\\ud83d\\ude00":"E","banner":"blue"}';
+
+/**
+ * `ODD_ARMS`'s canonical JSON: every member kept, keys sorted by their
+ * UTF-16 code units (JavaScript's string order), so "10" before "2".
+ */
+const ODD_ARMS_CANONICAL =
+  '{"10":"A","2":"B","__proto__":"B","banner":"blue","checkout":"A",' +
+  '"é":"C","\u{1f600}":"E","｡":"D"}';
+
 let rr: RecordReplay;
 
 beforeAll(async () => {
   rr = await startRecordReplay((build) => {
+    const html = fs.readFileSync(path.join(build, "declarations.html"), "utf8");
+    const withArms = (name: string, arms: string): void => {
+      const page = html.replace(
+        `data-ct-arms='{"checkout":"B","banner":"blue"}'`,
+        `data-ct-arms='${arms}'`,
+      );
+      // Vacuity guard: the variant really declares the arms under test.
+      expect(page).toContain(`data-ct-arms='${arms}'`);
+      fs.writeFileSync(path.join(build, name), page);
+    };
     // A page whose `data-ct-arms` is not an object of strings: its arms are
     // ignored as a whole.
-    const html = fs.readFileSync(path.join(build, "declarations.html"), "utf8");
-    fs.writeFileSync(
-      path.join(build, "declarations-bad-arms.html"),
-      html.replace(
-        `data-ct-arms='{"checkout":"B","banner":"blue"}'`,
-        `data-ct-arms='{"checkout":"B","banner":7}'`,
-      ),
+    withArms("declarations-bad-arms.html", '{"checkout":"B","banner":7}');
+    // Valid arms that an ordinary object accumulator loses or reorders.
+    withArms("declarations-odd-arms.html", ODD_ARMS);
+    // A prototype-named experiment whose arm is not a string: the whole
+    // object is still ignored.
+    withArms(
+      "declarations-bad-proto-arms.html",
+      '{"__proto__":{"checkout":"B"},"banner":"blue"}',
     );
   });
 }, TIMEOUT);
@@ -148,6 +180,40 @@ describe("narrative declarations of a level-0 page", () => {
     "shim_ignores_arms_that_are_not_an_object_of_strings",
     async () => {
       const records = await rr.record("declarations-bad-arms.html", drive);
+      const env = records.find((r): r is RecordOf<"Env"> => r.record === "Env");
+      expect(env?.arms).toBe("{}");
+      // Positive control: the same page's labels and marks are recorded.
+      expect(marks(records).length).toBe(3);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "shim_keeps_prototype_named_numeric_and_unicode_arms_in_canonical_order",
+    async () => {
+      const records = await rr.record("declarations-odd-arms.html", drive);
+      const env = records.find((r): r is RecordOf<"Env"> => r.record === "Env");
+      expect(env?.arms).toBe(ODD_ARMS_CANONICAL);
+      // Every member the page declared, and no other (JSON.parse creates
+      // `__proto__` as an own member).
+      const members = (json: string): [string, unknown][] =>
+        Object.entries(JSON.parse(json) as object).sort(([a], [b]) =>
+          a < b ? -1 : a > b ? 1 : 0,
+        );
+      expect(members(env?.arms ?? "{}")).toEqual(members(ODD_ARMS));
+      expect(members(ODD_ARMS).length).toBe(8);
+      expectReplayed(await rr.replay(records), records);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "shim_ignores_arms_whose_prototype_named_arm_is_not_a_string",
+    async () => {
+      const records = await rr.record(
+        "declarations-bad-proto-arms.html",
+        drive,
+      );
       const env = records.find((r): r is RecordOf<"Env"> => r.record === "Env");
       expect(env?.arms).toBe("{}");
       // Positive control: the same page's labels and marks are recorded.
