@@ -56,7 +56,10 @@ export interface Page {
     url: string,
     handler: (route: { continue(): Promise<void> }) => Promise<void>,
   ): Promise<void>;
-  waitForEvent(event: "domcontentloaded"): Promise<unknown>;
+  waitForEvent(
+    event: "domcontentloaded",
+    options?: { timeout?: number },
+  ): Promise<unknown>;
 }
 export interface Context {
   newPage(): Promise<Page>;
