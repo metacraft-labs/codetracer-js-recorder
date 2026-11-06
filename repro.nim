@@ -15,7 +15,7 @@
 ##   and the Justfile build with one set of tools.
 ## * Windows: ``tarball``. There is no Nix; every tool in ``uses:``
 ##   has a Windows tarball entry in reprobuild's stdlib
-##   (``repro_dsl_stdlib/packages/{rustc,cargo,nim,nimble,capnp,zstd,
+##   (``repro_dsl_stdlib/packages/{rustc,cargo,nim,nimble,git,capnp,zstd,
 ##   node,npm}.nim``), which the engine downloads and verifies.
 ##
 ## ``--tool-provisioning=<mode>`` or ``REPRO_TOOL_PROVISIONING``
@@ -31,14 +31,19 @@ package codetracer_js_recorder:
     "rustc >=1.85"
     "cargo >=1.85"
     # C compiler driver — rustc links through `cc`, and build scripts
-    # (cc-rs, the Nim FFI) compile C. Declaring it puts its directory on
-    # every cargo edge's PATH. Windows links with MSVC instead.
+    # (cc-rs, the Nim FFI) compile C. The stdlib's `cargo` lists `gcc` /
+    # `clang` as sub-tools, so declaring it here puts it on every cargo
+    # edge's PATH; a `uses:` entry for a tool that no edge lists puts it
+    # on none. Windows links with MSVC instead.
     when defined(linux):
       "gcc"
     elif defined(macosx):
       "clang"
+    # Run by the build scripts of the dependency tree, not by cargo; the
+    # cargo edges attach them explicitly (see "Build-script tools" below).
     "nim >=2.2 <3.0"
     "nimble"
+    "git"
     "capnp"
     "zstd"
     # ``node`` + ``npm`` drive the napi-rs binding step. With MR2's
@@ -117,5 +122,36 @@ package codetracer_js_recorder:
         "crates/recorder_native/src",
         "crates/recorder_native/target/debug/deps"
       ])
+
+    # ---- Build-script tools --------------------------------------------
+    #
+    # A cargo edge gets ``cargo``, ``rustc`` and the C compiler on its PATH
+    # because the stdlib's ``cargo`` declares them as sub-tools. The tools a
+    # crate's BUILD SCRIPT runs are not cargo's: the stdlib leaves them to
+    # the recipe to attach at the call site
+    # (``repro_dsl_stdlib/packages/cargo.nim``, ``executable cargo``), and
+    # a ``uses:`` entry alone resolves a tool without putting it on any
+    # edge. On Linux and macOS the dev shell's PATH masks a missing
+    # attachment; on Windows (tarball provisioning) the build script fails
+    # with "program not found". The build scripts of this crate's
+    # dependency tree run:
+    #
+    # * ``codetracer_trace_writer_nim`` (a normal dependency, so every
+    #   edge): ``nimble install --depsOnly``, which runs ``nim`` and clones
+    #   the packages it lacks with ``git``, then ``nim e build_ffi.nims``,
+    #   which runs ``nim c`` and through it the C compiler.
+    # * ``codetracer_trace_format_capnp`` (reached only through the
+    #   dev-dependency ``codetracer_trace_reader``, so the test edges
+    #   only): ``capnpc`` runs ``capnp compile``.
+    #
+    # ``zstd-sys``, ``ring`` and ``napi-build`` need only the C compiler
+    # (``cc-rs``), which cargo's sub-tools cover. ``cargo test`` without
+    # ``--no-run`` first rebuilds whatever is stale, so the test-run edge
+    # carries the test-build edge's tools.
+    const nimFfiTools = ["nim", "nimble", "git"]
+    appendRegisteredActionToolIdentityRefs(addonBuild.id, nimFfiTools)
+    for action in [cargoTestsBuild.action, cargoTestsRun.action]:
+      appendRegisteredActionToolIdentityRefs(action.id, nimFfiTools)
+      appendRegisteredActionToolIdentityRefs(action.id, ["capnp"])
 
     discard collect("test", @[cargoTestsRun.action])
