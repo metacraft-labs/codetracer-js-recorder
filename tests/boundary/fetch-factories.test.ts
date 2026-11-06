@@ -407,6 +407,11 @@ beforeAll(async () => {
       });
       if (req.url!.startsWith("/api/slow")) {
         res.flushHeaders();
+        // `pending=1`: no body at all until the client goes away. The abort
+        // workflows abort a body they read while it is still pending; with
+        // pieces on a deadline (50 and 100 ms) a starved page's 15 ms abort
+        // came after the whole body, which then read as data.
+        if (req.url!.includes("pending=1")) return;
         later(() => {
           if (!res.destroyed) res.write("first:");
         }, 50);

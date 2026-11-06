@@ -85,7 +85,13 @@ import {
 } from "../../packages/boundary-replay/src/gates.js";
 import { documentTree } from "./harness.js";
 
-const TIMEOUT = 120_000;
+/**
+ * Each test loads every document of {@link DOCUMENTS} in fresh Chromium
+ * contexts, some sixty page loads in turn: a minute at a host load of 100,
+ * past 120 s with eight cores shared by 64 CPU hogs. Only a hang guard: nothing
+ * here measures time. As long as seeking.test.ts gives its own.
+ */
+const TIMEOUT = 600_000;
 
 const DOCUMENTS: Record<string, string> = {
   "pretty-printed": `<!doctype html>
@@ -330,15 +336,25 @@ describe("the replay runner's document gates", () => {
       const options = { parser: true, domContentLoaded: true, load: true };
       const results: Record<string, boolean> = {};
       let gates = 0;
+      const shortHeld: string[] = [];
       for (const [name, html] of Object.entries(DOCUMENTS)) {
         const gated = insertGates(html, options);
         expect(gated.skipped, name).toBeUndefined();
         gates += gated.parserGates;
+        const heldBefore = heldScripts.size;
         const [plain, withGates, held] = [
           await treeOf(html),
           await treeOf(gated.html),
           await treeOf(gated.html, true),
         ];
+        // The hold pass wrote one held script per parser gate, and one for
+        // the parser gate after the event gates.
+        const heldHere = heldScripts.size - heldBefore;
+        if (heldHere !== gated.parserGates + 1) {
+          shortHeld.push(
+            `${name}: ${heldHere} held scripts for ${gated.parserGates + 1} gates`,
+          );
+        }
         results[name] =
           JSON.stringify(withGates) === JSON.stringify(plain) &&
           JSON.stringify(held) === JSON.stringify(plain);
@@ -354,7 +370,9 @@ describe("the replay runner's document gates", () => {
       // ... and in the `hold` pass every one of them wrote its held script,
       // and so did the parser gate after the event gates, one per document,
       // which `parserGates` does not count.
-      expect(heldScripts.size).toBe(gates + Object.keys(DOCUMENTS).length);
+      expect(heldScripts.size, shortHeld.join("; ")).toBe(
+        gates + Object.keys(DOCUMENTS).length,
+      );
 
       // Negative control: a gate before a `<col>` ends its column group, and
       // the `<col>` implies a second one.
