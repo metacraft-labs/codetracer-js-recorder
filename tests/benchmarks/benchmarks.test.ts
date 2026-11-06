@@ -162,31 +162,105 @@ describe("benchmark_runtime_events_per_sec", () => {
       tags: new Set(["a", "b", "c"]),
     };
 
-    const iterations = 50_000;
+    // The yardstick: a plain recursive walk of the same value that builds a
+    // comparable tagged tree (no depth/size budgets, no cycle tracking). It
+    // runs in the same process, interleaved with encodeValue, so whatever
+    // the host is doing slows both alike. An absolute rate cannot be held
+    // to: the same build measured ~1M encodings/s on an idle workstation,
+    // ~40K with two cores starved, and 24K on a busy CI runner.
+    const referenceWalk = (v: unknown): unknown => {
+      if (v === null || typeof v !== "object") {
+        return { kind: typeof v, value: v };
+      }
+      if (v instanceof Set) {
+        return { kind: "set", items: Array.from(v, referenceWalk) };
+      }
+      if (Array.isArray(v)) {
+        return { kind: "array", items: v.map(referenceWalk) };
+      }
+      const fields = [];
+      for (const key of Object.keys(v)) {
+        fields.push({
+          name: key,
+          value: referenceWalk((v as Record<string, unknown>)[key]),
+        });
+      }
+      return { kind: "object", fields };
+    };
 
-    // Warm up
+    // Blocks of 1,250 calls of each, alternated. At least 20 (50,000 calls
+    // in all, as many as the benchmark made when it timed encodeValue
+    // alone), and then on until neither has run a new fastest block for 10
+    // blocks, or for at most 10 s.
+    const minBlocks = 20;
+    const settledAfter = 10;
+    const capMs = 10_000;
+    const perBlock = 1_250;
+
+    // Warm up both, so neither is measured before the JIT has compiled it.
     for (let i = 0; i < 1000; i++) {
       encodeValue(complexObj);
+      referenceWalk(complexObj);
     }
 
-    const start = performance.now();
-    for (let i = 0; i < iterations; i++) {
-      encodeValue(complexObj);
+    // Compare each one's fastest block. Interference only ever adds time to
+    // a block, so the fastest is the closest to what the code costs. Going
+    // on until the fastest blocks settle is for V8's optimising compiler,
+    // a background thread: on a starved host it can leave encodeValue
+    // unoptimised for many blocks after the smaller walk was optimised.
+    // Measured with two cores shared by 24 CPU hogs, the median of the
+    // blocks' ratios ranged from 0.07 to 22.7, and the fastest blocks'
+    // ratio of 20 blocks reached 21.6 once; settled, it stays within
+    // 0.85-1.41, as on an idle host.
+    const encodeBlocks: number[] = [];
+    const walkBlocks: number[] = [];
+    let lastNewFastest = 0;
+    const began = performance.now();
+    for (let b = 0; ; b++) {
+      let start = performance.now();
+      for (let i = 0; i < perBlock; i++) encodeValue(complexObj);
+      const e = performance.now() - start;
+      start = performance.now();
+      for (let i = 0; i < perBlock; i++) referenceWalk(complexObj);
+      const w = performance.now() - start;
+      if (
+        b === 0 ||
+        e < Math.min(...encodeBlocks) ||
+        w < Math.min(...walkBlocks)
+      ) {
+        lastNewFastest = b;
+      }
+      encodeBlocks.push(e);
+      walkBlocks.push(w);
+      if (b + 1 >= minBlocks && b - lastNewFastest >= settledAfter) break;
+      if (performance.now() - began > capMs) break;
     }
-    const elapsed = performance.now() - start;
-
-    const encodingsPerSec = (iterations / (elapsed / 1000)).toFixed(0);
+    const blocks = encodeBlocks.length;
+    const ratio = Math.min(...encodeBlocks) / Math.min(...walkBlocks);
+    const encodeMs = encodeBlocks.reduce((a, b) => a + b, 0);
+    const iterations = blocks * perBlock;
+    const encodingsPerSec = iterations / (encodeMs / 1000);
 
     console.log(`\n--- Deep Value Encoding Benchmark ---`);
     console.log(`  Encodings: ${iterations.toLocaleString()}`);
-    console.log(`  Total time: ${elapsed.toFixed(1)}ms`);
+    console.log(`  Total time: ${encodeMs.toFixed(1)}ms`);
     console.log(
-      `  Speed: ${Number(encodingsPerSec).toLocaleString()} encodings/sec`,
+      `  Speed: ${Math.round(encodingsPerSec).toLocaleString()} encodings/sec`,
+    );
+    console.log(
+      `  Cost relative to a plain walk (fastest of ${blocks} blocks each): ${ratio.toFixed(2)}x`,
     );
 
-    // Should handle at least 50K complex encodings/sec
-    expect(parseFloat(encodingsPerSec)).toBeGreaterThan(50_000);
-  });
+    // encodeValue measured 0.85-1.41x the plain walk, idle and under load
+    // alike. Three times the walk's cost means it has picked up real extra
+    // work per value, whatever the host's speed.
+    expect(ratio).toBeLessThan(3);
+    // A hang guard, not a speed bound: the verdict is the ratio above, which
+    // the test's duration does not enter. The blocks stop by themselves
+    // within their 10 s cap, which a starved host can reach, past vitest's
+    // 5 s default; an encodeValue slow enough to matter fails the ratio
+    // whatever the host, long before 60 s.
+  }, 60_000);
 });
 
 // =============================================

@@ -45,7 +45,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import * as esbuild from "esbuild";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   BOOTSTRAP_MARKER,
@@ -312,6 +312,19 @@ interface PageConfig {
 
 /** How long a case waits for an upload that must not come. */
 const NO_UPLOAD_GRACE_MS = 1500;
+
+/**
+ * Each browser test opens a fresh Chromium context against the traced
+ * fixture backend: about 2 s on an idle host, including the grace above,
+ * and past vitest's 5 s default on a busy CI runner. `runCase` itself
+ * waits up to 10 s for an expected upload, which a 5 s test timeout cut
+ * short. No assertion depends on how long a case takes (the waits above
+ * are bounded on their own), so this is only a hang guard, matching the
+ * other real-Chromium suites (tests/boundary/record-shim*.test.ts). It is
+ * set for the whole file: the pure tests below finish in milliseconds.
+ */
+const TIMEOUT = 60_000;
+vi.setConfig({ testTimeout: TIMEOUT });
 
 /**
  * Open the fixture page for `caseId` in a fresh context, with `initScript`
