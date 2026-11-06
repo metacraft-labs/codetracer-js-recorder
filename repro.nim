@@ -5,17 +5,28 @@
 ## natively per ``codetracer-specs/Repo-Requirements.md`` §2.8 — no
 ## ``shell(command = "just ..."")`` delegations.
 ##
-## Provisioning note (MR2): node + npm now ship full tarball-direct
-## entries in ``packages/node.nim`` and ``packages/npm.nim`` (Node 20.x
-## LTS from nodejs.org). The recipe therefore drops
-## ``defaultToolProvisioning "path"`` and relies on the engine's own
-## provisioning end-to-end — Nix on Linux/macOS, the tarball selector
-## on Windows (or ``REPRO_TOOL_PROVISIONING=tarball`` anywhere).
+## **Tool provisioning.** The engine refuses ``uses:`` declarations
+## without a provisioning mode (it will not fall back to PATH
+## implicitly), so the recipe declares one:
+##
+## * Linux / macOS: ``path``. The tools come from this repository's
+##   flake dev shell (``useFlakeDevShell()`` below), the same Nix
+##   toolchain ``nix develop`` and ``just`` use, so ``repro build``
+##   and the Justfile build with one set of tools.
+## * Windows: ``tarball``. There is no Nix; every tool in ``uses:``
+##   has a Windows tarball entry in reprobuild's stdlib
+##   (``repro_dsl_stdlib/packages/{rustc,cargo,nim,nimble,capnp,zstd,
+##   node,npm}.nim``), which the engine downloads and verifies.
+##
+## ``--tool-provisioning=<mode>`` or ``REPRO_TOOL_PROVISIONING``
+## overrides the default for one invocation.
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
 
 package codetracer_js_recorder:
+  defaultToolProvisioning (when defined(windows): tarball else: path)
+
   uses:
     "rustc >=1.85"
     "cargo >=1.85"
