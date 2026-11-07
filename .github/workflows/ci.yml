@@ -68,6 +68,13 @@ jobs:
       - name: Build TypeScript packages
         run: dev-exec npm run build
 
+      - name: Build codetracer test binaries
+        # tests/boundary/{replay,seeking,sensitive,transport} run
+        # `ct-jsbound` and `session-manager` from the codetracer sibling
+        # (cloned by setup-dev-env from .github/sibling-repos) and fail,
+        # naming the build command, when they are missing.
+        run: dev-exec just build-codetracer-test-bins
+
       - name: Run tests
         run: dev-exec just test
 

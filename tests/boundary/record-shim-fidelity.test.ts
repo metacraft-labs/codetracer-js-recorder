@@ -433,7 +433,7 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
       const log = await stopAndDecode(shimmed.page);
       const { reqId, taskId } = request(
         log,
-        "/api/stream?n=forever&interval=50",
+        "/api/stream?n=1&hold=fetch-abort",
       );
       const end = indicesOf(log, isBodyEnd(reqId));
       expect(end).toHaveLength(1);

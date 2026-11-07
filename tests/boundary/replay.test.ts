@@ -55,6 +55,7 @@ import {
   runReplayLeg,
 } from "../../packages/boundary-conformance/src/index.js";
 import { type FixtureServer, FIXTURES, startFixtureServer } from "./harness.js";
+import type { Context } from "./record-replay.js";
 import { ctPrintFull, requireCtPrint } from "../helpers/ct-print.js";
 import {
   assembleRecording,
@@ -652,6 +653,11 @@ function runReplayCli(
       String(level),
       "--out",
       out,
+      // Each step's limit: the CLI's 15 s default is a hang guard that a
+      // replay on a busy host outlasts (measured with eight cores shared by
+      // 64 CPU hogs); nothing here judges how long a step took.
+      "--timeout-ms",
+      "60000",
     ],
     { encoding: "utf-8", timeout: TIMEOUT },
   );
@@ -679,21 +685,75 @@ interface Mouse {
 }
 
 /**
+ * The pointer moves the recording waits for while it holds the document
+ * between parsing and load (see {@link recordSlowLoad}).
+ */
+const MOVES_BEFORE_LOAD = 3;
+
+/**
  * Record `slow-load.html` while the pointer moves over it the whole time it
  * loads: real, trusted input, which the browser dispatches between the
  * page's own tasks wherever the network leaves it room. The document comes
  * in pieces (`chunks`) and every resource late (`delay`, harness.ts).
+ *
+ * The time the document spends between parsing and `load` is imposed, not
+ * hoped for. With only the fixture server's delays it was the image's delay
+ * less the time to parse, and the parse is what a busy host stretches: when
+ * the document's last piece and the parser came in after the image had,
+ * `DOMContentLoaded` and `load` ran right after parsing, no input landed in
+ * between, and the vacuity guard failed (`expected 0 to be greater than 0`;
+ * reproduced on an idle host by sending the pieces 1500 ms apart). So the
+ * recording holds the image's response, which `load` waits for, until
+ * `DOMContentLoaded` (the page's event as DevTools reports it, which runs
+ * nothing in the page) and then {@link MOVES_BEFORE_LOAD} completed moves:
+ * those are input between parsing and load. `Input.dispatchMouseEvent`,
+ * which `mouse.move` awaits, returns once the renderer has handled the
+ * event.
+ *
+ * The input while the document parses needs no hold: the gaps between the
+ * document's pieces are server timers, which a busy host makes longer, never
+ * shorter. (Holding the head's parser-blocking script instead stalls the
+ * pointer: Chromium handles no input before the first frame, which that
+ * script keeps back.)
+ *
+ * Only the recording is constrained: what it logs is still the browser's
+ * own order, and the replay under test gets that log unchanged.
  */
 async function recordSlowLoad(): Promise<BoundaryRecord[]> {
-  const context = await browser.newContext();
+  const context = (await browser.newContext()) as unknown as Context;
+  // Moves started and completed so far. A move in flight when
+  // `DOMContentLoaded` is seen may have been dispatched before it, so only
+  // the moves started after it count. `over` ends the wait if the recording
+  // ends first (it failed, and says why).
+  let started = 0;
+  let completed = 0;
+  let over = false;
   try {
     const page = await context.newPage();
     const mouse = (page as unknown as { mouse: Mouse }).mouse;
+    // No timeout: the recording's own deadline below is the hang guard.
+    const contentLoaded = page.waitForEvent("domcontentloaded", {
+      timeout: 0,
+    });
+    contentLoaded.catch(() => undefined);
+    await page.route("**/slow-load-pixel.svg*", async (route) => {
+      try {
+        await contentLoaded;
+        const want = started + MOVES_BEFORE_LOAD;
+        while (completed < want && !over) {
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        if (!over) await route.continue();
+      } catch {
+        // The page closed while the image was held: nothing to answer.
+      }
+    });
     await mouse.move(3, 3);
     await page.goto(`${recorded.server.origin}/slow-load.html?chunks=250`, {
       waitUntil: "commit",
     });
-    const deadline = Date.now() + 20_000;
+    // A hang guard, not a measure: a starved host takes many times longer.
+    const deadline = Date.now() + 120_000;
     for (let n = 0; ; n++) {
       // Polled from Node: an in-page poll would be recorded as the page's.
       const loaded = await page.evaluate(
@@ -701,9 +761,11 @@ async function recordSlowLoad(): Promise<BoundaryRecord[]> {
       );
       if (loaded === "1") break;
       if (Date.now() > deadline) throw new Error("slow-load.html never loaded");
+      started++;
       await mouse.move(10 + ((n * 53) % 700), 10 + ((n * 31) % 500), {
         steps: 2,
       });
+      completed++;
     }
     await mouse.move(400, 300, { steps: 4 });
     const bytes = await page.evaluate(() => {
@@ -714,6 +776,7 @@ async function recordSlowLoad(): Promise<BoundaryRecord[]> {
     });
     return decodeLog(Uint8Array.from(bytes), { inlineBodies: "batch" }).records;
   } finally {
+    over = true;
     await context.close();
   }
 }

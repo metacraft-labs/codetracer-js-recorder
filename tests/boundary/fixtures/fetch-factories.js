@@ -145,7 +145,8 @@ async function workflow(mode, call, delay, reuse) {
     const [, consumer, state] = mode.split(":"),
       ac = new AbortController(),
       r = await call(
-        "/api/slow?consumer=" + (state === "mime" ? "text" : consumer),
+        "/api/slow?pending=1&consumer=" +
+          (state === "mime" ? "text" : consumer),
         { signal: ac.signal },
       ),
       reader = state === "mime" ? undefined : r.body.getReader();
@@ -171,7 +172,7 @@ async function workflow(mode, call, delay, reuse) {
   } else if (mode.startsWith("abort-consumer:")) {
     const [, consumer, copy, reason] = mode.split(":"),
       ac = new AbortController();
-    const r = await call("/api/slow?consumer=" + consumer, {
+    const r = await call("/api/slow?pending=1&consumer=" + consumer, {
         signal: ac.signal,
       }),
       target = copy === "clone" ? r.clone() : r;
@@ -240,7 +241,7 @@ async function workflow(mode, call, delay, reuse) {
     }
   } else if (mode === "abort-body") {
     const ac = new AbortController();
-    const r = await call("/api/slow", { signal: ac.signal });
+    const r = await call("/api/slow?pending=1", { signal: ac.signal });
     const stop = delay(15).then(() =>
       ac.abort(new DOMException("stop body", "AbortError")),
     );

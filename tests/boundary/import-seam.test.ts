@@ -50,7 +50,16 @@ afterAll(() => {
 const seam1 = (arg: string) =>
   `${IMPORT_SEAM_CALLEE}(${IMPORT_SEAM_LOAD_1}${arg})`;
 
-describe("the dynamic import() seam", () => {
+/**
+ * Several tests run the CLI as a subprocess and a real vite build, which
+ * take about a second on an idle host and well past vitest's 5 s default on
+ * a busy CI runner. No assertion here depends on how long anything takes, so
+ * the timeout is only a hang guard; it matches the other subprocess-driven
+ * boundary suites (record-shim, record-shim-fidelity).
+ */
+const TIMEOUT = 60_000;
+
+describe("the dynamic import() seam", { timeout: TIMEOUT }, () => {
   it("import_seam_rewrites_every_call_and_nothing_else", () => {
     const src = [
       `const a = import("./a.js");`,

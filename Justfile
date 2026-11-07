@@ -28,6 +28,24 @@ test: install
     just verify-request-spans
     just verify-jsbound-vectors
 
+# Build the two codetracer sibling binaries the boundary replay tests run
+# (tests/boundary/{replay,seeking,sensitive,transport}.test.ts, located by
+# tests/boundary/siblings.ts): `ct-jsbound`, the recording assembler, and
+# `session-manager`, whose `record-web` writes the materialised trace. Needs
+# the `codetracer` sibling checkout (.github/sibling-repos). `--target-dir` is
+# each crate's own `target/`, the directory siblings.ts looks in, so an
+# ambient CARGO_TARGET_DIR cannot put the binaries where the tests do not
+# look; `--locked` builds exactly the sibling's committed Cargo.lock. Not part
+# of `just test`, which developers run without building codetracer; CI runs
+# it before `just test`.
+build-codetracer-test-bins:
+    cargo build --locked --bin ct-jsbound \
+      --manifest-path ../codetracer/libs/jsbound/Cargo.toml \
+      --target-dir ../codetracer/libs/jsbound/target
+    cargo build --locked --bin session-manager \
+      --manifest-path ../codetracer/src/backend-manager/Cargo.toml \
+      --target-dir ../codetracer/src/backend-manager/target
+
 # Verify the vendored JS boundary log vectors (tests/boundary/vectors/)
 # against their SHA256SUMS and, when the codetracer sibling is checked out,
 # against the Rust side that writes them (libs/jsbound/vectors). Re-vendor

@@ -339,6 +339,8 @@ This is a monorepo managed with npm workspaces:
   `codetracer/src/backend-manager`) and `ct-jsbound` (`cargo build --bin
   ct-jsbound` in `codetracer/libs/jsbound`), or `CODETRACER_SESSION_MANAGER` and
   `CT_JSBOUND`; without them it fails, naming the build command.
+  `tests/boundary/{seeking,sensitive,transport}.test.ts` need them too.
+  `just build-codetracer-test-bins` builds both; CI runs it before `just test`.
 * `crates/recorder_native` — Rust N-API addon (via napi-rs) for writing
   trace files in binary (CBOR+zstd) and JSON formats.
 * `tests/` — End-to-end integration tests.

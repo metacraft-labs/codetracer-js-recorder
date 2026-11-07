@@ -288,6 +288,12 @@ interface Send {
   deadline: number;
   /** When the request settled (answered or failed), in browser time. */
   answered?: number;
+  /**
+   * With TIMER_PROBE installed: the timer whose callback made this request
+   * (the delay it was set with, and the time read just before it was set),
+   * or null for a request made outside one.
+   */
+  timer?: { delay: number; setBefore: number } | null;
 }
 
 /**
@@ -309,12 +315,57 @@ const SEND_RECORDER =
   "const shim = window.__ctBoundaryShim; " +
   "const s = shim && shim.uploadStatus ? shim.uploadStatus() : undefined; " +
   "e = { t: now(), body: Array.from(init.body), " +
-  "deadline: s ? s.flushDeadlineMs : -1 }; " +
+  "deadline: s ? s.flushDeadlineMs : -1, " +
+  "timer: window.__ctTimer ? window.__ctTimer() : undefined }; " +
   "window.__ctSends.push(e); } " +
   "const p = real.apply(this, arguments); " +
   "if (e) { const settled = () => { e.answered = now(); }; " +
   "then.call(p, settled, settled); } " +
   "return p; }; })();";
+
+/**
+ * An init script, run before the shim, that notes which timer sent each
+ * batch. The transport captures its `setTimeout` as the original (as
+ * SEND_RECORDER's `fetch`), so every one of its timer callbacks runs inside
+ * the wrapper. `window.__ctTimer()` answers, from inside one (null
+ * outside), the delay its timer was set with and the time read just before
+ * it was set (`setBefore`); SEND_RECORDER keeps that with each send.
+ */
+const TIMER_PROBE =
+  "(() => { const st = window.setTimeout; " +
+  "const now = performance.now.bind(performance); " +
+  "let current = null; " +
+  "window.__ctTimer = () => current; " +
+  "window.setTimeout = function (cb) { " +
+  "if (typeof cb !== 'function') return st.apply(this, arguments); " +
+  "const args = Array.prototype.slice.call(arguments); " +
+  "const rec = { delay: Number(arguments[1]) || 0, setBefore: now() }; " +
+  "args[0] = function () { const outer = current; " +
+  "current = rec; " +
+  "try { return cb.apply(this, arguments); } finally { current = outer; } }; " +
+  "return st.apply(this, args); }; })();";
+
+/**
+ * The longest `setTimeout` delay Chromium runs precisely: measured with
+ * headless Chromium 141, delays of 8 to 31 ms fired within 0.2 ms of their
+ * due time and delays of 32 ms to 2 s 2 to 5 ms after it, on an idle page
+ * (the measurement behind the transport's PRECISE_TIMER_MAX_MS). Stated
+ * here as the browser's fact, not imported from the transport, so the test
+ * does not move with the code it checks.
+ */
+const CHROMIUM_PRECISE_TIMER_MAX_MS = 31;
+
+/**
+ * How far past a batch's aim the flush timer may be aimed: half the
+ * §11.1 lead of 10 ms.
+ * The aim is worked out from the batch's oldest tick read, a little after
+ * the transport took that record's time, and the probe reads the clock a
+ * little after the transport worked out its delay, so a timer aimed right
+ * comes out a fraction of a millisecond late, more only if the renderer is
+ * descheduled between the transport's two statements. A timer aimed at the
+ * deadline itself is the whole lead (10 ms) late.
+ */
+const AIM_SLACK_MS = 5;
 
 async function sendsOf(page: TPage): Promise<Send[]> {
   return page.evaluate(
@@ -1117,17 +1168,35 @@ describe("the batched upload transport", () => {
     "transport_flush_timer_fires_at_its_aim",
     async () => {
       // §11.1: the flush timer is aimed FLUSH_TIMER_LEAD_MS (10 ms) ahead of
-      // the deadline, the room a timer has to run late on a busy page. While
-      // a page runs a short repeating timer, Chromium runs a timer of 32 ms
-      // or more at that timer's next wake-up, after its tick: on a page
-      // ticking every 5 ms, up to 5 ms after it was due (shorter timers run
-      // on time). A transport that waited for its aim with one long timer
-      // spent half the lead there, and the page's tick due after the aim ran
-      // before the flush (under load the batch then left past its
-      // deadline). The batches of the 5 ms page are cut by the deadline (50
-      // ms, then doubling) until they reach 256 records; how late past its
-      // aim each leaves is the wait of its oldest timed record less the aim.
-      // With one long timer the median was 4 to 5 ms.
+      // the deadline, the room a timer has to run late on a busy page.
+      // Chromium runs a timer of 32 ms or more on a coarse wake-up, up to 5
+      // ms after it was due (shorter timers run on time); a transport that
+      // waited for its aim with one long timer spent half the lead there.
+      // The batches of the page's 5 ms ticks are cut by the deadline (50 ms,
+      // then doubling) until they reach 256 records.
+      //
+      // The verdict is what the transport asked of the timer that sent each
+      // batch (TIMER_PROBE sees the delay each timer was set with, and when),
+      // not how late anything ran, so it does not depend on the host's load:
+      //
+      // - Aim. The timer was set to come due at the batch's aim: its oldest
+      //   record, the tick read that opened it, plus the deadline, less the
+      //   lead. A flush aimed late, at the deadline or past it, fails.
+      // - Precision. It was a timer Chromium runs precisely (at most
+      //   CHROMIUM_PRECISE_TIMER_MAX_MS). One long timer to the aim fails.
+      //
+      // How late the timers then ran is not judged: on a starved host every
+      // timer of the page runs late, and when the renderer gets the CPU back
+      // with several overdue, Chromium does not keep to their due order
+      // across its timer queues (measured: a page tick due 26 ms after a
+      // flush timer, both overdue, ran first), so neither lateness nor order
+      // tells a defect from the host. Under such load a run measured the
+      // flush timers' median lateness at 2.5 ms with none.
+      //
+      // The transport arms nothing while a batch is in flight, so when the
+      // answer to the batch before comes after the aim it sends late, rightly:
+      // straight from the answer (outside any timer, not judged), or from a
+      // timer it could only set then, judged from when it was set.
       const ingest = await stub();
       const server = await site(ingest);
       const context = await browser.newContext();
@@ -1135,6 +1204,7 @@ describe("the batched upload transport", () => {
       try {
         const page = await context.newPage();
         await page.addInitScript({ content: SEND_RECORDER });
+        await page.addInitScript({ content: TIMER_PROBE });
         await page.goto(`${server.origin}/transport.html`);
         await until(() => status(page), idle, "the transport did not go idle");
         await page.click("#ticks");
@@ -1151,27 +1221,51 @@ describe("the batched upload transport", () => {
       const sent = sendTimes(sends);
       const schedule = deadlineSchedule(ingest.batches);
       const bits = Buffer.alloc(8);
-      const late: number[] = [];
+      const violations: string[] = [];
+      let judged = 0;
+      let outsideTimer = 0;
       for (const { parsed: b } of ingest.batches) {
         const seq = b.envelope.batch_seq;
         if (b.records.length >= 256 || !sent.has(seq)) continue;
-        let wait = -Infinity;
+        const timer = sent.get(seq)!.timer;
+        // The probe is installed, so a send has `timer`: the timer that made
+        // it, or null for one made outside a timer callback.
+        expect(timer, `batch ${seq}'s timer`).not.toBeUndefined();
+        if (timer === null || timer === undefined) {
+          outsideTimer++;
+          continue;
+        }
+        let oldest = Infinity;
         for (const r of b.records) {
           if (r.record !== "Clock" || r.src !== 2) continue;
           bits.writeBigUInt64LE(r.bits);
-          wait = Math.max(wait, sent.get(seq)!.t - bits.readDoubleLE(0));
+          oldest = Math.min(oldest, bits.readDoubleLE(0));
         }
-        if (!Number.isFinite(wait)) continue;
-        late.push(wait - (schedule.get(seq)! - FLUSH_TIMER_LEAD_MS));
+        if (!Number.isFinite(oldest)) continue;
+        judged++;
+        if (timer.delay > CHROMIUM_PRECISE_TIMER_MAX_MS) {
+          violations.push(
+            `batch ${seq}: sent by a timer set for ${timer.delay} ms, which Chromium runs on a coarse wake-up`,
+          );
+        }
+        const aim = oldest + schedule.get(seq)! - FLUSH_TIMER_LEAD_MS;
+        // Where the transport aimed it: it worked out the delay just before
+        // setting the timer, so the time read then plus the delay is never
+        // earlier than the moment it meant the timer to come due.
+        const aimedAt = timer.setBefore + timer.delay;
+        if (aimedAt > Math.max(aim, timer.setBefore) + AIM_SLACK_MS) {
+          violations.push(
+            `batch ${seq}: aimed at ${aim.toFixed(1)}, its timer set at ${timer.setBefore.toFixed(1)} for ${timer.delay.toFixed(1)} ms, due at ${aimedAt.toFixed(1)}`,
+          );
+        }
       }
-      // Vacuity: enough batches cut by the deadline, each with a timed record.
-      expect(late.length, "deadline-cut batches").toBeGreaterThanOrEqual(6);
-      late.sort((a, b) => a - b);
-      const median = late[late.length >> 1];
+      // Vacuity: batches cut by the deadline and sent by the flush timer,
+      // each opened by a tick read.
       expect(
-        median,
-        `each batch's lateness past its aim, in ms: ${JSON.stringify(late)}`,
-      ).toBeLessThan(2);
+        judged,
+        `deadline-cut batches sent by the flush timer (${outsideTimer} outside one)`,
+      ).toBeGreaterThanOrEqual(4);
+      expect(violations).toEqual([]);
     },
     TIMEOUT,
   );

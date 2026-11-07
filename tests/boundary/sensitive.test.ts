@@ -1592,6 +1592,11 @@ function runNoninterference(
       String(level),
       "--out",
       out,
+      // Each step's limit: the CLI's 15 s default is a hang guard that a
+      // replay on a busy host outlasts (measured with eight cores shared by
+      // 64 CPU hogs); nothing here judges how long a step took.
+      "--timeout-ms",
+      "60000",
     ],
     { encoding: "utf-8", timeout: TIMEOUT },
   );

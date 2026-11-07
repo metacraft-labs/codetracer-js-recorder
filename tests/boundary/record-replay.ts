@@ -52,11 +52,22 @@ export interface Page {
   evaluate<T>(fn: () => T): Promise<T>;
   setInputFiles(selector: string, files: string): Promise<void>;
   click(selector: string): Promise<void>;
+  route(
+    url: string,
+    handler: (route: { continue(): Promise<void> }) => Promise<void>,
+  ): Promise<void>;
+  waitForEvent(
+    event: "domcontentloaded",
+    options?: { timeout?: number },
+  ): Promise<unknown>;
 }
 export interface Context {
   newPage(): Promise<Page>;
   setOffline(offline: boolean): Promise<void>;
   close(): Promise<void>;
+  newCDPSession(page: Page): Promise<{
+    send(method: string, params?: object): Promise<unknown>;
+  }>;
 }
 
 /** A build of the fixtures, its server and a browser. */
@@ -78,10 +89,13 @@ export interface RecordReplay {
   /**
    * As {@link record}, and also what the page wrote into its result slots
    * (`<ul id="out">`'s items' text, in order) when it was done.
+   * `prepare` runs on the new page before it navigates (to route its
+   * requests, say).
    */
   recordPage(
     pagePath: string,
     drive?: (page: Page, context: Context) => Promise<void>,
+    prepare?: (page: Page, context: Context) => Promise<void>,
   ): Promise<{ records: BoundaryRecord[]; slots: string[] }>;
   /** Replay `records` against the build (verification only, no trace). */
   replay(
@@ -153,10 +167,11 @@ export async function startRecordReplay(
     async record(pagePath, drive) {
       return (await this.recordPage(pagePath, drive)).records;
     },
-    async recordPage(pagePath, drive) {
+    async recordPage(pagePath, drive, prepare) {
       const context = (await browser.newContext()) as unknown as Context;
       try {
         const page = await context.newPage();
+        if (prepare !== undefined) await prepare(page, context);
         await page.goto(`${server.origin}/${pagePath}`);
         if (drive !== undefined) await drive(page, context);
         await until(page, isDone, `${pagePath} to finish`);

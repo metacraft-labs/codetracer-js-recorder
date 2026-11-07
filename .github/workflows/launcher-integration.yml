@@ -100,14 +100,16 @@ jobs:
           CT_LAUNCHER_TARGET: linux-musl-x86_64
           CT_RECORDER_SRC: ${{ github.workspace }}/codetracer-js-recorder/packages
         # Node from nixpkgs, not actions/setup-node: the latter downloads a
-        # glibc build that cannot start on the NixOS runners.
-        run: nix shell nixpkgs#nodejs_20 -c node build_npm.mjs
+        # glibc build that cannot start on the NixOS runners. Node 22, the
+        # dev shell's major: nixpkgs marks nodejs_20 (end of life) insecure
+        # and refuses to evaluate it. The launcher package accepts node >=18.
+        run: nix shell nixpkgs#nodejs_22 -c node build_npm.mjs
 
       - name: Smoke-test the tarball
         run: |
           sandbox="${RUNNER_TEMP}/m9-npm"
           mkdir -p "$sandbox" && cd "$sandbox"
-          nix shell nixpkgs#nodejs_20 -c bash -euo pipefail -c '
+          nix shell nixpkgs#nodejs_22 -c bash -euo pipefail -c '
             npm init -y > /dev/null
             npm install --no-save "${GITHUB_WORKSPACE}/codetracer-launcher/packaging/npm/dist"/*.tgz
             out=$(./node_modules/.bin/ct --version)

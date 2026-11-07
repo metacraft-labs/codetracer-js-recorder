@@ -66,7 +66,7 @@
         system:
         fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
-          sha256 = "sha256-Qxt8XAuaUR2OMdKbN4u8dBJOhSHxS+uS06Wl9+flVEk=";
+          sha256 = "sha256-zC8E38iDVJ1oPIzCqTk/Ujo9+9kx9dXq7wAwPMpkpg0=";
         };
     in
     {
@@ -284,7 +284,7 @@
             nativeBuildInputs = with pkgs; [
               nodejs_22
               npmHooks.npmConfigHook # Sets up npm cache and runs npm install
-              # Use project's Rust toolchain (1.88) — nixpkgs default (1.86) is
+              # Use project's Rust toolchain (1.94.1) — nixpkgs default (1.86) is
               # too old for napi-build@2.3.1
               (rust-toolchain-for system)
               rustPlatform.cargoSetupHook # Sets up Cargo vendor directory

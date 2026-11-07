@@ -33,13 +33,12 @@
 
   var cases = {
     // Headers arrive before any body bytes; abort while text() is pending.
-    // The first body piece is due a minute after the headers, so the abort
-    // always comes first, however late a loaded host runs the 15 ms timer:
-    // the abort closes the response, which cancels that piece (a 50 ms
-    // delay lost the race under load and logged a body chunk).
+    // `first=never`: the server sends no body byte until the connection
+    // closes, so the body is still pending whenever the abort runs. (A
+    // first piece on a deadline raced the abort's timer on a busy host.)
     "fetch-abort-pending-text": async function () {
       var ac = new AbortController();
-      var r = await fetch("/api/stream?n=3&interval=100&first=60000", {
+      var r = await fetch("/api/stream?first=never", {
         signal: ac.signal,
       });
       var pending = r.text();
@@ -194,9 +193,13 @@
     // A body the page stops reading and then aborts: the platform errors
     // the body at once, so the reader's closed promise rejects with no read
     // pending, and a later read fails the same way.
+    // `n=1&hold=`: the server writes `c0` and then nothing more, keeping
+    // the body open until the abort closes it, so the first read gets `c0`
+    // alone however late it runs. (A piece every 50 ms let a slow page's
+    // first read take several pieces at once on a busy host.)
     "fetch-abort": function () {
       var ac = new AbortController();
-      fetch("/api/stream?n=forever&interval=50", { signal: ac.signal }).then(
+      fetch("/api/stream?n=1&hold=fetch-abort", { signal: ac.signal }).then(
         function (r) {
           var reader = r.body.getReader();
           return reader.read().then(function (first) {
