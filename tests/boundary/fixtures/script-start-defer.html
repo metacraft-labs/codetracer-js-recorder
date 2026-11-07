@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>a deferred script that changes the document before its first read</title>
+    <script defer src="script-start.js"></script>
+  </head>
+  <body>
+    <ul id="out"></ul>
+    <div id="host"></div>
+    <p id="after">markup the parser inserts before the script runs</p>
+  </body>
+</html>

@@ -198,9 +198,28 @@ export interface CtFullCallArg {
 
 /**
  * Tagged union of `events[]` entries in `ct-print --full` output.  The
- * `kind` discriminant routes between step / call_entry / call_exit / io.
+ * `kind` discriminant routes between step / call_entry / call_exit / io
+ * and the raise / catch / thread records.  Those records occupy an
+ * exec-record index (`step_index`) but are not steps: `counts.steps`
+ * does not include them.
  */
 export type CtFullEvent =
+  | {
+      kind: "raise";
+      step_index: number;
+      exception_type_id: number;
+      exception_message: string;
+    }
+  | {
+      kind: "catch";
+      step_index: number;
+      exception_type_id: number;
+    }
+  | {
+      kind: "thread_start" | "thread_exit" | "thread_switch";
+      step_index: number;
+      thread_id: number;
+    }
   | {
       kind: "step";
       step_index: number;
@@ -237,7 +256,7 @@ export type CtFullEvent =
     }
   | {
       kind: "io";
-      io_kind: string; // "ioStdout" / "ioStderr" / "ioFile" / "ioError"
+      io_kind: string; // the EventLogKind name: "Write", "WriteStderr", "WriteOther", "Error", ...
       io_index: number;
       step_id: number;
       text?: string;
@@ -472,6 +491,9 @@ export function ctPrintFull(ctFile: string): CtFullBundle {
   const stdout = execFileSync(bin, ["--full", "--strip-paths", ctFile], {
     encoding: "utf-8",
     timeout: 30000,
+    // A trace of a few thousand steps prints more than execFileSync's
+    // default 1 MiB of stdout, which it refuses with ENOBUFS.
+    maxBuffer: 512 * 1024 * 1024,
   });
   return JSON.parse(stdout) as CtFullBundle;
 }

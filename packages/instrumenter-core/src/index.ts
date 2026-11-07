@@ -28,6 +28,12 @@ export {
   shouldInstrument,
   DEFAULT_INCLUDE,
   DEFAULT_EXCLUDE,
+  RECORDER_VERSION,
+  MANIFEST_FILE_NAME,
+  recorderVersionDeclaration,
+  declaredRecorderVersion,
+  manifestDocument,
+  manifestFileContents,
 } from "@codetracer/instrumenter";
 
 export type {

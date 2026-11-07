@@ -3,6 +3,7 @@ import type { ParserConfig } from "@swc/types";
 import type { InstrumentOptions, InstrumentResult } from "./index.js";
 import { DEFAULT_MAX_STEP_LOCALS } from "./index.js";
 import { ManifestBuilder } from "./manifest.js";
+import { recorderVersionDeclaration } from "./version.js";
 import { LineColMapper, transformModule } from "./visitor.js";
 import type { TransformContext } from "./visitor.js";
 import { computeStepLocals } from "./scopes.js";
@@ -166,6 +167,12 @@ export function instrument(
   options: InstrumentOptions,
 ): InstrumentResult {
   const { filename } = options;
+  // The path this file is known by in the manifest and the output source
+  // map. `filename` stays the path it is READ by (an external input
+  // source map is found relative to it); the two differ when the caller
+  // records paths relative to a bundle root, so the output does not
+  // depend on where the bundle sits on disk.
+  const recordedPath = options.recordedPath ?? filename;
 
   // Detect and load input source map (if any)
   const inputTraceMap = detectAndLoadSourceMap(
@@ -203,7 +210,7 @@ export function instrument(
   // builder mints are baked into the emitted `__ct.*` calls below and
   // cannot be renumbered afterwards.
   const manifest = new ManifestBuilder(options.idBases);
-  const pathIndex = manifest.addPath(filename);
+  const pathIndex = manifest.addPath(recordedPath);
   // P2.3: register the per-line byte-length table for the source
   // we're instrumenting.  The native addon forwards this through
   // `register_path_with_line_lengths` so the CTFS writer's `paths.dat`
@@ -211,7 +218,7 @@ export function instrument(
   // needs to resolve `(line, column)` ↔ `global_position_index`
   // round-trips.  We use the cleaned source (sourceMappingURL
   // stripped) so the byte offsets match what SWC saw.
-  manifest.setLineLengths(filename, computeLineLengths(cleanCode));
+  manifest.setLineLengths(recordedPath, computeLineLengths(cleanCode));
 
   // If we have a source map resolver, register original source paths
   // and store sourcesContent
@@ -289,7 +296,7 @@ export function instrument(
   // Generate output code
   const output = printSync(module, {
     sourceMaps: true,
-    filename,
+    filename: recordedPath,
   });
 
   // Chain source maps if we had an input source map
@@ -320,8 +327,12 @@ export function instrument(
     }
   }
 
+  // Declare the recorder version (see version.ts).
+  // Appended after the last line, so no generated position the source
+  // map describes moves.
+  const body = output.code.endsWith("\n") ? output.code : `${output.code}\n`;
   return {
-    code: output.code,
+    code: `${body}${recorderVersionDeclaration()}\n`,
     map: finalMap,
     manifestSlice: manifest.build(),
   };

@@ -11,6 +11,19 @@ export {
   DEFAULT_EXCLUDE,
 } from "./filter.js";
 export type { FilterOptions } from "./filter.js";
+export { sortedFilesUnder, compareUtf8 } from "./files.js";
+export type { SortedFilesOptions } from "./files.js";
+export {
+  RECORDER_VERSION,
+  VERSION_SHAPE,
+  MANIFEST_FILE_NAME,
+  recorderVersionDeclaration,
+  declaredRecorderVersion,
+  manifestDocument,
+  manifestFileContents,
+  checkInstrumentedBuild,
+} from "./version.js";
+export type { RecorderVersionMismatch } from "./version.js";
 export {
   tryAutoformat,
   looksMinified,
@@ -53,6 +66,15 @@ export interface ManifestIdBases {
 export interface InstrumentOptions {
   /** Source file path (used for manifest and source map resolution) */
   filename: string;
+  /**
+   * The path written into the manifest and the output source map for
+   * this file, when it should differ from {@link filename}, which is
+   * still what the file (and an external input source map beside it) is
+   * read by. Post-bundle instrumentation passes the path relative to the
+   * bundle root, so the output is the same wherever the bundle sits.
+   * Defaults to `filename`.
+   */
+  recordedPath?: string;
   /**
    * Where this file's ids start in the manifest the caller will merge
    * this slice into. Omit when the slice is the whole manifest.

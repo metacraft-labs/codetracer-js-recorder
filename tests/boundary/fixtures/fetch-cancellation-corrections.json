@@ -1,0 +1,53 @@
+{
+  "parent": "e275e1f1957de4d13cbe511e79daec42cfccdc94",
+  "entries": [
+    {
+      "file": "packages/boundary-shim/src/browser/seams-net.ts",
+      "parentSha256": "080bd8e3e1b84419410820071805624a184f379e145710a2d43dd9da9807ff81",
+      "changes": [
+        {
+          "current": "\nimport { TaskKind } from \"./recorder.js\";\nimport { prepareFetch } from \"./fetch-preparation.js\";\nimport { prepareFetchCancellation } from \"./fetch-cancellation.js\";\nimport { markPageResponse } from \"./seams-platform.js\";\nimport { holeBytes, holeText } from \"./sensitive.js\";\nimport { sha256Hex } from \"./sha256.js\";\n",
+          "parent": "\nimport { TaskKind } from \"./recorder.js\";\nimport { prepareFetch } from \"./fetch-preparation.js\";\nimport { markPageResponse } from \"./seams-platform.js\";\nimport { holeBytes, holeText } from \"./sensitive.js\";\nimport { sha256Hex } from \"./sha256.js\";\n"
+        },
+        {
+          "current": "        });\n        return { reqId, taskId };\n      });\n      const cancellation =\n        ids !== undefined && responses !== undefined\n          ? prepareFetchCancellation(orig, input, init)\n          : undefined;\n      const p = origFetch.call(w, input, cancellation?.init ?? init);\n      if (ids === undefined) return p;\n      return p.then(\n        (resp: Response) => {\n          cancellation?.head();\n          // The head has arrived: the network task that resolves the\n          // platform's promise. The page gets its response now; its body is\n          // recorded piece by piece as the page reads it (stream-body.ts).\n",
+          "parent": "        });\n        return { reqId, taskId };\n      });\n      const p = origFetch.call(w, input, init);\n      if (ids === undefined) return p;\n      return p.then(\n        (resp: Response) => {\n          // The head has arrived: the network task that resolves the\n          // platform's promise. The page gets its response now; its body is\n          // recorded piece by piece as the page reads it (stream-body.ts).\n"
+        },
+        {
+          "current": "            rec.task(ids.taskId, TaskKind.networkCompletion);\n            let outcome = Outcome.response;\n            if (resp.body !== null) {\n              const rebuilt = responses?.rebuild(\n                resp,\n                ids.reqId,\n                ids.taskId,\n                cancellation?.release,\n              );\n              if (rebuilt === undefined) {\n                // The page reads the platform's body directly, unseen.\n                ctx.refuseOnce(\n",
+          "parent": "            rec.task(ids.taskId, TaskKind.networkCompletion);\n            let outcome = Outcome.response;\n            if (resp.body !== null) {\n              const rebuilt = responses?.rebuild(resp, ids.reqId, ids.taskId);\n              if (rebuilt === undefined) {\n                // The page reads the platform's body directly, unseen.\n                ctx.refuseOnce(\n"
+        },
+        {
+          "current": "                page = rebuilt;\n                outcome = Outcome.head;\n              }\n            } else if (\n              cancellation !== undefined &&\n              orig.responseBody?.descriptor.get?.call(resp) === null\n            ) {\n              // An own body getter can hide a live native body. Only the\n              // captured internal null body makes cancellation irrelevant.\n              cancellation?.release();\n            }\n            rec.emit(\"NetResponse\", {\n              req_id: ids.reqId,\n",
+          "parent": "                page = rebuilt;\n                outcome = Outcome.head;\n              }\n            }\n            rec.emit(\"NetResponse\", {\n              req_id: ids.reqId,\n"
+        },
+        {
+          "current": "          return page;\n        },\n        (err: unknown) => {\n          const failure = cancellation?.rejection(err);\n          cancellation?.release();\n          rec.guard(() => {\n            const outcome = failure?.outcome ?? failureOutcome(err);\n            // An abort is the page's own call, made inside one of its tasks.\n            if (outcome !== Outcome.abort) {\n              rec.task(ids.taskId, TaskKind.networkCompletion);\n",
+          "parent": "          return page;\n        },\n        (err: unknown) => {\n          rec.guard(() => {\n            const outcome = failureOutcome(err);\n            // An abort is the page's own call, made inside one of its tasks.\n            if (outcome !== Outcome.abort) {\n              rec.task(ids.taskId, TaskKind.networkCompletion);\n"
+        },
+        {
+          "current": "              body: inline(EMPTY),\n            });\n          });\n          throw failure === undefined ? err : failure.error;\n        },\n      );\n    };\n",
+          "parent": "              body: inline(EMPTY),\n            });\n          });\n          throw err;\n        },\n      );\n    };\n"
+        }
+      ]
+    },
+    {
+      "file": "packages/boundary-shim/src/browser/replay/net.ts",
+      "parentSha256": "d6d052b04744d6377d7e471a66b6fb847ff57df66ce754d6b02ba7df8878942d",
+      "changes": [
+        {
+          "current": "        // owns delivery of the request's rejection.\n      }\n\n      // Pre-header cancellation returns the actual page reason, including\n      // explicit null. Body/XHR diagnostics retain their separate mapping.\n      const aborted = () =>\n        signal !== undefined &&\n        (orig.abortSignalAborted?.descriptor.get?.call(signal) ??\n          signal.aborted);\n      const signalReason = () =>\n        orig.abortSignalReason?.descriptor.get\n          ? orig.abortSignalReason.descriptor.get.call(signal)\n          : signal?.reason;\n      const requestFailure = (outcome: number) =>\n        (outcome === Outcome.abort || outcome === Outcome.timeout) && aborted()\n          ? signalReason()\n          : failureError(w, outcome, signal);\n\n      return new OrigPromise<Response>((resolve, reject) => {\n        let phase: \"head\" | \"body\" | \"done\" = \"head\";\n        let controller: ReadableStreamController<Uint8Array> | undefined;\n",
+          "parent": "        // owns delivery of the request's rejection.\n      }\n\n      return new OrigPromise<Response>((resolve, reject) => {\n        let phase: \"head\" | \"body\" | \"done\" = \"head\";\n        let controller: ReadableStreamController<Uint8Array> | undefined;\n"
+        },
+        {
+          "current": "              resolve(responseOf(r, blobBytes(replay, r.body) as BodyInit));\n            } else {\n              finish();\n              if (\n                r.outcome === Outcome.timeout &&\n                signal !== undefined &&\n                !aborted()\n              ) {\n                // AbortSignal.timeout is a real native signal, not a page\n                // timer task. The existing scheduler awaits this task's\n                // returned promise until that native operation has settled.\n                return new OrigPromise<void>((done) => {\n                  orig.addEventListener.call(\n                    signal,\n                    \"abort\",\n                    () => {\n                      reject(\n                        applicationThrew\n                          ? applicationError\n                          : requestFailure(r.outcome),\n                      );\n                      done();\n                    },\n                    { once: true },\n                  );\n                });\n              }\n              reject(\n                applicationThrew ? applicationError : requestFailure(r.outcome),\n              );\n            }\n            return;\n",
+          "parent": "              resolve(responseOf(r, blobBytes(replay, r.body) as BodyInit));\n            } else {\n              finish();\n              reject(\n                applicationThrew\n                  ? applicationError\n                  : failureError(w, r.outcome, signal),\n              );\n            }\n            return;\n"
+        },
+        {
+          "current": "              ) {\n                const r = replay.next(\"NetResponse\", { req_id: reqId });\n                finish();\n                reject(requestFailure(r.outcome));\n              }\n            } else if (phase === \"body\" && bodyRecordNext()) {\n              deliver();\n            }\n          });\n        if (signal !== undefined && signal !== null) {\n          if (aborted()) onAbort();\n          else\n            orig.addEventListener.call(signal, \"abort\", onAbort, {\n              once: true,\n",
+          "parent": "              ) {\n                const r = replay.next(\"NetResponse\", { req_id: reqId });\n                finish();\n                reject(failureError(w, r.outcome, signal));\n              }\n            } else if (phase === \"body\" && bodyRecordNext()) {\n              deliver();\n            }\n          });\n        if (signal !== undefined && signal !== null) {\n          if (signal.aborted) onAbort();\n          else\n            orig.addEventListener.call(signal, \"abort\", onAbort, {\n              once: true,\n"
+        }
+      ]
+    }
+  ]
+}

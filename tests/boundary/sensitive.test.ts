@@ -1,0 +1,1704 @@
+/**
+ * Sensitive inputs, declassification and scrubbing (CodeTracer's
+ * JS-Boundary-Recording specification §11.3, §5.2 `Declassify`, §5.2.1, §7.2
+ * `cause`, §9.9's non-interference leg), recorded for real and replayed by the
+ * real runner.
+ *
+ * Two routes record here:
+ *
+ * - the upload route: `fixtures/sensitive-upload.html` with the shim
+ *   installed by the shipped deploy step (`boundary-shim --ingest`), driven
+ *   in headless Chromium, uploading to a local stub ingest; what the stub
+ *   received (the raw batch bodies) and what codetracer's real `ct-jsbound
+ *   assemble` makes of them (the assembled container) are searched;
+ * - the record-and-replay route (`record-replay.ts`): `fixtures/sensitive.html`
+ *   recorded with the log kept in the page, replayed by `replaySession`.
+ *
+ * Mocks, each justified:
+ * - **The ingest is the local stub** (`stub-ingest.ts`), as for the transport
+ *   tests: the real ingest is CodeTracer's service, tested against the
+ *   shared batch vectors on its side; the stub's `config` answer here
+ *   carries the site's scrub lists as the ingest's does.
+ *
+ * The non-interference leg runs the conformance suite's command line on the
+ * suite's own generic and reference builds, and on the builds that carry the
+ * raw-read fault, which it must reject.
+ */
+
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import {
+  type BoundaryRecord,
+  HOLE_TOKEN,
+  type RecordOf,
+} from "../../packages/boundary-format/src/index.js";
+import {
+  buildGenericFixtures,
+  buildReferenceFixtures,
+  type NoninterferenceReport,
+  ROUTES,
+} from "../../packages/boundary-conformance/src/index.js";
+import {
+  loadBoundaryLog,
+  seqAt,
+  withoutRecord,
+  withRecordBefore,
+} from "../../packages/boundary-replay/src/index.js";
+import {
+  copyFixtures,
+  FIXTURE_BUILD_HASH,
+  type FixtureServer,
+  startFixtureServer,
+} from "./harness.js";
+import {
+  expectDiverged,
+  expectReplayed,
+  indexWhere,
+  isDone,
+  type RecordReplay,
+  replaced,
+  startRecordReplay,
+  until,
+} from "./record-replay.js";
+import { ctJsboundPath, RECORDING_ID } from "./siblings.js";
+import { type StubIngest, startStubIngest } from "./stub-ingest.js";
+
+const REPO_ROOT = path.resolve(__dirname, "..", "..");
+const CLI = path.join(REPO_ROOT, "packages", "cli", "dist", "index.js");
+const CONFORMANCE_CLI = path.join(
+  REPO_ROOT,
+  "packages/boundary-conformance/dist/cli.js",
+);
+const TIMEOUT = 300_000;
+
+/** The slice of Playwright's page these tests drive. */
+interface SPage {
+  goto(url: string): Promise<unknown>;
+  type(selector: string, text: string): Promise<void>;
+  fill(selector: string, text: string): Promise<void>;
+  press(selector: string, key: string): Promise<void>;
+  click(selector: string): Promise<void>;
+  evaluate<T>(fn: () => T): Promise<T>;
+  keyboard: {
+    type(text: string): Promise<void>;
+    press(key: string): Promise<void>;
+  };
+  mouse: { click(x: number, y: number): Promise<void> };
+}
+interface SContext {
+  newPage(): Promise<SPage>;
+  close(): Promise<void>;
+}
+
+let rr: RecordReplay;
+let CT_JSBOUND: string;
+const tmpDirs: string[] = [];
+const closers: { close(): Promise<void> }[] = [];
+
+function tmp(prefix: string): string {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tmpDirs.push(d);
+  return d;
+}
+
+beforeAll(async () => {
+  CT_JSBOUND = ctJsboundPath();
+  rr = await startRecordReplay();
+}, TIMEOUT);
+
+afterAll(async () => {
+  for (const c of closers) await c.close();
+  await rr?.close();
+  for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
+});
+
+// ── The upload route ────────────────────────────────────────────────────
+
+/** What one uploaded session left: the bodies, and what they assemble to. */
+interface Uploaded {
+  /** Every batch body the stub ingest received, as received. */
+  bodies: Uint8Array[];
+  /** The container `ct-jsbound assemble` made of them. */
+  container: Uint8Array;
+  /** Its log, decoded strictly by the canonical reader. */
+  records: BoundaryRecord[];
+  /** Whatever `inspect` read of the page before the session stopped. */
+  inspected: unknown;
+}
+
+/**
+ * Record `<pageName>?<query>` (by default `sensitive-upload.html`) with the
+ * shim uploading to a stub ingest whose `config` is `config`, drive it, wait
+ * until it is done, stop the session, and assemble what was uploaded.
+ */
+async function upload(
+  query: string,
+  drive: (page: SPage) => Promise<void>,
+  config: unknown = { enabled: true },
+  inspect: () => unknown = () => null,
+  pageName = "sensitive-upload.html",
+): Promise<Uploaded> {
+  const stub: StubIngest = await startStubIngest(config);
+  closers.push(stub);
+  const dir = copyFixtures();
+  tmpDirs.push(dir);
+  execFileSync(
+    process.execPath,
+    [
+      CLI,
+      "boundary-shim",
+      path.join(dir, pageName),
+      "--build-hash",
+      FIXTURE_BUILD_HASH,
+      "--ingest",
+      stub.base,
+    ],
+    { stdio: "pipe" },
+  );
+  const server: FixtureServer = await startFixtureServer(dir);
+  closers.push(server);
+  const context = (await rr.browser.newContext()) as unknown as SContext;
+  let inspected: unknown;
+  try {
+    const page = await context.newPage();
+    await page.goto(`${server.origin}/${pageName}?${query}`);
+    await drive(page);
+    await until(page, isDone, `${pageName}?${query} to finish`);
+    inspected = await page.evaluate(inspect);
+    await page.evaluate(() =>
+      (
+        globalThis as unknown as { __ctBoundaryShim: { stop(): Promise<void> } }
+      ).__ctBoundaryShim.stop(),
+    );
+  } finally {
+    await context.close();
+  }
+  const bodies = stub.batches.map((b) => b.body);
+  expect(bodies.length).toBeGreaterThan(0);
+  const batchDir = tmp("ct-sensitive-batches-");
+  bodies.forEach((b, i) => fs.writeFileSync(path.join(batchDir, String(i)), b));
+  const out = path.join(tmp("ct-sensitive-ct-"), "session.ct");
+  const r = spawnSync(
+    CT_JSBOUND,
+    ["assemble", "--recording-id", RECORDING_ID, "--out", out, batchDir],
+    { encoding: "utf-8" },
+  );
+  if (r.status !== 0) {
+    throw new Error(`ct-jsbound assemble failed (${r.status}): ${r.stderr}`);
+  }
+  return {
+    bodies,
+    container: new Uint8Array(fs.readFileSync(out)),
+    records: loadBoundaryLog(out).records,
+    inspected,
+  };
+}
+
+/** The forms a value may be written in: raw, URL-encoded and JSON-escaped. */
+function forms(s: string): string[] {
+  return [
+    ...new Set([s, encodeURIComponent(s), JSON.stringify(s).slice(1, -1)]),
+  ];
+}
+
+/**
+ * Whether `s`, in any of its {@link forms}, occurs in any of `blobs`: one
+ * search, used for what must be absent and, as the vacuity guard, for what
+ * must be present (a search that reads nothing passes every "absent"
+ * check).
+ */
+function found(blobs: readonly Uint8Array[], s: string): boolean {
+  const needles = forms(s).map((f) => Buffer.from(f, "utf8"));
+  return blobs.some((b) => {
+    const buf = Buffer.from(b.buffer, b.byteOffset, b.byteLength);
+    return needles.some((n) => buf.includes(n));
+  });
+}
+
+const inputsAt = (records: BoundaryRecord[], target: string, type: string) =>
+  records.filter(
+    (r): r is RecordOf<"Input"> =>
+      r.record === "Input" && r.target === target && r.type === type,
+  );
+
+const propsOf = (r: RecordOf<"Input">) =>
+  JSON.parse(r.props) as Record<string, unknown>;
+
+const scrubbedAt = (records: BoundaryRecord[], target: string) =>
+  records.filter(
+    (r): r is RecordOf<"Scrubbed"> =>
+      r.record === "Scrubbed" && r.target === target,
+  );
+
+const valuesAt = (records: BoundaryRecord[], target: string) =>
+  records.filter(
+    (r): r is RecordOf<"DomEffect"> =>
+      r.record === "DomEffect" && r.target === target && r.effect === 1,
+  );
+
+const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+
+/** The secrets typed into `sensitive-focus.html`'s sensitive fields. */
+interface FocusSecrets {
+  pinA: string;
+  pinB: string;
+  pinC: string;
+  otp: string;
+}
+
+/** Four digits each, the last one moving focus away; no letters. */
+const FOCUS_SECRETS: FocusSecrets = {
+  pinA: "4719",
+  pinB: "8357",
+  pinC: "5174",
+  otp: "9183",
+};
+
+/**
+ * Type each secret into its field of `sensitive-focus.html` (each field's
+ * last key moves focus away, see the fixture), then `publicText` into the
+ * public field, and send.
+ */
+async function driveFocusMoves(
+  page: SPage,
+  secrets: FocusSecrets,
+  publicText: string,
+): Promise<void> {
+  for (const id of ["pinA", "pinB", "pinC", "otp"] as const) {
+    await page.click(`#${id}`);
+    await page.keyboard.type(secrets[id]);
+  }
+  await page.click("#pub");
+  await page.keyboard.type(publicText);
+  await page.click("#send");
+}
+
+/**
+ * The records of a `sensitive-focus.html` session hold every keystroke of
+ * every secret masked, key and code, at the field it was typed into and at
+ * the element its last key finished at; and no key event anywhere carries
+ * a key or a physical key of a secret.
+ */
+function expectFocusMovesMasked(
+  records: BoundaryRecord[],
+  secrets: FocusSecrets,
+): void {
+  const masked = (target: string, type: string, n: number) => {
+    const props = inputsAt(records, target, type).map(propsOf);
+    expect(props.length, `${target} ${type}`).toBe(n);
+    for (const p of props) {
+      expect(p.key, `${target} ${type}`).toBe("*");
+      expect(p.code, `${target} ${type}`).toBe("Masked");
+    }
+  };
+  // Typed into the fields: every keydown masked.
+  for (const id of ["pinA", "pinB", "pinC", "otp"] as const) {
+    masked(`path:#${id}`, "keydown", secrets[id].length);
+  }
+  // The keydown handler cancelled `pinA`'s last key and focused the public
+  // field: its keyup finished there.
+  masked("path:#pinA", "keyup", 3);
+  masked("path:#pubA", "keyup", 1);
+  masked("path:#pubA", "keypress", 0);
+  // Not cancelled: the keypress and the keyup at the button, at `body`.
+  for (const [id, at] of [
+    ["pinB", "path:#btn"],
+    ["pinC", "path:#page"],
+  ] as const) {
+    masked(`path:#${id}`, "keypress", 3);
+    masked(`path:#${id}`, "keyup", 3);
+    masked(at, "keypress", 1);
+    masked(at, "keyup", 1);
+  }
+  // Auto-advanced by the input handler: only the keyup moved.
+  masked("path:#otp", "keypress", 4);
+  masked("path:#otp", "keyup", 3);
+  masked("path:#pubD", "keyup", 1);
+  // Nowhere a key of a secret, nor its physical key.
+  const digits = new Set(Object.values(secrets).join(""));
+  for (const r of records) {
+    if (r.record !== "Input" || !r.type.startsWith("key")) continue;
+    const p = propsOf(r);
+    expect(digits.has(String(p.key)), `${r.target} ${r.type}`).toBe(false);
+    expect(String(p.code).startsWith("Digit"), `${r.target} ${r.type}`).toBe(
+      false,
+    );
+  }
+}
+
+/** The secrets typed in `sensitive-focus.html`'s insert case. */
+interface InsertSecrets {
+  pinE: string;
+  pinF: string;
+}
+
+const INSERT_SECRETS: InsertSecrets = { pinE: "6182", pinF: "3956" };
+
+/** Typed into `pubE` and `pubF` after their secret's last character. */
+const AFTER_E = "qrs";
+const AFTER_F = "tu";
+
+/**
+ * The physical key an input method's `Process` keydown is of in the insert
+ * case, and the text it composes: neither may be in the log.
+ */
+const IME_CODE = "KeyJ";
+const IME_TEXT = "じ";
+
+/**
+ * Drive `sensitive-focus.html`'s insert case: `pinE`'s last key moves focus
+ * to the public `pubE` without being cancelled, so its character lands
+ * there, and `AFTER_E` follows it; `pinF`'s last key is cancelled and moves
+ * focus to the public `pubF`, then is held until it repeats there (its
+ * character landing in `pubF`), and `AFTER_F` follows; `ime` gets a
+ * composition through the DevTools protocol (a `Process` keydown, the
+ * composed text, the key's keyup, as Chromium dispatches an input method's
+ * keys); then `publicText` into the public field, and `send`.
+ */
+async function driveInsert(
+  page: SPage,
+  secrets: InsertSecrets,
+  publicText: string,
+): Promise<void> {
+  await page.click("#pinE");
+  await page.keyboard.type(secrets.pinE);
+  await page.keyboard.type(AFTER_E);
+  await page.click("#pinF");
+  await page.keyboard.type(secrets.pinF.slice(0, 3));
+  const held = secrets.pinF[3];
+  await page.keyboard.down(held);
+  // Already down: Playwright dispatches it again with `repeat` set.
+  await page.keyboard.down(held);
+  await page.keyboard.up(held);
+  await page.keyboard.type(AFTER_F);
+  await page.click("#ime");
+  const cdp = await (
+    page as unknown as {
+      context(): {
+        newCDPSession(p: unknown): Promise<{
+          send(method: string, params: object): Promise<unknown>;
+        }>;
+      };
+    }
+  )
+    .context()
+    .newCDPSession(page);
+  await cdp.send("Input.dispatchKeyEvent", {
+    type: "rawKeyDown",
+    key: "Process",
+    code: IME_CODE,
+    windowsVirtualKeyCode: 229,
+  });
+  await cdp.send("Input.insertText", { text: IME_TEXT });
+  await cdp.send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "j",
+    code: IME_CODE,
+    windowsVirtualKeyCode: 74,
+  });
+  await page.click("#pub");
+  await page.keyboard.type(publicText);
+  await page.click("#send");
+}
+
+/** How many keyups {@link driveInsert} makes. */
+const insertKeyups = (secrets: InsertSecrets, publicText: string) =>
+  secrets.pinE.length +
+  AFTER_E.length +
+  secrets.pinF.length +
+  AFTER_F.length +
+  1 +
+  publicText.length;
+
+/**
+ * The records of an insert-case session: the public fields a masked
+ * keystroke put its character into (`pubE`, `pubF`) are sensitive from
+ * the event that carried it on, a `Scrubbed` telling so before it, so
+ * every later event there is masked and their values are never written;
+ * the repeated keydown at `pubF` is masked; the input method's `Process`
+ * keys have their `code` masked. No record carries a key, a physical key or
+ * the text of a secret.
+ */
+function expectInsertMasked(
+  records: BoundaryRecord[],
+  secrets: InsertSecrets,
+): void {
+  for (const id of ["pubE", "pubF"]) {
+    const at = `path:#${id}`;
+    expect(valuesAt(records, at), at).toEqual([]);
+    const scrubbed = scrubbedAt(records, at);
+    expect(scrubbed.length, at).toBeGreaterThan(0);
+    // The `Scrubbed` that makes it sensitive comes before the first event
+    // that carries text there (the repeated keydown at `pubF` comes before
+    // it, masked as a repeat).
+    const firstText = records.findIndex(
+      (r) =>
+        r.record === "Input" &&
+        r.target === at &&
+        ["keypress", "beforeinput", "textInput", "input"].includes(r.type),
+    );
+    const firstScrubbed = records.findIndex(
+      (r) => r.record === "Scrubbed" && r.target === at,
+    );
+    expect(firstText, at).toBeGreaterThan(-1);
+    expect(firstScrubbed, at).toBeGreaterThan(-1);
+    expect(firstScrubbed, at).toBeLessThan(firstText);
+    const inputs = records.filter(
+      (r): r is RecordOf<"Input"> => r.record === "Input" && r.target === at,
+    );
+    expect(inputs.length, at).toBeGreaterThan(0);
+    for (const r of inputs) {
+      const p = propsOf(r);
+      if (typeof p.key === "string" && [...p.key].length === 1) {
+        expect(p.key, `${at} ${r.type}`).toBe("*");
+        expect(p.code, `${at} ${r.type}`).toBe("Masked");
+      }
+      if (typeof p.data === "string") {
+        expect(p.data, `${at} ${r.type}`).toMatch(/^\**$/);
+      }
+    }
+    // The character arrived: a beforeinput and an input carried it.
+    expect(inputsAt(records, at, "beforeinput").length, at).toBeGreaterThan(0);
+    expect(inputsAt(records, at, "input").length, at).toBeGreaterThan(0);
+  }
+  // The held key repeated at `pubF`, masked.
+  const repeats = inputsAt(records, "path:#pubF", "keydown")
+    .map(propsOf)
+    .filter((p) => p.repeat === true);
+  expect(repeats.length).toBe(1);
+  expect(repeats[0].key).toBe("*");
+  // The input method's keys at `ime`.
+  const imeDown = inputsAt(records, "path:#ime", "keydown").map(propsOf);
+  expect(imeDown.map((p) => [p.key, p.code])).toEqual([["Process", "Masked"]]);
+  const imeUp = inputsAt(records, "path:#ime", "keyup").map(propsOf);
+  expect(imeUp.map((p) => [p.key, p.code])).toEqual([["*", "Masked"]]);
+  // Nowhere a key, a physical key or the text of a secret.
+  const digits = new Set(Object.values(secrets).join(""));
+  for (const r of records) {
+    if (r.record === "DomEffect" && r.effect === 1) {
+      for (const d of digits) expect(r.value, r.target).not.toContain(d);
+    }
+    if (r.record !== "Input") continue;
+    const p = propsOf(r);
+    const at = `${r.target} ${r.type}`;
+    expect(digits.has(String(p.key)), at).toBe(false);
+    expect(String(p.code).startsWith("Digit"), at).toBe(false);
+    expect(p.code, at).not.toBe(IME_CODE);
+    if (typeof p.data === "string") {
+      for (const d of digits) expect(p.data, at).not.toContain(d);
+      expect(p.data, at).not.toContain(IME_TEXT);
+    }
+  }
+}
+
+describe("sensitive inputs on the upload route", () => {
+  it(
+    "sensitive_value_never_in_uploaded_bytes",
+    async () => {
+      // The secret has characters that URL-encoding and JSON-escaping
+      // change, so each form is searched for.
+      const SECRET = 'Zk9"q&w/m';
+      // The vacuity guard's string: typed into the public field, the same
+      // search must find it (a distinct unique string: the secret itself is
+      // what must be absent from the same bytes).
+      const PUBLIC = 'Pb4"x&y/n';
+      const sensitive = ["pw", "cc", "ds", "cs", "plain"];
+      const up = await upload("case=fields", async (page) => {
+        for (const id of sensitive) {
+          await page.type(`#${id}`, SECRET);
+          // Named keys: Backspace, then the last character again, and Tab.
+          await page.press(`#${id}`, "Backspace");
+          await page.type(`#${id}`, SECRET.slice(-1));
+          await page.press(`#${id}`, "Tab");
+        }
+        await page.press("#plain", "Enter");
+        await page.type("#pub", PUBLIC);
+        await page.click("#send");
+      });
+      const blobs = [...up.bodies, up.container];
+
+      // Vacuity guard: the same search finds the public field's string, in
+      // the bodies and in the container, the two things searched below.
+      expect(found(up.bodies, PUBLIC)).toBe(true);
+      expect(found([up.container], PUBLIC)).toBe(true);
+      // The secret, in every form, in no batch and not in the container.
+      for (const f of forms(SECRET)) {
+        expect(found(blobs, f), f).toBe(false);
+      }
+
+      // The keystrokes: printable keys masked, named keys verbatim.
+      let masked = 0;
+      for (const id of sensitive) {
+        const target = `path:#${id}`;
+        const downs = inputsAt(up.records, target, "keydown");
+        const printable = downs.filter((d) => propsOf(d).key === "*");
+        masked += printable.length;
+        for (const d of printable) expect(propsOf(d).code).toBe("Masked");
+        const named = downs
+          .map(propsOf)
+          .filter((p) => p.key !== "*")
+          .map((p) => `${p.key}/${p.code}`);
+        expect(named, id).toEqual(
+          id === "plain"
+            ? ["Backspace/Backspace", "Tab/Tab", "Enter/Enter"]
+            : ["Backspace/Backspace", "Tab/Tab"],
+        );
+        for (const i of inputsAt(up.records, target, "input")) {
+          const data = propsOf(i).data;
+          expect(data === null || data === "*", `${id}: ${data}`).toBe(true);
+        }
+        // The value is never a DomEffect; a Scrubbed of its length is.
+        expect(valuesAt(up.records, target), id).toEqual([]);
+        const scrubbed = scrubbedAt(up.records, target);
+        expect(scrubbed.at(-1)?.length, id).toBe(SECRET.length);
+        expect(scrubbed.at(-1)?.class, id).toBe(
+          { pw: 1, cc: 2, ds: 4, cs: 4, plain: 4 }[id],
+        );
+      }
+      // Vacuity guard: the masked-key count is the scripted printable count.
+      expect(masked).toBe(sensitive.length * (SECRET.length + 1));
+
+      // What the page sent is logged in holed form (§5.2.1).
+      const requests = up.records.filter(
+        (r): r is RecordOf<"NetRequest"> => r.record === "NetRequest",
+      );
+      expect(requests.map((r) => r.url)).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining(`/api/data?q=${HOLE_TOKEN}`),
+        ]),
+      );
+      const post = requests.find((r) => r.method === "POST")!;
+      expect(post.body_digest).toBe(
+        sha256(JSON.stringify({ pw: HOLE_TOKEN, cc: HOLE_TOKEN })),
+      );
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "sensitive_text_in_shadow_trees_and_editable_regions_never_uploaded",
+    async () => {
+      // No character that URL-encoding, JSON-escaping or the error
+      // template changes: an unholed copy would be found verbatim.
+      const SECRET = "Qx7tz-mirror";
+      // One secret per shadow-tree field, so that each is holed in the URL
+      // only if its own field was found (not by another field's value).
+      const OPEN = "Ow5kd-opened";
+      const CLOSED = "Cj8rv-closed";
+      const PUBLIC = "Pv3wy-public";
+      const up = await upload(
+        "case=shadow",
+        async (page) => {
+          // A password in an open shadow root: Playwright's selector
+          // pierces it, the window's listeners see the host.
+          await page.type("#spw", OPEN);
+          // An undeclared text field in a closed shadow root.
+          await page.evaluate(() =>
+            (
+              globalThis as unknown as { __closedInput: HTMLElement }
+            ).__closedInput.focus(),
+          );
+          await page.keyboard.type(CLOSED);
+          await page.type("#ed", SECRET);
+          await page.type("#edpub", PUBLIC);
+          await page.type("#mir", SECRET);
+          await page.type("#ta", SECRET);
+          await page.click("#send");
+        },
+        { enabled: true },
+        () => (globalThis as unknown as { __mutations: number }).__mutations,
+      );
+      const blobs = [...up.bodies, up.container];
+
+      // Vacuity guards: the page's observer was handed records, and what was
+      // typed into the public region (its mutation records' text) is found
+      // by the same search, in the bodies and in the container.
+      expect(up.inspected).toBeGreaterThan(SECRET.length);
+      expect(found(up.bodies, PUBLIC)).toBe(true);
+      expect(found([up.container], PUBLIC)).toBe(true);
+      // The secrets, in every form, in no batch and not in the container.
+      for (const secret of [SECRET, OPEN, CLOSED]) {
+        for (const f of forms(secret)) {
+          expect(found(blobs, f), f).toBe(false);
+        }
+      }
+
+      // The keystrokes behind both shadow roots are masked, though their
+      // events reach the window at the hosts.
+      for (const host of ["path:#openhost", "path:#closedhost"]) {
+        const keys = inputsAt(up.records, host, "keydown").map(
+          (r) => propsOf(r).key,
+        );
+        expect(keys, host).toEqual(Array(OPEN.length).fill("*"));
+      }
+      // The editable region's text: a Scrubbed of its length, no value.
+      expect(scrubbedAt(up.records, "path:#ed").at(-1)).toMatchObject({
+        class: 4,
+        length: SECRET.length,
+      });
+      expect(scrubbedAt(up.records, "path:#edpub")).toEqual([]);
+      // The observer's records of the sensitive fields are written, holed.
+      const mutations = up.records.filter(
+        (r): r is RecordOf<"PlatformValue"> =>
+          r.record === "PlatformValue" && r.src === 3,
+      );
+      expect(mutations.some((r) => r.value.includes(HOLE_TOKEN))).toBe(true);
+      // What the page sent and the error it raised hold the hole.
+      const request = up.records.find(
+        (r): r is RecordOf<"NetRequest"> =>
+          r.record === "NetRequest" && r.url.includes("/api/data"),
+      )!;
+      expect(request.url).toContain(
+        `?e=${HOLE_TOKEN}&o=${HOLE_TOKEN}&c=${HOLE_TOKEN}`,
+      );
+      expect(
+        up.records
+          .filter((r): r is RecordOf<"Error"> => r.record === "Error")
+          .map((e) => e.message),
+      ).toEqual([`Uncaught Error: rejected ${HOLE_TOKEN}`]);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keystrokes_in_declarative_closed_roots_of_focusable_hosts_never_uploaded",
+    async () => {
+      // Two closed roots the HTML parser attached (no `attachShadow` call
+      // the shim could see), each on a host that is focusable itself, so
+      // the window's listeners cannot tell a keystroke into the field behind
+      // it from one at the host.
+      const DIV = "Dv6qp-closed";
+      const DELEGATES = "Df2mn-closed";
+      const PUBLIC = "Pz8hc-public";
+      const up = await upload(
+        "case=upload",
+        async (page) => {
+          // The field fills the host: the click lands on it.
+          await page.click("#dhost");
+          await page.keyboard.type(DIV);
+          // The host delegates focus to its field.
+          await page.evaluate(() => document.getElementById("dfhost")!.focus());
+          await page.keyboard.type(DELEGATES);
+          // A focusable element that cannot host a shadow root: its keys
+          // are its own.
+          await page.press("#item", "k");
+          // Focusable widgets with no shadow root that take their own
+          // keys: unmarked, and declared public by attribute and by call.
+          await page.press("#kneg", "k");
+          await page.press("#kpub", "k");
+          await page.press("#kct", "k");
+          await page.type("#pub", PUBLIC);
+          await page.click("#send");
+        },
+        { enabled: true },
+        () => document.getElementById("status")!.textContent,
+        "sensitive-closed.html",
+      );
+      const blobs = [...up.bodies, up.container];
+
+      // Vacuity guards: every keystroke reached the hosts' listeners, and
+      // the public field's text is found by the same search, in the bodies
+      // and in the container.
+      expect(up.inspected).toBe(`keys ${DIV.length + DELEGATES.length}`);
+      expect(found(up.bodies, PUBLIC)).toBe(true);
+      expect(found([up.container], PUBLIC)).toBe(true);
+      // The secrets, in every form, in no batch and not in the container.
+      for (const secret of [DIV, DELEGATES]) {
+        for (const f of forms(secret)) {
+          expect(found(blobs, f), f).toBe(false);
+        }
+      }
+      // The keystrokes at both hosts are masked, key and code.
+      for (const [host, typed] of [
+        ["path:#dhost", DIV],
+        ["path:#dfhost", DELEGATES],
+      ] as const) {
+        for (const type of ["keydown", "keypress", "keyup"]) {
+          const props = inputsAt(up.records, host, type).map(propsOf);
+          expect(props.length, `${host} ${type}`).toBe(typed.length);
+          for (const p of props) {
+            expect(p.key, `${host} ${type}`).toBe("*");
+            expect(p.code, `${host} ${type}`).toBe("Masked");
+          }
+        }
+      }
+      // The control: the list item's key is recorded as it was.
+      expect(
+        inputsAt(up.records, "path:#item", "keydown").map(
+          (r) => propsOf(r).key,
+        ),
+      ).toEqual(["k"]);
+      // The unmarked widget is taken for the host of a root the shim cannot
+      // see: its key is masked. The widgets the page declared public, by
+      // `data-ct-public` and by `ct.public`, keep their keys exactly.
+      for (const [host, key, code] of [
+        ["path:#kneg", "*", "Masked"],
+        ["path:#kpub", "k", "KeyK"],
+        ["path:#kct", "k", "KeyK"],
+      ] as const) {
+        for (const type of ["keydown", "keypress", "keyup"]) {
+          const props = inputsAt(up.records, host, type).map(propsOf);
+          expect(props.length, `${host} ${type}`).toBe(1);
+          expect(props[0].key, `${host} ${type}`).toBe(key);
+          expect(props[0].code, `${host} ${type}`).toBe(code);
+        }
+      }
+      // The component read its field's value through its own internals and
+      // sent it: the request is logged with the hole.
+      const request = up.records.find(
+        (r): r is RecordOf<"NetRequest"> =>
+          r.record === "NetRequest" && r.url.includes("/api/data"),
+      )!;
+      expect(request.url).toContain(`?d=${HOLE_TOKEN}`);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keystrokes_in_a_declarative_closed_root_on_body_never_uploaded",
+    async () => {
+      // A closed root the HTML parser attached to `body`: a keystroke into
+      // its field reaches the window at `body`, as one made while nothing
+      // has focus does.
+      const SECRET = "Bq7xz-bodyroot";
+      const up = await upload(
+        "case=upload",
+        async (page) => {
+          // The field is fixed at the top left of the viewport.
+          await page.mouse.click(20, 15);
+          await page.keyboard.type(SECRET);
+          // Nothing focused: the page's own shortcut at body.
+          await page.click("#blank");
+          await page.keyboard.press("k");
+          await page.click("#send");
+        },
+        { enabled: true },
+        () => document.getElementById("status")!.textContent,
+        "sensitive-body.html",
+      );
+      // Vacuity guard: every keystroke reached body's listener.
+      expect(up.inspected).toBe(`sent ${SECRET.length + 1}`);
+      const blobs = [...up.bodies, up.container];
+      for (const f of forms(SECRET)) expect(found(blobs, f), f).toBe(false);
+      for (const type of ["keydown", "keypress", "keyup"]) {
+        const props = inputsAt(up.records, "path:#page", type).map(propsOf);
+        expect(props.length, type).toBe(SECRET.length + 1);
+        // The typing into the field behind the root: masked, key and code.
+        for (const p of props.slice(0, SECRET.length)) {
+          expect(p.key, type).toBe("*");
+          expect(p.code, type).toBe("Masked");
+        }
+        // The control: the key pressed with nothing focused is kept.
+        expect(props.at(-1)!.key, type).toBe("k");
+        expect(props.at(-1)!.code, type).toBe("KeyK");
+      }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keystrokes_finished_after_focus_left_a_sensitive_field_never_uploaded",
+    async () => {
+      // Each secret's last key moves focus away from its sensitive field
+      // between the key's keydown and its keyup (by the page's keydown
+      // handler, or by its input handler auto-advancing a full field), so
+      // the browser finishes the keystroke at another element: a public
+      // field, a button, `body` (nothing focused).
+      const PUBLIC = "abcxyz";
+      const up = await upload(
+        "",
+        (page) => driveFocusMoves(page, FOCUS_SECRETS, PUBLIC),
+        { enabled: true },
+        () => document.getElementById("status")!.textContent,
+        "sensitive-focus.html",
+      );
+      // Vacuity guard: every keyup reached the window's listener.
+      const typed = Object.values(FOCUS_SECRETS).join("") + PUBLIC;
+      expect(up.inspected).toBe(`sent ${typed.length}`);
+      expectFocusMovesMasked(up.records, FOCUS_SECRETS);
+      // No key of a secret, nor its physical key, in any batch or in the
+      // container; the public field's keys are found by the same search
+      // (the vacuity guard).
+      const blobs = [...up.bodies, up.container];
+      for (const blob of [up.bodies, [up.container]]) {
+        for (const c of PUBLIC) {
+          expect(found(blob, `"key":"${c}"`), c).toBe(true);
+          expect(found(blob, `"code":"Key${c.toUpperCase()}"`), c).toBe(true);
+        }
+      }
+      for (const c of new Set(Object.values(FOCUS_SECRETS).join(""))) {
+        expect(found(blobs, `"key":"${c}"`), c).toBe(false);
+        expect(found(blobs, `"code":"Digit${c}"`), c).toBe(false);
+      }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "characters_a_masked_keystroke_puts_into_a_public_field_never_uploaded",
+    async () => {
+      // A keystroke typed into a sensitive field whose character the
+      // browser inserts into a public field, because the page moved focus
+      // there without cancelling the key or because the key was held until
+      // it repeated there, makes that field sensitive; an input method's
+      // keys keep their physical keys to themselves. The page then sends
+      // `pubE`'s value in a query string.
+      const PUBLIC = "abcxyz";
+      const up = await upload(
+        "case=insert",
+        (page) => driveInsert(page, INSERT_SECRETS, PUBLIC),
+        { enabled: true },
+        () => document.getElementById("status")!.textContent,
+        "sensitive-focus.html",
+      );
+      // Vacuity guard: every keyup reached the window's listener.
+      expect(up.inspected).toBe(`sent ${insertKeyups(INSERT_SECRETS, PUBLIC)}`);
+      expectInsertMasked(up.records, INSERT_SECRETS);
+      // The request went out, its query holed.
+      const req = up.records.filter(
+        (r): r is RecordOf<"NetRequest"> =>
+          r.record === "NetRequest" && r.url.includes("/api/data?q="),
+      );
+      expect(req.map((r) => r.url.split("?")[1])).toEqual([`q=${HOLE_TOKEN}`]);
+      const blobs = [...up.bodies, up.container];
+      for (const blob of [up.bodies, [up.container]]) {
+        for (const c of PUBLIC) {
+          expect(found(blob, `"key":"${c}"`), c).toBe(true);
+        }
+      }
+      const valueE = INSERT_SECRETS.pinE.at(-1)! + AFTER_E;
+      const valueF = INSERT_SECRETS.pinF.at(-1)! + AFTER_F;
+      for (const v of [valueE, valueF, IME_TEXT, `"code":"${IME_CODE}"`]) {
+        expect(found(blobs, v), v).toBe(false);
+      }
+      for (const c of new Set(Object.values(INSERT_SECRETS).join(""))) {
+        expect(found(blobs, `"key":"${c}"`), c).toBe(false);
+        expect(found(blobs, `"code":"Digit${c}"`), c).toBe(false);
+        expect(found(blobs, `"data":"${c}"`), c).toBe(false);
+      }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "shim_public_opt_out_and_credential_refusal",
+    async () => {
+      const up = await upload(
+        "case=optout",
+        async (page) => {
+          await page.type("#pub", "pubtextone");
+          await page.type("#pubattr", "pubtexttwo");
+          await page.type("#cc2", "4111111111111111");
+          await page.type("#neg", "negtextfour");
+          await page.click("#check");
+          await page.evaluate(() =>
+            document.body.setAttribute("data-done", "1"),
+          );
+        },
+        { enabled: true },
+        () =>
+          (globalThis as unknown as { __publicThrew: unknown }).__publicThrew,
+      );
+      // ct.public() on a password and on a one-time-code field throws.
+      expect(up.inspected).toEqual({ pw2: true, otp: true });
+
+      // The public fields: verbatim values, unmasked keys, no Scrubbed.
+      for (const [id, text] of [
+        ["pub", "pubtextone"],
+        ["pubattr", "pubtexttwo"],
+      ]) {
+        const target = `path:#${id}`;
+        expect(
+          valuesAt(up.records, target)
+            .map((r) => JSON.parse(r.value))
+            .at(-1),
+        ).toBe(text);
+        expect(scrubbedAt(up.records, target)).toEqual([]);
+        const keys = inputsAt(up.records, target, "keydown").map(
+          (r) => propsOf(r).key,
+        );
+        expect(keys.join("")).toBe(text);
+        const codes = inputsAt(up.records, target, "keydown").map(
+          (r) => propsOf(r).code,
+        );
+        expect(codes).not.toContain("Masked");
+        const data = inputsAt(up.records, target, "input").map(
+          (r) => propsOf(r).data,
+        );
+        expect(data.join("")).toBe(text);
+      }
+
+      // data-ct-public on a card field is ignored; the field with no marking
+      // is masked and scrubbed (the negative control): the marking is what
+      // changed the public fields' records.
+      for (const [id, cls, text] of [
+        ["cc2", 2, "4111111111111111"],
+        ["neg", 4, "negtextfour"],
+      ] as const) {
+        const target = `path:#${id}`;
+        expect(valuesAt(up.records, target)).toEqual([]);
+        expect(scrubbedAt(up.records, target).at(-1)).toMatchObject({
+          class: cls,
+          length: text.length,
+        });
+        const keys = inputsAt(up.records, target, "keydown").map(
+          (r) => propsOf(r).key,
+        );
+        expect(keys).toEqual(Array(text.length).fill("*"));
+        expect(found(up.bodies, text)).toBe(false);
+      }
+
+      // A checkbox with no declaration: its checked state verbatim.
+      const checked = up.records.filter(
+        (r): r is RecordOf<"DomEffect"> =>
+          r.record === "DomEffect" &&
+          r.target === "path:#check" &&
+          r.effect === 2,
+      );
+      expect(checked.map((r) => r.value)).toContain("true");
+      expect(scrubbedAt(up.records, "path:#check")).toEqual([]);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "scrubbed_headers_and_url_tokens_never_uploaded",
+    async () => {
+      const JWT1 =
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvbmUifQ.c2lnbmF0dXJlLW9uZS1hYmM";
+      const JWT2 =
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0d28ifQ.c2lnbmF0dXJlLXR3by14eXo";
+      const JWT3 =
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0aHJlZSJ9.c2lnbmF0dXJlLXRocmVlLXE";
+      const up = await upload(
+        // The page's own URL carries a JWT and a value of a key only the
+        // site lists (`sid`): `Env` is written before the configuration
+        // arrives, so its scrubbing by the site's list is the transport's
+        // rewrite of the frames it held.
+        `case=headers&access_token=${JWT1}&sid=plainsid123`,
+        async (page) => {
+          await page.click("#send");
+        },
+        {
+          enabled: true,
+          scrub_headers: ["X-Site-Secret"],
+          scrub_query_keys: ["sid"],
+        },
+      );
+      const blobs = [...up.bodies, up.container];
+      // Positive control: a header nobody lists is uploaded, so the search
+      // reads the headers.
+      expect(found(up.bodies, "plain-header-value-77")).toBe(true);
+      for (const secret of [
+        JWT1,
+        JWT2,
+        JWT3,
+        "plainsid123",
+        // The request's own Authorization and Cookie are never logged.
+        "req-authz-91c3d7",
+        "cookie-val-5544e1",
+        // The response's credential, proxy and site-listed headers.
+        "resp-authz-6f2b9c41",
+        "7d3e0a55",
+        "proxy-realm-8a1c",
+        "site-secret-4e9d21",
+      ]) {
+        expect(found(blobs, secret), secret).toBe(false);
+      }
+      const env = up.records[1] as RecordOf<"Env">;
+      expect(env.url).toContain("access_token=<scrubbed>&sid=<scrubbed>");
+      const response = up.records.find(
+        (r): r is RecordOf<"NetResponse"> =>
+          r.record === "NetResponse" && r.url.includes("/api/headers"),
+      )!;
+      expect(response.url).toContain("token=<scrubbed>");
+      const names = (JSON.parse(response.headers) as [string, string][]).map(
+        ([n]) => n,
+      );
+      expect(names).toContain("x-plain");
+      for (const n of [
+        "authorization",
+        "cookie",
+        "proxy-authenticate",
+        "x-site-secret",
+      ]) {
+        expect(names).not.toContain(n);
+      }
+      const nav = up.records.find(
+        (r): r is RecordOf<"Navigation"> =>
+          r.record === "Navigation" && r.kind === 1,
+      )!;
+      expect(nav.url).toContain("jwt=<scrubbed>");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "error_messages_are_templated_before_upload",
+    async () => {
+      const up = await upload("case=error", async (page) => {
+        await page.click("#send");
+      });
+      const errors = up.records.filter(
+        (r): r is RecordOf<"Error"> => r.record === "Error",
+      );
+      expect(errors.map((e) => e.message)).toEqual([
+        "Uncaught Error: Login failed for <email> after <num> attempts",
+      ]);
+      expect(errors[0].kind).toBe(1);
+      expect(found(up.bodies, "ada@example.com")).toBe(false);
+      expect(found(up.bodies, "after 3 attempts")).toBe(false);
+      // Vacuity guard: the template's own words are in the bodies.
+      expect(found(up.bodies, "Login failed for <email>")).toBe(true);
+    },
+    TIMEOUT,
+  );
+});
+
+// ── The record-and-replay route ────────────────────────────────────────
+
+/** The e-mail case, recorded once for the two declassifier tests. */
+let emailSession:
+  | { records: BoundaryRecord[]; recordCalls: number }
+  | undefined;
+
+async function recordEmail(): Promise<{
+  records: BoundaryRecord[];
+  recordCalls: number;
+}> {
+  if (emailSession !== undefined) return emailSession;
+  let recordCalls = -1;
+  const records = await rr.record("sensitive.html?case=email", async (p) => {
+    const page = p as unknown as SPage;
+    // Not an address, then one: the declassifier answers false, then true.
+    // The first is long enough that its placeholder (`x…x@x.invalid`, the
+    // e-mail class's) is itself an address.
+    await page.type("#email", "ada-at-example.org");
+    await page.click("#check");
+    await page.fill("#email", "");
+    await page.type("#email", "ada@example.org");
+    await page.click("#check");
+    recordCalls = await page.evaluate(() =>
+      (
+        globalThis as unknown as { __declassifierCalls(): number }
+      ).__declassifierCalls(),
+    );
+    await page.click("#finish");
+  });
+  emailSession = { records, recordCalls };
+  return emailSession;
+}
+
+describe("sensitive inputs on the record-and-replay route", () => {
+  it(
+    "declassify_replays_logged_output_not_function",
+    async () => {
+      const { records, recordCalls } = await recordEmail();
+      const declassified = records.filter(
+        (r): r is RecordOf<"Declassify"> => r.record === "Declassify",
+      );
+      expect(declassified.map((d) => [d.fn_id, d.output])).toEqual([
+        ["isValidEmail", "false"],
+        ["isValidEmail", "true"],
+      ]);
+      // The record side ran the body once per Declassify record.
+      expect(recordCalls).toBe(declassified.length);
+      // The field's values were never logged: Scrubbed, e-mail class.
+      expect(valuesAt(records, "path:#email")).toEqual([]);
+      expect(scrubbedAt(records, "path:#email").at(-1)).toMatchObject({
+        class: 3,
+        length: "ada@example.org".length,
+      });
+
+      const report = await rr.replay(records);
+      expectReplayed(report, records);
+      // The replay-side count, raised by the page in its last task: the
+      // body never ran. The log holds the message as a template, so the
+      // replay's message matched it whatever the count.
+      expect(report.pageErrors).toContain("declassifier-calls=0");
+      const error = records.find(
+        (r): r is RecordOf<"Error"> => r.record === "Error",
+      );
+      expect(error?.message).toBe("Uncaught Error: declassifier-calls=<num>");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "declassify_identity_and_order_are_asserted",
+    async () => {
+      const { records } = await recordEmail();
+      const at = indexWhere(records, "Declassify");
+      const seq = seqAt(records, at);
+
+      // Negative control: the unedited log replays clean in this run.
+      expectReplayed(await rr.replay(records), records);
+
+      // Its identity changed: the page's call names another declassifier.
+      expectDiverged(
+        await rr.replay(
+          replaced<"Declassify">(records, at, { fn_id: "isValidEmail2" }),
+        ),
+        "ArgumentMismatch",
+        seq,
+      );
+      // Removed: the page calls a declassifier where the log has the next
+      // record.
+      expectDiverged(
+        await rr.replay(withoutRecord(records, at)),
+        "ExtraRead",
+        seq,
+      );
+      // Duplicated: a Declassify the page never makes comes due.
+      expectDiverged(
+        await rr.replay(withRecordBefore(records, at + 1, records[at])),
+        "MissingRead",
+        (BigInt(seq) + 1n).toString(),
+      );
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "placeholder_request_matches_holed_digest",
+    async () => {
+      const records = await rr.record(
+        "sensitive.html?case=login",
+        async (p) => {
+          const page = p as unknown as SPage;
+          await page.type("#pw", "hunter2!x");
+          await page.click("#login");
+        },
+      );
+      // Replayed with a placeholder in the field: the request it makes holes
+      // to the same form, so no ArgumentMismatch.
+      expectReplayed(await rr.replay(records), records);
+      // The form both sides hole to: the token in the query, the digest
+      // over the holed JSON body.
+      const request = records.find(
+        (r): r is RecordOf<"NetRequest"> => r.record === "NetRequest",
+      )!;
+      expect(request.url).toContain(`/api/data?pin=${HOLE_TOKEN}`);
+      expect(request.body_digest).toBe(
+        sha256(JSON.stringify({ user: "ada", pass: HOLE_TOKEN })),
+      );
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "mirrored_and_editable_sensitive_text_replays_with_placeholders",
+    async () => {
+      // A value the page mirrors into the DOM (a field's `value` attribute,
+      // a textarea's text) and the text of an editable region: never in the
+      // log, so the checkpoints and the page's mutation records must hold
+      // them as holes for a replay with placeholders to match.
+      const SECRET = "Qx7tz-mirror";
+      const records = await rr.record(
+        "sensitive.html?case=mirror",
+        async (p) => {
+          const page = p as unknown as SPage;
+          await page.type("#mir", SECRET);
+          await page.type("#ta", SECRET);
+          await page.type("#ed", SECRET);
+          await page.click("#finish");
+        },
+      );
+      const text = records
+        .map((r) =>
+          JSON.stringify(r, (_k, v: unknown) =>
+            typeof v === "bigint" ? v.toString() : v,
+          ),
+        )
+        .join("\n");
+      // The script made both fields before its first record (the
+      // observer's TaskReg), so its execution follows a Loading that
+      // counts them, which only the script brings the replay to.
+      const start = indexWhere(
+        records,
+        "DocTask",
+        (d) => d.kind === 1 && d.src.endsWith("/sensitive.js"),
+      );
+      expect(records[start - 1].record).toBe("Loading");
+      expect(records[start + 1]).toMatchObject({ record: "TaskReg", kind: 10 });
+      // Vacuity guard: the page's observer records of the mirrored fields
+      // are in the log (holed) ...
+      expect(
+        records.some(
+          (r) =>
+            r.record === "PlatformValue" &&
+            r.src === 3 &&
+            r.value.includes(HOLE_TOKEN),
+        ),
+      ).toBe(true);
+      // ... and the secret is in no record.
+      expect(text.includes(SECRET)).toBe(false);
+      expect(scrubbedAt(records, "path:#ed").at(-1)).toMatchObject({
+        class: 4,
+        length: SECRET.length,
+      });
+      // Replayed with placeholders: every checkpoint and every mutation
+      // record matches.
+      expectReplayed(await rr.replay(records), records);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keystrokes_in_declarative_closed_roots_replay_masked",
+    async () => {
+      // The page of the upload test above, recorded twice with secrets of
+      // one length: the checkpoints may depend on the typing's shape (the
+      // page counts the keystrokes) but never on its content.
+      const record = (div: string, delegates: string) =>
+        rr.record("sensitive-closed.html?case=replay", async (p) => {
+          const page = p as unknown as SPage;
+          await page.click("#dhost");
+          await page.keyboard.type(div);
+          await page.evaluate(() => document.getElementById("dfhost")!.focus());
+          await page.keyboard.type(delegates);
+          await page.click("#send");
+        });
+      const first = ["Dv6qp-closed", "Df2mn-closed"] as const;
+      const second = ["Rk4wb-hidden", "Tn9yx-hidden"] as const;
+      const a = await record(...first);
+      const b = await record(...second);
+      for (const [records, secrets] of [
+        [a, first],
+        [b, second],
+      ] as const) {
+        const text = records
+          .map((r) =>
+            JSON.stringify(r, (_k, v: unknown) =>
+              typeof v === "bigint" ? v.toString() : v,
+            ),
+          )
+          .join("\n");
+        for (const s of secrets) expect(text.includes(s), s).toBe(false);
+        // Vacuity guard: the keystrokes are in the log, masked.
+        for (const host of ["path:#dhost", "path:#dfhost"]) {
+          const keys = inputsAt(records, host, "keydown").map(
+            (r) => propsOf(r).key,
+          );
+          expect(keys, host).toEqual(Array(12).fill("*"));
+        }
+      }
+      // The document after the typing hashes the same whatever was typed.
+      const lastHash = (records: BoundaryRecord[]) =>
+        records
+          .filter((r): r is RecordOf<"Checkpoint"> => r.record === "Checkpoint")
+          .at(-1)?.state_hash;
+      expect(lastHash(a)).toBeDefined();
+      expect(lastHash(a)).toEqual(lastHash(b));
+      // Replayed with no secret at all: every checkpoint matches.
+      expectReplayed(await rr.replay(a), a);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keystrokes_in_a_declarative_closed_root_on_body_replay_masked",
+    async () => {
+      // The page of the upload test above, recorded twice with secrets of
+      // one length; the key pressed with nothing focused is the page's own.
+      const record = (secret: string) =>
+        rr.record("sensitive-body.html", async (p) => {
+          const page = p as unknown as SPage;
+          await page.mouse.click(20, 15);
+          await page.keyboard.type(secret);
+          await page.click("#blank");
+          await page.keyboard.press("k");
+          await page.click("#send");
+        });
+      const first = "Bq7xz-bodyroot";
+      const second = "Wm3kd-hiddenxx";
+      const a = await record(first);
+      const b = await record(second);
+      for (const [records, secret] of [
+        [a, first],
+        [b, second],
+      ] as const) {
+        const text = records
+          .map((r) =>
+            JSON.stringify(r, (_k, v: unknown) =>
+              typeof v === "bigint" ? v.toString() : v,
+            ),
+          )
+          .join("\n");
+        expect(text.includes(secret), secret).toBe(false);
+        const keys = inputsAt(records, "path:#page", "keydown").map(
+          (r) => propsOf(r).key,
+        );
+        expect(keys).toEqual([...Array(secret.length).fill("*"), "k"]);
+      }
+      const lastHash = (records: BoundaryRecord[]) =>
+        records
+          .filter((r): r is RecordOf<"Checkpoint"> => r.record === "Checkpoint")
+          .at(-1)?.state_hash;
+      expect(lastHash(a)).toBeDefined();
+      expect(lastHash(a)).toEqual(lastHash(b));
+      expectReplayed(await rr.replay(a), a);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keystrokes_finished_after_focus_left_a_sensitive_field_replay_masked",
+    async () => {
+      // The page of the upload test above, recorded twice with secrets of
+      // one shape: the checkpoints may depend on the typing's shape (the
+      // page counts the keyups) but never on its content.
+      const record = (secrets: FocusSecrets) =>
+        rr.record("sensitive-focus.html", async (p) =>
+          driveFocusMoves(p as unknown as SPage, secrets, "abcxyz"),
+        );
+      const first = FOCUS_SECRETS;
+      const second: FocusSecrets = {
+        pinA: "2630",
+        pinB: "0264",
+        pinC: "6203",
+        otp: "3026",
+      };
+      const a = await record(first);
+      const b = await record(second);
+      for (const [records, secrets] of [
+        [a, first],
+        [b, second],
+      ] as const) {
+        expectFocusMovesMasked(records, secrets);
+      }
+      // The document after the typing hashes the same whatever was typed.
+      const lastHash = (records: BoundaryRecord[]) =>
+        records
+          .filter((r): r is RecordOf<"Checkpoint"> => r.record === "Checkpoint")
+          .at(-1)?.state_hash;
+      expect(lastHash(a)).toBeDefined();
+      expect(lastHash(a)).toEqual(lastHash(b));
+      // Replayed with no secret at all: every checkpoint matches.
+      expectReplayed(await rr.replay(a), a);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "masked_keyup_at_a_public_field_diverges_substituted_sensitive",
+    async () => {
+      // The page branches on the key of the keyup that `pinA`'s last
+      // keystroke finishes at `pubA`, a public field: a digit reads
+      // `Math.random()`. On replay that key is `*`, as logged, so the read
+      // is missing, and the divergence names the substitution.
+      const records = await rr.record(
+        "sensitive-focus.html?case=keybranch",
+        async (p) => {
+          const page = p as unknown as SPage;
+          await page.click("#pinA");
+          await page.keyboard.type(FOCUS_SECRETS.pinA);
+          await page.click("#send");
+        },
+      );
+      const keyup = inputsAt(records, "path:#pubA", "keyup");
+      expect(keyup.map((r) => propsOf(r).key)).toEqual(["*"]);
+      const random = indexWhere(records, "Random");
+      expect(random).toBeGreaterThan(-1);
+      const report = await rr.replay(records);
+      expectDiverged(report, "MissingRead", seqAt(records, random));
+      expect(report.divergence?.cause).toBe("substituted-sensitive");
+      expect(report.divergence?.sensitiveRead).toMatchObject({
+        target: "path:#pubA",
+        what: "event.key",
+      });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "characters_a_masked_keystroke_puts_into_a_public_field_replay_masked",
+    async () => {
+      // The insert case of the upload test above, recorded twice with
+      // secrets of one shape: the fields made sensitive hash as the token,
+      // so the checkpoints do not depend on what was typed, and the replay
+      // makes them sensitive where the log's `Scrubbed` says, so it matches.
+      const record = (secrets: InsertSecrets) =>
+        rr.record("sensitive-focus.html?case=insert", async (p) =>
+          driveInsert(p as unknown as SPage, secrets, "abcxyz"),
+        );
+      const second: InsertSecrets = { pinE: "0274", pinF: "8021" };
+      const a = await record(INSERT_SECRETS);
+      const b = await record(second);
+      expectInsertMasked(a, INSERT_SECRETS);
+      expectInsertMasked(b, second);
+      const lastHash = (records: BoundaryRecord[]) =>
+        records
+          .filter((r): r is RecordOf<"Checkpoint"> => r.record === "Checkpoint")
+          .at(-1)?.state_hash;
+      expect(lastHash(a)).toBeDefined();
+      expect(lastHash(a)).toEqual(lastHash(b));
+      expectReplayed(await rr.replay(a), a);
+      expectReplayed(await rr.replay(b), b);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a_public_field_a_masked_keystroke_put_text_into_diverges_substituted_sensitive",
+    async () => {
+      // The page branches on `pubE`'s value after `pinE`'s last character
+      // landed there: a digit first reads `Math.random()`. On replay the
+      // field holds a placeholder, so the read is missing, and the
+      // divergence names the field's value as the substitution.
+      const records = await rr.record(
+        "sensitive-focus.html?case=insertbranch",
+        async (p) => {
+          const page = p as unknown as SPage;
+          await page.click("#pinE");
+          await page.keyboard.type(INSERT_SECRETS.pinE);
+          await page.click("#send");
+        },
+      );
+      expect(valuesAt(records, "path:#pubE")).toEqual([]);
+      expect(scrubbedAt(records, "path:#pubE").length).toBeGreaterThan(0);
+      const random = indexWhere(records, "Random");
+      expect(random).toBeGreaterThan(-1);
+      const report = await rr.replay(records);
+      expectDiverged(report, "MissingRead", seqAt(records, random));
+      expect(report.divergence?.cause).toBe("substituted-sensitive");
+      expect(report.divergence?.sensitiveRead).toMatchObject({
+        target: "path:#pubE",
+        what: "value",
+      });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "masked_keys_at_a_focusable_widget_diverge_substituted_sensitive",
+    async () => {
+      // A widget that takes its own keys and branches on one: `g` reads
+      // Math.random(). Unmarked, it is taken for the host of a closed root
+      // the shim cannot see, its key is masked, and the replay, which hands
+      // the page the logged `*`, takes the other branch and misses the read:
+      // a divergence the page's read of the masked `key` explains.
+      const press = (id: string) =>
+        rr.record("sensitive-closed.html?case=keybranch", async (p) => {
+          const page = p as unknown as SPage;
+          await page.press(`#${id}`, "g");
+          await page.click("#send");
+        });
+      const masked = await press("kneg");
+      const keydown = indexWhere(
+        masked,
+        "Input",
+        (r) => r.type === "keydown" && r.target === "path:#kneg",
+      );
+      expect(propsOf(masked[keydown] as RecordOf<"Input">).key).toBe("*");
+      const random = indexWhere(masked, "Random");
+      const report = await rr.replay(masked);
+      expectDiverged(report, "MissingRead", seqAt(masked, random));
+      expect(report.divergence?.cause).toBe("substituted-sensitive");
+      expect(report.divergence?.sensitiveRead).toMatchObject({
+        target: "path:#kneg",
+        what: "event.key",
+        afterSeq: seqAt(masked, keydown),
+      });
+
+      // The widgets the page declared public: the key is exact in the log
+      // and the replay takes the recorded branch.
+      for (const id of ["kpub", "kct"]) {
+        const exact = await press(id);
+        const keys = inputsAt(exact, `path:#${id}`, "keydown").map(
+          (r) => propsOf(r).key,
+        );
+        expect(keys, id).toEqual(["g"]);
+        expect(indexWhere(exact, "Random"), id).toBeGreaterThanOrEqual(0);
+        expectReplayed(await rr.replay(exact), exact);
+      }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "divergence_cause_distinguishes_substituted_sensitive",
+    async () => {
+      // A branch on the raw value's first character: replay substitutes a
+      // placeholder, takes the other branch, and misses the Random read.
+      const branch = await rr.record(
+        "sensitive.html?case=branch",
+        async (p) => {
+          const page = p as unknown as SPage;
+          await page.type("#pin", "7123");
+          await page.click("#go");
+          await page.click("#finish");
+        },
+      );
+      const random = indexWhere(branch, "Random");
+      const click = indexWhere(
+        branch,
+        "Input",
+        (r) => r.type === "click" && r.target === "path:#go",
+      );
+      const report = await rr.replay(branch);
+      expectDiverged(report, "MissingRead", seqAt(branch, random));
+      expect(report.divergence?.cause).toBe("substituted-sensitive");
+      expect(report.divergence?.sensitiveRead).toMatchObject({
+        target: "path:#pin",
+        what: "value",
+        afterSeq: seqAt(branch, click),
+      });
+      expect(report.divergence?.sensitiveRead?.frames.length).toBeGreaterThan(
+        0,
+      );
+
+      // An edited Random with no sensitive read: a real mismatch.
+      const roll = await rr.record("sensitive.html?case=roll", async (p) => {
+        const page = p as unknown as SPage;
+        await page.click("#roll");
+        await page.click("#finish");
+      });
+      const r = indexWhere(roll, "Random");
+      const edited = replaced<"Random">(roll, r, {
+        bytes: new Uint8Array(8).fill(0x3f),
+      });
+      const mismatch = await rr.replay(edited);
+      expect(mismatch.status).toBe("diverged");
+      expect(mismatch.divergence?.kind).toBe("CheckpointMismatch");
+      expect(mismatch.divergence?.cause).toBe("mismatch");
+      expect(mismatch.divergence?.sensitiveRead).toBeNull();
+    },
+    TIMEOUT,
+  );
+});
+
+// ── The conformance suite's non-interference leg ────────────────────────
+
+/** Run `ct-boundary-conformance noninterference` on `build`. */
+function runNoninterference(
+  build: string,
+  level: 0 | 1,
+): { status: number | null; report: NoninterferenceReport; stderr: string } {
+  const out = path.join(tmp("ct-ni-report-"), "report.json");
+  const r = spawnSync(
+    process.execPath,
+    [
+      CONFORMANCE_CLI,
+      "noninterference",
+      "--build",
+      build,
+      "--level",
+      String(level),
+      "--out",
+      out,
+      // Each step's limit: the CLI's 15 s default is a hang guard that a
+      // replay on a busy host outlasts (measured with eight cores shared by
+      // 64 CPU hogs); nothing here judges how long a step took.
+      "--timeout-ms",
+      "60000",
+    ],
+    { encoding: "utf-8", timeout: TIMEOUT },
+  );
+  if (!fs.existsSync(out)) {
+    throw new Error(
+      `the CLI wrote no report (status ${r.status}): ${r.stderr}`,
+    );
+  }
+  return {
+    status: r.status,
+    report: JSON.parse(fs.readFileSync(out, "utf-8")) as NoninterferenceReport,
+    stderr: r.stderr,
+  };
+}
+
+/** The suite's generic build, installed by the shipped deploy route. */
+async function genericBuild(leakRawRead: boolean): Promise<string> {
+  const dir = path.join(tmp("ct-ni-generic-"), "site");
+  await buildGenericFixtures(dir, { leakRawRead });
+  const hash = execFileSync(process.execPath, [CLI, "bundle-manifest", dir], {
+    encoding: "utf-8",
+  }).trim();
+  execFileSync(
+    process.execPath,
+    [
+      CLI,
+      "boundary-shim",
+      dir,
+      "--build-hash",
+      hash,
+      "--ingest",
+      ROUTES.ingest,
+    ],
+    { stdio: "pipe" },
+  );
+  return dir;
+}
+
+const statusOf = (report: NoninterferenceReport) =>
+  report.fixtures.flatMap((f) =>
+    f.checks.map((c) => `${f.name} ${c.name} ${c.status}`),
+  );
+
+describe("the non-interference leg", () => {
+  it(
+    "conformance_noninterference_passes_shim_and_reference",
+    async () => {
+      const fixtures = ["sensitive-login", "sensitive-email", "sensitive-pin"];
+      const passing = (level: 0 | 1) =>
+        fixtures.flatMap((f) => [
+          `${f} recordings pass`,
+          `${f} declaration ${level === 0 ? "not-applicable-at-level-0" : "pass"}`,
+          // The vacuity guard: the two logs are not byte-identical (some
+          // Declassify.output differs) and the public probe is found.
+          `${f} vacuity pass`,
+          `${f} differs-only-in-declassify pass`,
+          `${f} no-secret-in-batches pass`,
+          `${f} replay-a pass`,
+          `${f} replay-b pass`,
+        ]);
+
+      const generic = runNoninterference(await genericBuild(false), 0);
+      expect(statusOf(generic.report), generic.stderr).toEqual(passing(0));
+      expect(generic.status).toBe(0);
+      const reference = path.join(tmp("ct-ni-reference-"), "site");
+      await buildReferenceFixtures(reference);
+      const ref = runNoninterference(reference, 1);
+      expect(statusOf(ref.report), ref.stderr).toEqual(passing(1));
+      expect(ref.status).toBe(0);
+
+      // The falsifier: a component that branches a request's URL on the
+      // raw value's first character makes the comparison fail, naming the
+      // first record that differs; both levels.
+      const leakyGeneric = runNoninterference(await genericBuild(true), 0);
+      const leakyReference = path.join(tmp("ct-ni-reference-leak-"), "site");
+      await buildReferenceFixtures(leakyReference, { leakRawRead: true });
+      const leakyRef = runNoninterference(leakyReference, 1);
+      for (const run of [leakyGeneric, leakyRef]) {
+        expect(run.status).toBe(1);
+        const check = run.report.fixtures
+          .find((f) => f.name === "sensitive-login")!
+          .checks.find((c) => c.name === "differs-only-in-declassify")!;
+        expect(check.status).toBe("fail");
+        expect(check.detail.join(" ")).toMatch(
+          /^record \d+ differs beyond Declassify\.output: with X \{"record":"NetRequest".*first=a.*with Y \{"record":"NetRequest".*first=b/,
+        );
+      }
+
+      // A framework that ignores the declaration records the value: the
+      // scan finds the secret (the reference's seeded defect).
+      const ignoring = path.join(tmp("ct-ni-reference-ignore-"), "site");
+      await buildReferenceFixtures(ignoring, { leakSensitive: true });
+      const ignored = runNoninterference(ignoring, 1);
+      expect(ignored.status).toBe(1);
+      expect(statusOf(ignored.report)).toEqual(
+        expect.arrayContaining([
+          "sensitive-login no-secret-in-batches fail",
+          "sensitive-email no-secret-in-batches fail",
+          "sensitive-pin differs-only-in-declassify fail",
+        ]),
+      );
+    },
+    TIMEOUT * 2,
+  );
+});

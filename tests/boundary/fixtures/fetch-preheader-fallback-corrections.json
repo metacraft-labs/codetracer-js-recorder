@@ -1,0 +1,24 @@
+{
+  "parent": "aabe50a815833b94eb922f90d990896ea0929341",
+  "entries": [
+    {
+      "file": "packages/boundary-shim/src/browser/seams-net.ts",
+      "parentSha256": "51f444b7979755c2fba48c8315332e2425e759503ac911b7e4dcc40c7992a2bb",
+      "changes": [
+        {
+          "current": "      // Cancellation is proved without the rebuilder: an untracked body keeps\n      // its mirror until that body is unreachable (fetch-cancellation.ts).\n      const cancellation =\n        ids !== undefined\n          ? prepareFetchCancellation(orig, input, init)\n          : undefined;",
+          "parent": "      const cancellation =\n        ids !== undefined && responses !== undefined\n          ? prepareFetchCancellation(orig, input, init)\n          : undefined;"
+        },
+        {
+          "current": "cancellation?.head(resp);",
+          "parent": "cancellation?.head();"
+        }
+      ]
+    },
+    {
+      "file": "packages/boundary-shim/src/browser/replay/net.ts",
+      "parentSha256": "dd91c3abf4bf1f7b1cc82beac6f6a8918a2c4035cd0d1ae440860bfa15900f13",
+      "changes": []
+    }
+  ]
+}

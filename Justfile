@@ -14,13 +14,45 @@ alias fmt := format
 install:
     npm install
 
-# Run all tests (builds workspaces first so imports resolve)
+# Run all tests. Builds the native addon and the workspaces first: the
+# recording tests load `crates/recorder_native/index.node`, which is not
+# committed, so on a clean tree (or after the trace-format siblings move)
+# they must not run against a missing or stale addon. Cargo makes the
+# addon build a no-op when nothing changed.
 test: install
     cargo test --manifest-path crates/recorder_native/Cargo.toml
+    just build-native
     npm run build
     npm test
     just verify-cli-convention
     just verify-request-spans
+    just verify-jsbound-vectors
+
+# Build the two codetracer sibling binaries the boundary replay tests run
+# (tests/boundary/{replay,seeking,sensitive,transport}.test.ts, located by
+# tests/boundary/siblings.ts): `ct-jsbound`, the recording assembler, and
+# `session-manager`, whose `record-web` writes the materialised trace. Needs
+# the `codetracer` sibling checkout (.github/sibling-repos). `--target-dir` is
+# each crate's own `target/`, the directory siblings.ts looks in, so an
+# ambient CARGO_TARGET_DIR cannot put the binaries where the tests do not
+# look; `--locked` builds exactly the sibling's committed Cargo.lock. Not part
+# of `just test`, which developers run without building codetracer; CI runs
+# it before `just test`.
+build-codetracer-test-bins:
+    cargo build --locked --bin ct-jsbound \
+      --manifest-path ../codetracer/libs/jsbound/Cargo.toml \
+      --target-dir ../codetracer/libs/jsbound/target
+    cargo build --locked --bin session-manager \
+      --manifest-path ../codetracer/src/backend-manager/Cargo.toml \
+      --target-dir ../codetracer/src/backend-manager/target
+
+# Verify the vendored JS boundary log vectors (tests/boundary/vectors/)
+# against their SHA256SUMS and, when the codetracer sibling is checked out,
+# against the Rust side that writes them (libs/jsbound/vectors). Re-vendor
+# with `bash scripts/vendor-jsbound-vectors.sh`. Wired into `just lint` and
+# `just test`.
+verify-jsbound-vectors:
+    bash scripts/vendor-jsbound-vectors.sh --check
 
 # Verify the RS-M9 web-request span coverage is present and running.
 # This is a no-silent-skip shell guard — every assertion either passes
@@ -47,9 +79,10 @@ build: install
 format-rust:
     cargo fmt --manifest-path crates/recorder_native/Cargo.toml
 
-# Format TypeScript/JavaScript code
+# Format TypeScript/JavaScript code with the lockfile's prettier (never npx;
+# see scripts/prettier.sh)
 format-js:
-    npx prettier --write "packages/**/*.{ts,js}" "tests/**/*.{ts,js}"
+    bash scripts/prettier.sh --write "packages/**/*.{ts,js}" "tests/**/*.{ts,js}"
 
 # Format Nix files
 format-nix:
@@ -64,11 +97,13 @@ format:
 # Lint Rust code
 lint-rust:
     cargo fmt --check --manifest-path crates/recorder_native/Cargo.toml
-    cargo clippy --manifest-path crates/recorder_native/Cargo.toml
+    cargo clippy --manifest-path crates/recorder_native/Cargo.toml -- -D warnings
 
-# Lint TypeScript/JavaScript code
+# Lint TypeScript/JavaScript code with the lockfile's prettier (never npx;
+# see scripts/prettier.sh)
 lint-js:
-    npx prettier --check "packages/**/*.{ts,js}" "tests/**/*.{ts,js}"
+    bash scripts/prettier.sh --check "packages/**/*.{ts,js}" "tests/**/*.{ts,js}"
+    bash tests/prettier-resolution-test.sh
 
 # Lint Nix files
 lint-nix:
@@ -81,6 +116,7 @@ lint:
     just lint-nix
     just verify-cli-convention
     just verify-request-spans
+    just verify-jsbound-vectors
 
 # Bump version across all package.json files
 # (usage: just bump-version 0.2.0  or  just bump-version patch / minor / major)
@@ -113,7 +149,7 @@ bump-version version:
         print(f"{f} -> {new}")
 
 # --- M13: Packaging UX Standardization ---
-# Implements Repo-Requirements.md §2.8 packaging UX for the JS
+# Implements Repo-Requirements.md §2.5 packaging UX for the JS
 # language-ecosystem recorder. Single channel: npm.
 
 # Build a release artifact for the given channel.
@@ -263,3 +299,8 @@ record-mixed-request-panel-fixture OUT:
     [[ ${#containers[@]} == 1 ]]
     mkdir -p "$(dirname '{{OUT}}')"
     cp "${containers[0]}" '{{OUT}}'
+
+# Entering the dev shell from another git repository must write nothing there.
+# Runs `nix develop`, so it is not part of the in-shell test recipes.
+test-dev-shell:
+    bash tests/test_dev_shell_writes_nothing_elsewhere.sh

@@ -33,7 +33,19 @@ npm run bench
 This is a monorepo managed with npm workspaces:
 
 * `packages/cli` — CLI entry point (`codetracer-js-recorder` binary).
-  Provides `instrument`, `record` and `read-spans` subcommands.
+  Provides `instrument`, `record`, `read-spans`, `boundary-shim` and
+  `bundle-manifest` subcommands. `instrument` is deterministic: files are
+  instrumented in sorted order (`sortedFilesUnder` in
+  `packages/instrumenter/src/files.ts`, never the filesystem's order), every
+  output declares the recorder version (`packages/instrumenter/src/version.ts`),
+  and `--relative-paths` makes the output independent of where the bundle sits
+  (the post-bundle replay build). `bundle-manifest` writes `ct-bundle.json` and
+  prints the build hash (`packages/boundary-shim/src/bundle-manifest.ts`).
+  Pinned by `tests/integration/deterministic-instrumentation.test.ts`.
+* `packages/{esbuild,rollup,webpack,vite}-plugin` — bundler plugins. Each numbers
+  every module in the merged manifest (`ManifestAccumulator`, see below) and
+  emits `codetracer.manifest.json` and a source map; the real bundlers (root
+  devDependencies) run them in `tests/integration/bundler-plugins.test.ts`.
 * `packages/express` — Express middleware emitting one web-request span per
   request into the recorded `.ct` container (RS-M9); see
   `docs/web-request-spans.md`.
@@ -43,6 +55,292 @@ This is a monorepo managed with npm workspaces:
   instrumentation using SWC.
 * `packages/runtime` — Runtime library injected into instrumented programs
   to capture trace events.
+* `packages/boundary-format` — encoder and strict decoder of the browser
+  boundary log (`jsbound.log`). Held to the byte vectors the Rust
+  implementation in codetracer `libs/jsbound` writes; they are vendored in
+  `tests/boundary/vectors/` by `scripts/vendor-jsbound-vectors.sh` (re-run it
+  after the Rust side regenerates them; `just verify-jsbound-vectors` checks
+  the copy).
+* `packages/boundary-shim` — the generic boundary-recording shim (record mode):
+  patches a page's nondeterminism seams and writes the boundary log with
+  `packages/boundary-format`. Its browser half is bundled into
+  `dist/boundary-shim.iife.js` and inserted first in `<head>` by
+  `codetracer-js-recorder boundary-shim <html|dir>` or the vite plugin's
+  `codetracerBoundaryShimPlugin`. Where the bootstrap goes (`bootstrapPosition`,
+  `src/placement.ts`) is found with the HTML tokenizer in `src/html-scan.ts`,
+  never a text search (a `<head>` in a comment or a script is not the head);
+  the replay runner's gates use the same scanner, so record and replay agree
+  on positions (`tests/boundary/bootstrap-placement.test.ts`). The page's
+  encoding declaration must stay in the first 1024 bytes for the encoding
+  prescan: the bootstrap follows a declaration that only inert elements
+  (a title, comments, `<meta>` elements that declare nothing) precede, and
+  otherwise a copy of the declaration (`<meta charset=<label>>`) goes right
+  before it, marked by the bootstrap's `data-codetracer-boundary-shim=charset`
+  so that stripping removes both (the build hash is the page's) and the
+  replay runner puts the same copy before its stand-in. Only when asked (`--import-seam`, the
+  vite plugin's `importSeam`; never by default, since it changes the page's
+  own code) the same deploy step rewrites every dynamic `import()` of the
+  site's scripts (and of its pages' inline scripts) into a call of the shim's
+  seam, `__ctBoundaryImport` (`src/import-seam.ts`, found with SWC, never as
+  text), and the shim declares `import-seam` in `Header.capabilities`;
+  `bundle-manifest` hashes files with the seam removed, so the build hash
+  does not change. The replay runner applies the same rewrite to everything
+  it serves, at both levels, and in a session that does not declare the seam
+  the replay runtime's own `__ctBoundaryImport` ends the replay
+  `NonReplayable` at the page's first dynamic import, a level-1 session's
+  included (`tests/boundary/import-seam.test.ts`,
+  `tests/boundary/replay-resources.test.ts`, whose
+  `replay_refuses_a_dynamic_import_of_a_level_1_session` runs the
+  conformance suite's reference framework).
+  Its browser tests
+  (`tests/boundary/record-shim.test.ts`) run real headless Chromium, which the
+  dev shell provides (`PLAYWRIGHT_CORE_PATH`, `PLAYWRIGHT_BROWSERS_PATH`).
+* `packages/runtime-browser/src/batch-transport.ts` — `HttpBatchTransport`,
+  the batched upload transport of boundary recording: a capped ring with
+  drop accounting, batches of at most 256 records or the flush deadline (50 ms
+  for a session's first 8 batches, then doubled by each batch it cuts, up to
+  2 s) with the Boundary-Ingest envelope (`encodeBatch` from
+  `packages/boundary-format`, never a second codec), a `keepalive` fetch
+  without credentials at `pagehide`/hidden (`sendBeacon` only as its
+  fallback: a beacon always sends cookies), and the consent
+  gates (DNT, GPC, the page's consent callback, the ingest's `config`). The
+  shim uses it when installed with `boundary-shim --ingest <url>` and imports
+  it by its subpath (`@codetracer/runtime-browser/dist/batch-transport.js`)
+  so the shim bundle carries no `__ct` runtime; cooperating frameworks can
+  use it the same way. Every platform function it calls is a captured
+  original, or its timers and requests would be recorded as the page's.
+  Without `--ingest` the shim keeps its log in the page (`log()`), which is
+  what the replay and shim tests read. Pinned by
+  `tests/boundary/transport.test.ts` against a local stub ingest
+  (`tests/boundary/stub-ingest.ts`, the one allowed mock until the real
+  ingest exists).
+* `packages/boundary-conformance` — the conformance suite of the
+  boundary-recording cooperation protocol, the definition of "a framework
+  implements the protocol": the fixture scenarios (`src/fixtures.ts`), the
+  record-leg harness `ct-boundary-conformance record --build <dir> --level
+  <0|1>` (a real server and headless Chromium; the checks in
+  `src/checks.ts`), the suite's generic build for the shim at level 0 (installed with
+  `--ingest /ct-conformance`: at both levels the log is the batches the
+  harness's server received), and a
+  **test-only** reference micro-framework at level 1 (`src/reference/`, with
+  seeded defects) that proves the harness discriminates. It is a public
+  contract other repositories run against their own builds, so the fixture
+  pages' `data-fx` names and the `/ct-conformance/` routes are part of it.
+  The checkpoint cadence oracle (`src/cadence.ts`) is the one implementation
+  of that rule; the shim's own tests call it too. The probe's `dom-v1`
+  serialiser (`src/browser/probe.ts`) is deliberately a second, independent
+  implementation of the scheme, the oracle the recorders' hashes are checked
+  against; do not replace it with the shim's. Pinned by
+  `tests/boundary/conformance.test.ts`. `packages/boundary-format` also has
+  the batch envelope codec (`batch.ts`, `encodeBatch`/`parseBatch`) the suite
+  checks uploads with, held to the Rust parser by the shared batch vectors
+  (`tests/boundary/vectors/batches.json`).
+  The suite's third leg, `ct-boundary-conformance noninterference`
+  (`src/noninterference.ts`), records each fixture with sensitive fields
+  (`sensitive-login`, `-email`, `-pin`) twice with two secrets, the clocks
+  and random sources pinned by an init script and one server origin, and
+  checks the logs differ only in `Declassify.output`, no secret reaches a
+  batch, and each log replays with placeholders. Its falsifier is a build
+  option of both suite builds (`leakRawRead`); it must keep failing.
+* Sensitive inputs (`packages/runtime-browser/src/sensitive.ts`, re-exported
+  as `packages/boundary-shim/src/browser/sensitive.ts`): which
+  field is sensitive, the shape-preserving placeholders, the hole token's
+  substitution, event masking and the page's `ct` API (`public`,
+  `sensitive`, `declassify`, `mark`). One module for record and replay, the shim,
+  the reference framework and the browser error reporter (below), so it lives
+  in `runtime-browser`, which the shim depends on, and so does `scrub.ts`
+  (likewise re-exported by the shim); its state lives on the window under a registered
+  symbol because the recorder, the replay shim, the replay runtime and a
+  framework are separate bundles. Every record is scrubbed before it is
+  encoded by one function (`record-scrub.ts`, the `Recorder`'s `sanitize`):
+  never scrub at a seam, or a new seam writes an unscrubbed URL. The
+  transport sends nothing before the ingest's `config`, whose scrub lists
+  the recorder applies to the frames still held then (`onConfig`). Replay
+  compares a URL with `<scrubbed>` as a wildcard (`urlMatches` in `scrub.ts`)
+  and an error by its template. An undeclared free-text field is sensitive,
+  so a test page that shows what was typed must mark the field
+  `data-ct-public`. An input event's field is found through shadow trees
+  (`eventField`: the composed path, the roots `attachShadow` made, and a
+  fail-closed rule for a tree the shim cannot see into, `textEventMaskedAt`:
+  a closed root the HTML parser attaches is invisible to scripts, so a
+  printable key at an element that could host one is masked, `body` only
+  while it matches `:focus`, unless the page declared that element public;
+  the recorder also remembers the values the page reads from sensitive
+  fields inside any shadow tree, `rememberShadowFieldReads`), and what a
+  `MutationObserver` hands the page is holed where it names a sensitive
+  field's text, on both sides by `mutationRecordsJson`, as `dom-v1` holes a
+  sensitive field's value, its `value` attribute and a sensitive textarea's
+  text: frameworks mirror a controlled field's value into the DOM. A
+  keystroke is masked as a whole (`keystrokeMasked`: the `keypress`, `keyup`
+  and repeated `keydown`s of a key whose `keydown` was masked are masked
+  wherever focus has moved), and a field such a keystroke puts its
+  character into becomes sensitive (`keystrokeTaints`, `SensitiveState.tainted`),
+  told to replay by a `Scrubbed` that `applyScrubbed` reads the same way;
+  an input method's `Process` keys and a `Dead` key have their `code`
+  masked. Pinned by `tests/boundary/sensitive.test.ts`.
+* The browser error reporter (`packages/runtime-browser/src/error-report.ts`,
+  `installErrorReporter`): a window `error` of a script error or an
+  `unhandledrejection` becomes one report, scrubbed by the boundary log's
+  own rules (`scrubErrorReport`: sensitive values holed, the message
+  templated, every URL scrubbed), carrying the server-rendered response's W3C
+  `traceparent` (`trace-context.ts`: a `<meta name="traceparent">`, else the
+  navigation's `Server-Timing` `traceparent` entry), and uploaded to the
+  site's endpoint without credentials or referrer. Inert unless `enabled:
+  true` with an `http(s)` endpoint; nothing at all under Do Not Track or
+  Global Privacy Control (`privacySignal`, the transport's predicate); each
+  report is sent only when the page's consent callback, shown it as it would
+  be sent, answers yes. Its platform functions are captured originals, like
+  the transport's, the timeline's `getEntriesByType` included (on a page the
+  shim records, the patched one logs each read as the page's). Error frames
+  are parsed by `error-frames.ts`, which the shim's `Error` record uses too.
+  The shim writes the same trace context, by the same reader, into its
+  `Env` record's `traceparent` when it reads `Env` (`readEnvironment` in
+  `install.ts`): a `<meta name="traceparent">` counts only when it precedes
+  the bootstrap (before the page's encoding declaration, which the bootstrap
+  follows), the `Server-Timing` entry always. Pinned by
+  `tests/browser/error-report.test.ts`: real Chromium against a page whose
+  request the real OpenTelemetry Python SDK traces
+  (`tests/browser/fixtures/error-report/server.py`, run with the dev shell's
+  `CT_OTEL_PYTHON`), with negative controls and falsifiers (a mutated
+  reporter or shim built for each) that must keep showing the defect.
+* What a level-0 page declares for its session's narrative
+  (`packages/boundary-shim/src/browser/declarations.ts`): its experiment arms
+  (`data-ct-arms` on the document element, written as `Env.arms`), its
+  controls' labels (`data-ct-label` on an element or an ancestor, written as
+  `Input.label`) and its marks (`ct.mark(name, data)`, written as `Mark`; not
+  logged inside a declassifier's body; a no-op on replay, which skips
+  marks). The shim reads only these declarations, never the page's text, and
+  holes a label and a mark like a URL. Pinned by
+  `tests/boundary/declarations.test.ts`.
+* `packages/boundary-replay` — the replay runner of boundary recording:
+  `ct-boundary-replay --log <recording.ct|jsbound.log> --build <dir> [--out
+  <trace.ct>]` replays a recorded log in headless Chromium against the build
+  it ran (`replaySession` in `src/runner.ts`), reports the first divergence
+  as a typed error and, with `--out`, instruments the build itself and writes
+  the materialised trace through codetracer's `session-manager record-web`,
+  passing it the trace's recording id (`materialisedRecordingId`, derived from
+  the session, so a trace written again is byte-identical). The replay reaches
+  no network: the runner's routing answers every HTTP request, and the
+  context's proxy is a listener of the runner's that refuses every connection
+  the routing never sees (a WebSocket of a realm the shim does not patch, such
+  as a same-origin frame's own `WebSocket`); only the trace stream's own
+  `record-web` host bypasses it (`proxyBypass`), and the report counts the
+  refused connections (`refusedConnections`). WebRTC's STUN and media go
+  over UDP, which no proxy carries, so the browser the runner launches
+  (`launchReplayBrowser`, `REPLAY_BROWSER_ARGS`) keeps WebRTC to proxied
+  connections; a browser handed to `replaySession` must be launched the
+  same way. `record-web` is started with `--workdir /` (`TRACE_WORKDIR`),
+  so the trace names the build's files relative to the recorded origin's
+  root and the same session gives the same bytes from any working
+  directory (`replay_writes_the_same_trace_from_any_working_directory` in
+  `tests/boundary/replay.test.ts`). Playwright's `routeWebSocket`
+  must not be used for this: it installs a wrapper in the page's own world
+  that the replayed page observes (its socket ids are `crypto.getRandomValues`
+  reads the log does not have). Pinned by `tests/boundary/replay-resources.test.ts`
+  `replay_lets_no_request_of_an_unpatched_realm_reach_the_network`. `--seq-from` and
+  `--seq-to` materialise a range: the replay runs from the start with `__ct`
+  emission off until the last checkpoint at or before the range's start and
+  stops at the first checkpoint at or after its end, both found in the
+  recording's `jsbound.chk` (`rangeBounds`; the in-page runtime's `gateTrace`
+  wraps the `__ct` methods). A bound is only ever a checkpoint where no
+  instrumented frame is open (an `async` function or a generator suspended
+  across it): `gateTrace` counts the frames entered and not yet returned
+  from whether emission is on or not, the replay stops at the first
+  checkpoint at or after the end with none open, and a start with frames
+  open moves to the last earlier checkpoint with none, by replaying a second
+  time (`quiescentBounds`); the trace's `seq-range` arg and the report's
+  `range` give the bounds it actually has. This relies on every call
+  reporting its exit, including one that falls off its end after an early
+  `return` elsewhere (`completesNormally` in
+  `packages/instrumenter/src/visitor.ts`). The reader refuses a `jsbound.chk` that disagrees
+  with the log (`verifyCheckpointIndex` in `packages/boundary-format`), and a
+  divergence reports the last checkpoint that matched. Pinned by
+  `tests/boundary/seeking.test.ts`. Its in-page half
+  (`src/browser/runtime.ts`, bundled to `dist/replay-runtime.iife.js`) is `__ctReplay`, the one cursor every replayed
+  read is matched against, and the scheduler that owns the page's tasks. The
+  document's own loading (the parser's progress, external scripts,
+  `DOMContentLoaded`, `load`) is held back to the points the log has
+  (`Loading` and `DocTask` records, written by
+  `packages/boundary-shim/src/browser/document-progress.ts` on both sides)
+  by the runner's gates (`src/gates.ts`), pinned by `tests/boundary/gates.test.ts`
+  and the slow-loading session of `tests/boundary/replay.test.ts`. A position
+  counts the document's text and comments as well as its elements
+  (`Loading.text`), and the parser gates sit at every token boundary where a
+  `<script>` leaves the tree as it was, so a task released while the document
+  parses sees the text it saw on record; a position inside a run of text
+  (the network cut it) is a typed divergence (`TaskOrderMismatch`). Pinned by
+  `tests/boundary/replay-loading-text.test.ts`. An external script's
+  `DocTask` 1 and the `Loading` before it are written at the script's first
+  record, so the position counts what the script changed before it; replay
+  lets such a script go where the parser waits for it and takes the two at
+  its first read (`takeScriptStart`); one that settles without that read,
+  or an `async` one run while the parser waited for the network (nothing
+  holds the replay's parser there), is a typed divergence at that
+  `Loading`. Pinned by `tests/boundary/replay-script-start.test.ts`. A gate runs at almost every
+  token boundary, so nothing it does may cost the size of the document:
+  while the document parses the position is counted from its mutation
+  records (`src/browser/parse-census.ts`, held to the whole-document count,
+  `DocumentProgress.fullPosition`, by `tests/boundary/parse-census.test.ts`),
+  and a gate removes itself, never by searching the document's scripts (a
+  live collection Blink recounts after every change to the tree: a 500 KB
+  page took a minute to replay that way). So are the
+  events of resource elements (an image's, a style sheet's, a frame's `load`
+  and `error`, a media element's events; `DocTask` kind 5, decided by
+  `packages/boundary-shim/src/browser/resource-events.ts` on both sides):
+  the runner holds the resource's request until its `DocTask`, and the
+  platform's other resource events are held back and dispatched from the log;
+  a frame's navigation is answered from the build; a dynamic `import()` (in a
+  session that declares the seam) starts only when its module's reads come due. Pinned by
+  `tests/boundary/replay-resources.test.ts`, whose runner test seam
+  `responseDelayMs` replays a resource slower than it was recorded. The
+  generic shim's replay mode is `packages/boundary-shim/src/browser/replay/`
+  (its own bundle, `dist/boundary-shim-replay.iife.js`, so recorded pages never
+  carry it), a client of `__ctReplay`; so is the reference framework's replay
+  mode. Every value a page reads is answered from the log or was refused on
+  record: the events replay dispatches in the platform's place reach the
+  page's listeners through `replay/trusted.ts` (a view whose `isTrusted` is
+  `true`), and the values of observers, the performance timeline and idle
+  deadlines are `PlatformValue` records (`entries.ts`, one JSON form for both
+  sides); so are the platform's own state the page reads (the referrer, the
+  navigator's, the screen's, the network's, the fonts', a socket's
+  `bufferedAmount`; src 8) and the outcomes of the platform promises that
+  report on it (src 9, after their platform task's `Task`, which the shim
+  settles in a task of its own, a message task, never a timer, which HTML
+  clamps when nested), both in `seams-environment.ts` and
+  `replay/environment.ts`, one table of reads for both sides; what cannot be
+  recorded faithfully there (a canvas read back, the clipboard's contents,
+  the Cache API, a permission's status, a battery, the visitor's position, a
+  camera's stream) is refused. The page's visibility, focus and viewport
+  state are read the same way (src 8, and the window's geometry and each
+  read of a media query list's `matches` as `LayoutRead`s), and the events
+  that report their changes are input (`seams-dom.ts` `INPUT_EVENT_TYPES`; a
+  media query list's `change` at target `mql:<n>`, the visual viewport's at
+  `visualViewport`; a notification's `show`, `click`, `close` and `error`
+  at `notification:<n>`, `seams-notification.ts` and `replay/notification.ts`). A trusted event the page's own code dispatches inside
+  a call (`focus()`, `requestSubmit()`) is never input: script lies below
+  its listener (`dispatchedFromScript`), and replay lets it through by the
+  same test (`jsStackDepth` in `replay/dom.ts`, measured against the depth
+  of the injected event's listeners, which the shim's first listener on
+  every injectable target records: `ReplayContext.injection`). Both read
+  the stack through the realm's own `Error`, captured before page code
+  (`NativeError` in `seams-dom.ts`): a page that replaces the global
+  `Error` must not make every event look dispatched from script. `document.fonts.ready` and
+  `FontFace.loaded` keep their identity across reads: each read logs which
+  promise it handed. The upload transport and the `__ct` runtime read
+  `document.visibilityState` through the captured original
+  (`originals.visibilityState`), never as the page. Each such value is pinned by `tests/boundary/replay-values.test.ts`,
+  which records a fixture case, replays it to `End`, and replays it again with
+  the value edited, which must diverge. A `.ct` is read through the native addon's `readCtfsMember` (the
+  canonical CTFS reader), never a second container decoder. The conformance
+  suite's replay leg (`ct-boundary-conformance replay`,
+  `packages/boundary-conformance/src/replay-leg.ts`) runs it. Pinned by
+  `tests/boundary/replay.test.ts`, which needs two codetracer sibling binaries
+  besides `ct-print`: `session-manager` (`cargo build --bin session-manager` in
+  `codetracer/src/backend-manager`) and `ct-jsbound` (`cargo build --bin
+  ct-jsbound` in `codetracer/libs/jsbound`), or `CODETRACER_SESSION_MANAGER` and
+  `CT_JSBOUND`; without them it fails, naming the build command.
+  `tests/boundary/{seeking,sensitive,transport}.test.ts` need them too.
+  `just build-codetracer-test-bins` builds both; CI runs it before `just test`.
 * `crates/recorder_native` — Rust N-API addon (via napi-rs) for writing
   trace files in binary (CBOR+zstd) and JSON formats.
 * `tests/` — End-to-end integration tests.
@@ -66,6 +364,11 @@ touch:
    the recording daemon. New instrumenter arguments are accepted and ignored
    here unless that protocol is extended too.
 
+The two browser implementations (1 as `runtime-browser`, and 3) must make their
+own timers and sockets through the platform functions as they were before a
+boundary shim patched them (`resolveOriginals` in `runtime-browser`), or the
+recorder's flush timer is recorded as a task of the page.
+
 ## Manifest ids are minted in the MERGED numbering, never per file
 
 `__ct.step(siteId)` / `__ct.write(siteId)` / `__ct.enter(fnId)` / `__ct.ret(fnId)`
@@ -78,7 +381,7 @@ So a caller that instruments several files must ask
 `nextManifestIdBases(slicesSoFar)` **before** each `instrument()` call and pass
 it as `idBases`, then merge in the same order with `mergeManifestSlices`. That
 merge is the single implementation (`packages/instrumenter/src/merge.ts`), used
-by `record`, `instrument` and the vite plugin's `ManifestAccumulator`; it places
+by `record`, `instrument` and every bundler plugin's `ManifestAccumulator`; it places
 each slice at its declared base and throws `ManifestIdBaseMismatchError` rather
 than mis-attributing.
 

@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>a script whose first read depends on a value read before it</title>
+    <script>
+      window.scriptStartQuiet =
+        localStorage.getItem("script-start-quiet") === "1";
+    </script>
+  </head>
+  <body>
+    <ul id="out"></ul>
+    <div id="host"></div>
+    <script src="script-start.js"></script>
+    <p id="after">markup the parser inserts after the script</p>
+  </body>
+</html>

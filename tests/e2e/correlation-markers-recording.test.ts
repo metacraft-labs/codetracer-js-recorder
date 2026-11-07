@@ -361,31 +361,38 @@ describe("test_correlation_markers_recorded_end_to_end", () => {
     expect(control.index.entries).toHaveLength(0);
   });
 
-  it("announces the index in the recording's header", () => {
-    // `meta.dat` bit 14 (contract §12). It is a hint rather than a gate —
-    // the container's file entry is the authority — but it is the cheapest
-    // possible answer to "is this recording worth opening for a marker
-    // lookup", and the flag must track reality in BOTH directions or it
-    // is worse than absent.
-    expect(declared.bundle.metadata.flags?.has_correlation_index).toBe(true);
-    expect(control.bundle.metadata.flags?.has_correlation_index).toBe(false);
+  it("is found by the index's presence, not by a header flag", () => {
+    // `meta.dat` is complete at the recording's first record, before any
+    // marker is declared, so the header cannot announce an index created
+    // during recording: its correlation-index bit stays clear in BOTH
+    // recordings, and the container's `corrmark.ns` entry is the only
+    // answer to "is this recording indexed".
+    expect(declared.bundle.metadata.flags?.has_correlation_index ?? false).toBe(
+      false,
+    );
+    expect(control.bundle.metadata.flags?.has_correlation_index ?? false).toBe(
+      false,
+    );
+    expect(declared.index.correlation_index).toBe("present");
+    expect(control.index.correlation_index).toBe("absent");
   });
 
   it("carries the marker in the metadata slot, with empty content", () => {
     // What the marker looks like as an event is now the SHARED WRITER's
     // decision, not this recorder's — `registerCorrelationMarkerById`
-    // writes `registerIOEvent(ioStdout, [], payload)`.
+    // writes it as a `Write` event with empty content and the payload in
+    // the metadata slot.
     //
     // This changed when the recorder became a binding, and it is
     // user-visible, so it is pinned rather than left to drift: before,
     // this recorder wrote the marker as an `ioStderr` event whose content
     // was its own `{"key":…,"payload":…}` JSON. A marker now shows up in
-    // an output view as an EMPTY STDOUT WRITE. Nothing is lost — the key
+    // an output view as an EMPTY `Write`. Nothing is lost — the key
     // and the shown value are both in the payload above, and `ct-print
     // --markers` renders them — but a consumer that printed a marker's
     // content now prints nothing.
     for (const m of markerEvents(declared.bundle)) {
-      expect(m.io_kind).toBe("ioStdout");
+      expect(m.io_kind).toBe("Write");
       expect(m.bytes_len).toBe(0);
       expect(m.text ?? "").toBe("");
     }

@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>an async script that changes the document while the parser waits for the network</title>
+  </head>
+  <body>
+    <ul id="out"></ul>
+    <div id="host"></div>
+    <script async src="script-start.js"></script>
+    <!--ct:chunk-->
+    <p id="after">markup that arrives after the script ran</p>
+  </body>
+</html>

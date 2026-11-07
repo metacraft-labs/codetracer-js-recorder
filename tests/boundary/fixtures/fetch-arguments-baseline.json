@@ -1,0 +1,656 @@
+{
+  "source": "567dd9f8aa298603df61a1cff8efbe0139a39a52",
+  "browser": "146.0.7680.164",
+  "cases": {
+    "plain-abort": {
+      "native": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "AbortError",
+          "message": "signal is aborted without reason",
+          "sameReason": true,
+          "sameThrown": false
+        }
+      },
+      "record": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "AbortError",
+          "message": "signal is aborted without reason",
+          "sameReason": true,
+          "sameThrown": false
+        }
+      }
+    },
+    "validation-signal": {
+      "native": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "Failed to execute 'fetch' on 'Window': Failed to read the 'signal' property from 'RequestInit': Failed to convert value to 'AbortSignal'.",
+          "sameReason": false,
+          "sameThrown": false
+        }
+      },
+      "record": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "Failed to execute 'fetch' on 'Window': Failed to read the 'signal' property from 'RequestInit': Failed to convert value to 'AbortSignal'.",
+          "sameReason": false,
+          "sameThrown": false
+        }
+      }
+    },
+    "validation-url": {
+      "native": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "Failed to execute 'fetch' on 'Window': Failed to parse URL from http://[",
+          "sameReason": false,
+          "sameThrown": false
+        }
+      },
+      "record": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "Failed to execute 'fetch' on 'Window': Failed to parse URL from http://[",
+          "sameReason": false,
+          "sameThrown": false
+        }
+      }
+    },
+    "validation-method": {
+      "native": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "Failed to execute 'fetch' on 'Window': 'bad method' is not a valid HTTP method.",
+          "sameReason": false,
+          "sameThrown": false
+        }
+      },
+      "record": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "Failed to execute 'fetch' on 'Window': 'bad method' is not a valid HTTP method.",
+          "sameReason": false,
+          "sameThrown": false
+        }
+      }
+    },
+    "validation-body": {
+      "native": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "Failed to execute 'fetch' on 'Window': Request with GET/HEAD method cannot have body.",
+          "sameReason": false,
+          "sameThrown": false
+        }
+      },
+      "record": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "Failed to execute 'fetch' on 'Window': Request with GET/HEAD method cannot have body.",
+          "sameReason": false,
+          "sameThrown": false
+        }
+      }
+    },
+    "validation-header": {
+      "native": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "Failed to execute 'fetch' on 'Window': Invalid name",
+          "sameReason": false,
+          "sameThrown": false
+        }
+      },
+      "record": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "Failed to execute 'fetch' on 'Window': Invalid name",
+          "sameReason": false,
+          "sameThrown": false
+        }
+      }
+    },
+    "getters": {
+      "native": {
+        "trace": ["body", "headers", "method", "signal"],
+        "receivers": [true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "name": "AbortError",
+          "message": "signal is aborted without reason",
+          "sameReason": true,
+          "sameThrown": false
+        }
+      },
+      "record": {
+        "trace": ["method", "body", "body", "headers", "method", "signal"],
+        "receivers": [true, true, true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "name": "AbortError",
+          "message": "signal is aborted without reason",
+          "sameReason": true,
+          "sameThrown": false
+        }
+      }
+    },
+    "changing": {
+      "native": {
+        "trace": ["body", "headers", "method", "signal"],
+        "receivers": [true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"POST\",\"body\":\"body-1\"}"
+        }
+      },
+      "record": {
+        "trace": [
+          "method",
+          "body",
+          "body",
+          "body",
+          "headers",
+          "method",
+          "signal"
+        ],
+        "receivers": [true, true, true, true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"PUT\",\"body\":\"body-3\"}"
+        }
+      }
+    },
+    "coercions": {
+      "native": {
+        "trace": [
+          "url.toString",
+          "body",
+          "headers",
+          "header.toString",
+          "method",
+          "method.toString",
+          "signal"
+        ],
+        "receivers": [true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"POST\",\"body\":\"native body\"}"
+        }
+      },
+      "record": {
+        "trace": [
+          "method",
+          "method.toString",
+          "url.toString",
+          "body",
+          "body",
+          "url.toString",
+          "body",
+          "headers",
+          "header.toString",
+          "method",
+          "method.toString",
+          "signal"
+        ],
+        "receivers": [true, true, true, true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"POST\",\"body\":\"native body\"}"
+        }
+      }
+    },
+    "request-missing": {
+      "native": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "AbortError",
+          "message": "signal is aborted without reason",
+          "sameReason": true,
+          "sameThrown": false
+        }
+      },
+      "record": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "AbortError",
+          "message": "signal is aborted without reason",
+          "sameReason": true,
+          "sameThrown": false
+        }
+      }
+    },
+    "request-signal-shadow": {
+      "native": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "AbortError",
+          "message": "signal is aborted without reason",
+          "sameReason": true,
+          "sameThrown": false
+        }
+      },
+      "record": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "AbortError",
+          "message": "signal is aborted without reason",
+          "sameReason": true,
+          "sameThrown": false
+        }
+      }
+    },
+    "request-undefined": {
+      "native": {
+        "trace": ["signal"],
+        "receivers": [true],
+        "returnedPromise": true,
+        "value": {
+          "name": "AbortError",
+          "message": "signal is aborted without reason",
+          "sameReason": true,
+          "sameThrown": false
+        }
+      },
+      "record": {
+        "trace": ["signal"],
+        "receivers": [true],
+        "returnedPromise": true,
+        "value": {
+          "name": "AbortError",
+          "message": "signal is aborted without reason",
+          "sameReason": true,
+          "sameThrown": false
+        }
+      }
+    },
+    "request-null": {
+      "native": {
+        "trace": ["signal"],
+        "receivers": [true],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"GET\",\"body\":\"\"}"
+        }
+      },
+      "record": {
+        "trace": ["signal"],
+        "receivers": [true],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"GET\",\"body\":\"\"}"
+        }
+      }
+    },
+    "request-shadow": {
+      "native": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "name": "AbortError",
+          "message": "signal is aborted without reason",
+          "sameReason": true,
+          "sameThrown": false
+        }
+      },
+      "record": {
+        "result": {
+          "trace": ["request.method"],
+          "receivers": [],
+          "returnedPromise": true,
+          "value": {
+            "name": "AbortError",
+            "message": "signal is aborted without reason",
+            "sameReason": true,
+            "sameThrown": false
+          }
+        },
+        "identity": true,
+        "receiver": true,
+        "args": true,
+        "terminal": {
+          "record": "Refusal",
+          "seq": "1",
+          "feature": "recorder-fault",
+          "detail": "Error: argument getter sentinel"
+        }
+      }
+    },
+    "throw-body": {
+      "native": {
+        "trace": ["body"],
+        "receivers": [true],
+        "returnedPromise": true,
+        "value": {
+          "name": "Error",
+          "message": "argument getter sentinel",
+          "sameReason": false,
+          "sameThrown": true
+        }
+      },
+      "record": {
+        "result": {
+          "trace": ["method", "body", "body"],
+          "receivers": [true, true, true],
+          "returnedPromise": true,
+          "value": {
+            "name": "Error",
+            "message": "argument getter sentinel",
+            "sameReason": false,
+            "sameThrown": true
+          }
+        },
+        "identity": true,
+        "receiver": true,
+        "args": true,
+        "terminal": {
+          "record": "Refusal",
+          "seq": "1",
+          "feature": "recorder-fault",
+          "detail": "Error: argument getter sentinel"
+        }
+      }
+    },
+    "throw-headers": {
+      "native": {
+        "trace": ["body", "headers"],
+        "receivers": [true, true],
+        "returnedPromise": true,
+        "value": {
+          "name": "Error",
+          "message": "argument getter sentinel",
+          "sameReason": false,
+          "sameThrown": true
+        }
+      },
+      "record": {
+        "trace": ["method", "body", "body", "headers"],
+        "receivers": [true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "name": "Error",
+          "message": "argument getter sentinel",
+          "sameReason": false,
+          "sameThrown": true
+        }
+      }
+    },
+    "throw-method": {
+      "native": {
+        "trace": ["body", "headers", "method"],
+        "receivers": [true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "name": "Error",
+          "message": "argument getter sentinel",
+          "sameReason": false,
+          "sameThrown": true
+        }
+      },
+      "record": {
+        "result": {
+          "trace": ["method", "body", "headers", "method"],
+          "receivers": [true, true, true, true],
+          "returnedPromise": true,
+          "value": {
+            "name": "Error",
+            "message": "argument getter sentinel",
+            "sameReason": false,
+            "sameThrown": true
+          }
+        },
+        "identity": true,
+        "receiver": true,
+        "args": true,
+        "terminal": {
+          "record": "Refusal",
+          "seq": "1",
+          "feature": "recorder-fault",
+          "detail": "Error: argument getter sentinel"
+        }
+      }
+    },
+    "throw-signal": {
+      "native": {
+        "trace": ["body", "headers", "method", "signal"],
+        "receivers": [true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "name": "Error",
+          "message": "argument getter sentinel",
+          "sameReason": false,
+          "sameThrown": true
+        }
+      },
+      "record": {
+        "trace": ["method", "body", "body", "headers", "method", "signal"],
+        "receivers": [true, true, true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "name": "Error",
+          "message": "argument getter sentinel",
+          "sameReason": false,
+          "sameThrown": true
+        }
+      }
+    },
+    "throw-headers-typeerror": {
+      "native": {
+        "trace": ["body", "headers"],
+        "receivers": [true, true],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "argument getter sentinel",
+          "sameReason": false,
+          "sameThrown": true
+        }
+      },
+      "record": {
+        "trace": ["method", "body", "body", "headers"],
+        "receivers": [true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "argument getter sentinel",
+          "sameReason": false,
+          "sameThrown": true
+        }
+      }
+    },
+    "throw-signal-typeerror": {
+      "native": {
+        "trace": ["body", "headers", "method", "signal"],
+        "receivers": [true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "argument getter sentinel",
+          "sameReason": false,
+          "sameThrown": true
+        }
+      },
+      "record": {
+        "trace": ["method", "body", "body", "headers", "method", "signal"],
+        "receivers": [true, true, true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "name": "TypeError",
+          "message": "argument getter sentinel",
+          "sameReason": false,
+          "sameThrown": true
+        }
+      }
+    },
+    "throw-headers-null": {
+      "native": {
+        "trace": ["body", "headers"],
+        "receivers": [true, true],
+        "returnedPromise": true,
+        "value": {
+          "sameReason": false,
+          "sameThrown": true
+        }
+      },
+      "record": {
+        "trace": ["method", "body", "body", "headers"],
+        "receivers": [true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "sameReason": false,
+          "sameThrown": true
+        }
+      }
+    },
+    "throw-signal-undefined": {
+      "native": {
+        "trace": ["body", "headers", "method", "signal"],
+        "receivers": [true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "sameReason": false,
+          "sameThrown": true
+        }
+      },
+      "record": {
+        "trace": ["method", "body", "body", "headers", "method", "signal"],
+        "receivers": [true, true, true, true, true, true],
+        "returnedPromise": true,
+        "value": {
+          "sameReason": false,
+          "sameThrown": true
+        }
+      }
+    },
+    "body-string": {
+      "native": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"POST\",\"body\":\"field=value\"}"
+        }
+      },
+      "record": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"POST\",\"body\":\"field=value\"}"
+        }
+      }
+    },
+    "body-params": {
+      "native": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"POST\",\"body\":\"field=value\"}"
+        }
+      },
+      "record": {
+        "trace": ["own.params.toString"],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"POST\",\"body\":\"field=value\"}"
+        }
+      }
+    },
+    "body-buffer": {
+      "native": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"POST\",\"body\":\"field=value\"}"
+        }
+      },
+      "record": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"POST\",\"body\":\"field=value\"}"
+        }
+      }
+    },
+    "body-view": {
+      "native": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"POST\",\"body\":\"field=value\"}"
+        }
+      },
+      "record": {
+        "trace": [],
+        "receivers": [],
+        "returnedPromise": true,
+        "value": {
+          "status": 200,
+          "body": "{\"method\":\"POST\",\"body\":\"field=value\"}"
+        }
+      }
+    }
+  }
+}

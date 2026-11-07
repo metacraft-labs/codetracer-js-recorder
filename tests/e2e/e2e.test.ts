@@ -293,11 +293,11 @@ describe("e2e_record_simple_program", () => {
     expect(bundle.steps).toBeDefined();
     expect(bundle.steps!.length).toBeGreaterThan(0);
 
-    // The console.log("Hello, World!") call must surface as an ioStdout
+    // The console.log("Hello, World!") call must surface as a `Write`
     // event — this is the canonical anchor for the recorder's IO path.
     expect(bundle.ioEvents).toBeDefined();
     const helloEvent = bundle.ioEvents!.find(
-      (e) => e.kind === "ioStdout" && (e.data ?? "").includes("Hello, World!"),
+      (e) => e.kind === "elkWrite" && (e.data ?? "").includes("Hello, World!"),
     );
     expect(helloEvent).toBeDefined();
 
@@ -338,9 +338,12 @@ describe("e2e_record_simple_program", () => {
 
     // ----- Step / call counts -----------------------------------------
     // hello.js produces a stable number of recorder events:
-    //   - 9 step events:
-    //       step 0  line 1  (synthetic thread-start)
-    //       step 1  line 1  (<module> definition-line anchor — see below)
+    //   - 8 steps, interleaved with one thread-start record.  Thread,
+    //     raise and catch records occupy an exec-record index but are not
+    //     steps, so `counts.steps` leaves them out; `--full` lists them as
+    //     their own `thread_start` / `raise` / ... entries:
+    //       step 0  line 1  (<module> definition-line anchor — see below)
+    //       index 1         (thread_start — not a step)
     //       step 2  line 1  (module prologue)
     //       step 3  line 4  (`function greet` declaration hoist)
     //       step 4  line 9  (`var result = greet("World")` — the call site)
@@ -365,7 +368,8 @@ describe("e2e_record_simple_program", () => {
     // These are stable properties of the canonical fixture under the
     // current JS recorder — if they change, that's a real regression
     // to investigate, not a flake.
-    expect(full.counts.steps).toBe(9);
+    expect(full.counts.steps).toBe(8);
+    expect(full.events.filter((e) => e.kind === "thread_start").length).toBe(1);
     expect(full.counts.calls).toBe(3);
     expect(full.counts.io_events).toBe(1);
 
@@ -573,7 +577,7 @@ describe("e2e_record_simple_program", () => {
       (e): e is Extract<CtFullEvent, { kind: "io" }> => e.kind === "io",
     );
     expect(ioEvents).toHaveLength(1);
-    expect(ioEvents[0].io_kind).toBe("ioStdout");
+    expect(ioEvents[0].io_kind).toBe("Write");
     expect(ioEvents[0].text).toBe("Hello, World!");
     expect(ioEvents[0].bytes_len).toBe("Hello, World!".length);
   });

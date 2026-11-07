@@ -2,50 +2,56 @@
  * CLI `instrument` command implementation.
  *
  * Usage: codetracer-js-recorder instrument <src> --out <dir> [--source-maps]
+ *          [--relative-paths]
  *
  * Walks the source directory (or instruments a single file), instruments
  * all .js/.ts/.jsx/.tsx files (excluding node_modules), writes instrumented
  * output to the specified directory preserving directory structure, and
  * writes a merged codetracer.manifest.json.
+ *
+ * The output is deterministic: files are
+ * instrumented in the order of their sorted relative paths, so the id
+ * blocks baked into the code do not depend on the order the filesystem
+ * lists them in, and every file and the manifest declare the recorder
+ * version. With --relative-paths the manifest and the source maps name
+ * files by their path relative to <src>, so the same bundle instrumented
+ * in two places, or on two machines, is byte-identical; that is how the
+ * post-bundle replay build is made. An --out directory that already holds
+ * an instrumented build of another recorder version is refused rather than
+ * reused.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  checkInstrumentedBuild,
   instrument,
+  manifestDocument,
+  manifestFileContents,
   mergeManifestSlices,
+  MANIFEST_FILE_NAME,
   nextManifestIdBases,
+  RECORDER_VERSION,
+  recorderVersionDeclaration,
   shouldInstrument,
+  sortedFilesUnder,
 } from "@codetracer/instrumenter";
 import type { ManifestSlice, FilterOptions } from "@codetracer/instrumenter";
 
 /**
- * Recursively collect all instrumentable files under a directory.
+ * Collect all instrumentable files under a directory, as paths relative
+ * to it, sorted (`sortedFilesUnder`): the order files are instrumented
+ * in decides the id blocks baked into their code, so it must not be the
+ * order the filesystem happens to list them in.
  *
  * Uses glob-based include/exclude filtering via picomatch.
  * By default, includes all JS/TS files and excludes node_modules.
  */
-function collectFiles(dir: string, filterOpts?: FilterOptions): string[] {
-  const results: string[] = [];
-
-  function walk(current: string): void {
-    const entries = fs.readdirSync(current, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        walk(fullPath);
-      } else if (entry.isFile()) {
-        // Use relative path for glob matching
-        const relPath = path.relative(dir, fullPath);
-        if (shouldInstrument(relPath, filterOpts)) {
-          results.push(fullPath);
-        }
-      }
-    }
-  }
-
-  walk(dir);
-  return results;
+export function collectFiles(
+  dir: string,
+  filterOpts?: FilterOptions,
+): string[] {
+  return sortedFilesUnder(dir, (rel) => shouldInstrument(rel, filterOpts));
 }
 
 /**
@@ -55,6 +61,8 @@ function parseArgs(args: string[]): {
   src: string;
   outDir: string;
   sourceMaps: boolean;
+  /** Record paths relative to <src> instead of absolute (see the header). */
+  relativePaths: boolean;
   include: string[];
   exclude: string[];
   /**
@@ -71,6 +79,7 @@ function parseArgs(args: string[]): {
   let src: string | undefined;
   let outDir: string | undefined;
   let sourceMaps = false;
+  let relativePaths = false;
   let browser = false;
   let endpoint: string | undefined;
   const include: string[] = [];
@@ -82,6 +91,8 @@ function parseArgs(args: string[]): {
       outDir = args[++i];
     } else if (arg === "--source-maps") {
       sourceMaps = true;
+    } else if (arg === "--relative-paths") {
+      relativePaths = true;
     } else if (arg === "--include" && i + 1 < args.length) {
       include.push(args[++i]);
     } else if (arg === "--exclude" && i + 1 < args.length) {
@@ -92,7 +103,7 @@ function parseArgs(args: string[]): {
       endpoint = args[++i];
     } else if (arg === "--help" || arg === "-h") {
       console.log(
-        `Usage: codetracer-js-recorder instrument <src> --out <dir> [--source-maps] [--include <glob>] [--exclude <glob>] [--browser [--endpoint <url>]]`,
+        `Usage: codetracer-js-recorder instrument <src> --out <dir> [--source-maps] [--relative-paths] [--include <glob>] [--exclude <glob>] [--browser [--endpoint <url>]]`,
       );
       process.exit(0);
     } else if (!src && !arg.startsWith("-")) {
@@ -113,6 +124,7 @@ function parseArgs(args: string[]): {
     src: src!,
     outDir: outDir!,
     sourceMaps,
+    relativePaths,
     include,
     exclude,
     browser,
@@ -145,6 +157,7 @@ function buildBrowserRuntimeStub(endpoint: string, manifest: unknown): string {
   // queue-and-flush semantics.  We keep it ES5 / no-modules so it loads
   // from a plain `<script>` tag without `type="module"`.
   return `// CodeTracer browser runtime (M26 AOT bundle bootstrap).
+${recorderVersionDeclaration()}
 // Wire format: newline-delimited JSON over WebSocket.
 // Spec: codetracer-specs/GUI/Debugging-Features/Value-Origin-Tracking.md §14.4
 (function () {
@@ -157,9 +170,20 @@ function buildBrowserRuntimeStub(endpoint: string, manifest: unknown): string {
   var stopped = false;
   var threshold = 256;
   var socket = null;
+  // The daemon socket is the recorder's, not the page's: open it with the
+  // WebSocket constructor as it was before a boundary shim patched it (the
+  // replay runner's or the shim's published originals), so it is not
+  // recorded as a socket the page opened. Mirrors resolveOriginals() in
+  // packages/runtime-browser/src/index.ts.
+  var published =
+    (globalThis.__ctReplay && globalThis.__ctReplay.originals) ||
+    (globalThis.__ctBoundaryShim && globalThis.__ctBoundaryShim.originals);
+  var WebSocketCtor =
+    (published && published.WebSocket) ||
+    (typeof WebSocket !== "undefined" ? WebSocket : undefined);
   try {
-    if (typeof WebSocket !== "undefined") {
-      socket = new WebSocket(endpoint);
+    if (WebSocketCtor) {
+      socket = new WebSocketCtor(endpoint);
       socket.onopen = function () { flush(); };
     }
   } catch (e) {
@@ -196,7 +220,19 @@ function buildBrowserRuntimeStub(endpoint: string, manifest: unknown): string {
     if (t === "function") return { value: v.name || "anonymous", typeKind: "FunctionKind" };
     return { value: "[object]", typeKind: "Raw" };
   }
-  enqueue({ kind: "SessionStart", program: (typeof document !== "undefined" && document.title) || "browser", args: [] });
+  // The session's program and args: the page's title and no args, unless
+  // the page (or a replay runner, which records a materialised trace's
+  // provenance in its args) set __codetracer_program / __codetracer_args.
+  var program = typeof globalThis.__codetracer_program === "string"
+    ? globalThis.__codetracer_program
+    : (typeof document !== "undefined" && document.title) || "browser";
+  var sessionArgs = [];
+  if (Array.isArray(globalThis.__codetracer_args)) {
+    for (var a = 0; a < globalThis.__codetracer_args.length; a++) {
+      sessionArgs.push(String(globalThis.__codetracer_args[a]));
+    }
+  }
+  enqueue({ kind: "SessionStart", program: program, args: sessionArgs });
   if (manifest) enqueue({ kind: "Manifest", manifest: manifest });
   var safeFlush = function () { try { flush(); } catch (e) {} };
   if (typeof globalThis.addEventListener === "function") {
@@ -252,17 +288,58 @@ function buildBrowserRuntimeStub(endpoint: string, manifest: unknown): string {
 `;
 }
 
+/** What {@link instrumentTree} instruments, and how. */
+export interface InstrumentTreeOptions {
+  /** A file, or a directory whose instrumentable files are instrumented. */
+  src: string;
+  /** The output directory. */
+  outDir: string;
+  sourceMaps?: boolean;
+  relativePaths?: boolean;
+  include?: string[];
+  exclude?: string[];
+  /** Also write the browser runtime stub `codetracer-runtime.js`. */
+  browser?: boolean;
+  /** The WebSocket endpoint baked into the stub. */
+  endpoint?: string;
+}
+
+/** What {@link instrumentTree} wrote. */
+export interface InstrumentTreeResult {
+  outDir: string;
+  /** Files instrumented. */
+  instrumented: number;
+  /** Files that failed to instrument (left out of the output), with why. */
+  failures: { file: string; error: string }[];
+  /** The merged manifest document (`codetracer.manifest.json`). */
+  manifest: unknown;
+  /** The browser runtime stub's path, with `browser`. */
+  stubPath?: string;
+}
+
 /**
- * Entry point for the `instrument` command.
+ * Instrument `options.src` into `options.outDir`: the `instrument`
+ * command as a library call, for the boundary replay runner, which
+ * instruments a deployed bundle itself (CodeTracer's JS-Boundary-Recording
+ * specification §8, §12). Throws instead of exiting.
  */
-export function instrumentCommand(args: string[]): void {
-  const { src, outDir, sourceMaps, include, exclude, browser, endpoint } =
-    parseArgs(args);
+export function instrumentTree(
+  options: InstrumentTreeOptions,
+): InstrumentTreeResult {
+  const {
+    src,
+    outDir,
+    sourceMaps = false,
+    relativePaths = false,
+    include = [],
+    exclude = [],
+    browser = false,
+    endpoint,
+  } = options;
 
   const srcPath = path.resolve(src);
   if (!fs.existsSync(srcPath)) {
-    console.error(`Error: source path '${srcPath}' does not exist.`);
-    process.exit(1);
+    throw new Error(`source path '${srcPath}' does not exist.`);
   }
 
   const stat = fs.statSync(srcPath);
@@ -283,25 +360,39 @@ export function instrumentCommand(args: string[]): void {
 
   if (isDir) {
     baseDir = srcPath;
-    files = collectFiles(srcPath, filterOpts);
+    files = collectFiles(srcPath, filterOpts).map((rel) =>
+      path.join(srcPath, rel),
+    );
   } else {
     baseDir = path.dirname(srcPath);
     files = [srcPath];
   }
 
   if (files.length === 0) {
-    console.error("No instrumentable files found.");
-    process.exit(1);
+    throw new Error("No instrumentable files found.");
   }
 
-  // Create output directory
+  // Create output directory, refusing one that holds an instrumented
+  // build of another recorder version: mixing its files with this
+  // version's would give a build no single runtime matches.
   const outPath = path.resolve(outDir);
+  const stale = checkInstrumentedBuild(outPath, RECORDER_VERSION);
+  if (stale.length > 0) {
+    const first = stale[0];
+    throw new Error(
+      `refusing to reuse '${outPath}': it holds an instrumented build ` +
+        `whose ${first.file} declares recorder version ` +
+        `${first.declared ?? "(none)"}, not ${RECORDER_VERSION} ` +
+        `(${stale.length} file(s) differ). Remove it or choose another --out.`,
+    );
+  }
   fs.mkdirSync(outPath, { recursive: true });
 
   // Instrument each file.  Merge order IS instrumentation order: each
   // file is instrumented with `nextManifestIdBases(slices)` so the ids
   // baked into its `__ct.*` calls are already the merged manifest's ids.
   const slices: ManifestSlice[] = [];
+  const failures: { file: string; error: string }[] = [];
   let instrumentedCount = 0;
 
   for (const file of files) {
@@ -311,6 +402,11 @@ export function instrumentCommand(args: string[]): void {
     try {
       const result = instrument(code, {
         filename: path.resolve(file),
+        // Relative to <src>, `/`-separated, when the output must not
+        // depend on where the bundle sits.
+        ...(relativePaths
+          ? { recordedPath: relPath.split(path.sep).join("/") }
+          : {}),
         // See the note on `slices` above: ids are baked into the emitted
         // code, so they must be minted in the merged numbering.
         idBases: nextManifestIdBases(slices),
@@ -330,34 +426,60 @@ export function instrumentCommand(args: string[]): void {
       slices.push(result.manifestSlice);
       instrumentedCount++;
     } catch (err) {
-      console.error(`Warning: failed to instrument '${file}': ${err}`);
+      failures.push({ file, error: String(err) });
     }
   }
 
   // Merge manifests and write
   const merged = mergeManifestSlices(slices);
-  const manifest = {
-    formatVersion: 1,
-    ...merged,
-  };
+  const manifest = manifestDocument(merged);
   fs.writeFileSync(
-    path.join(outPath, "codetracer.manifest.json"),
-    JSON.stringify(manifest, null, 2),
+    path.join(outPath, MANIFEST_FILE_NAME),
+    manifestFileContents(merged),
   );
 
   // M26: emit the browser-runtime bootstrap stub when --browser is set.
   // The output directory becomes a drop-in static-hostable bundle: the
   // `<script src="./codetracer-runtime.js">` tag loads the runtime + the
   // manifest, then the instrumented modules can be loaded normally.
+  let stubPath: string | undefined;
   if (browser) {
     const stubEndpoint = endpoint ?? "ws://localhost:9230/ct-stream";
-    const stubPath = path.join(outPath, "codetracer-runtime.js");
+    stubPath = path.join(outPath, "codetracer-runtime.js");
     fs.writeFileSync(stubPath, buildBrowserRuntimeStub(stubEndpoint, manifest));
-    console.log(`Browser runtime stub written to ${stubPath}`);
   }
 
-  console.log(`Instrumented ${instrumentedCount} file(s) -> ${outPath}`);
+  return {
+    outDir: outPath,
+    instrumented: instrumentedCount,
+    failures,
+    manifest,
+    ...(stubPath === undefined ? {} : { stubPath }),
+  };
+}
+
+/**
+ * Entry point for the `instrument` command.
+ */
+export function instrumentCommand(args: string[]): void {
+  const options = parseArgs(args);
+  let result: InstrumentTreeResult;
+  try {
+    result = instrumentTree(options);
+  } catch (err) {
+    console.error(`Error: ${(err as Error).message}`);
+    process.exit(1);
+  }
+  for (const f of result.failures) {
+    console.error(`Warning: failed to instrument '${f.file}': ${f.error}`);
+  }
+  if (result.stubPath !== undefined) {
+    console.log(`Browser runtime stub written to ${result.stubPath}`);
+  }
   console.log(
-    `Manifest written to ${path.join(outPath, "codetracer.manifest.json")}`,
+    `Instrumented ${result.instrumented} file(s) -> ${result.outDir}`,
+  );
+  console.log(
+    `Manifest written to ${path.join(result.outDir, MANIFEST_FILE_NAME)}`,
   );
 }

@@ -94,6 +94,11 @@ jobs:
         # and what the dev shell + Justfile produce today.
         run: dev-exec just build
 
+      - name: Build codetracer test binaries
+        # The boundary replay tests `just test` runs need `ct-jsbound` and
+        # `session-manager` from the codetracer sibling; same recipe as ci.yml.
+        run: dev-exec just build-codetracer-test-bins
+
       - name: just test (cross-check)
         run: dev-exec just test
 

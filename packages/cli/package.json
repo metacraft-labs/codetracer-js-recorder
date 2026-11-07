@@ -12,6 +12,7 @@
     "build": "tsc"
   },
   "dependencies": {
+    "@codetracer/boundary-shim": "*",
     "@codetracer/instrumenter": "*",
     "@codetracer/runtime": "*"
   },

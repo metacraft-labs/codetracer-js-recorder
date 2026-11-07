@@ -1,0 +1,1705 @@
+/**
+ * Reusable fetch library boundaries against real Chromium and a local HTTP
+ * server: native streaming/error/abort behavior, actual Recorder/strict codec,
+ * and actual owned replay scheduler/dom-v1 checkpoints. Exact existing native
+ * exception differences are diagnostics, not claimed native parity. No mocked transport,
+ * cursor, Response or runner. A setup-only iterator fault is explicitly injected
+ * in the fixture to witness original exception identity/reentry/failed retry.
+ * JSON cases hold the HTTP body until json() starts or drain a sibling clone
+ * first, comparing exact parser diagnostics and owned replay while retaining
+ * native buffered-body WebIDL context as a strict counterexample.
+ * Native timer observation shares Recorder/Replay ids with fetch, not a fake
+ * wire tape. This is bounded library preparation, not framework conformance.
+ */
+import * as fs from "node:fs";
+import { createHash } from "node:crypto";
+import ts from "typescript";
+import * as path from "node:path";
+import * as http from "node:http";
+import { build } from "esbuild";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  loadPlaywright,
+  type Browser,
+  type BrowserContext,
+  type Page,
+} from "./harness.js";
+
+const TIMEOUT = 60_000;
+const root = path.resolve(__dirname, "../..");
+const fixture = path.join(__dirname, "fixtures/fetch-factories.js");
+let browser: Browser,
+  server: http.Server,
+  origin: string,
+  bundle: string,
+  legacyBundle: string;
+const legacy = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "fixtures/fetch-legacy.json"), "utf8"),
+);
+const requests: { url: string; body: string; header: string | undefined }[] =
+  [];
+const contexts: BrowserContext[] = [];
+const timers = new Set<ReturnType<typeof setTimeout>>();
+const jsonBodies = new Map<
+  string,
+  { response: http.ServerResponse; body: string }
+>();
+let jsonBodyId = 0;
+const later = (fn: () => void, ms: number) => {
+  const timer = setTimeout(() => {
+    timers.delete(timer);
+    fn();
+  }, ms);
+  timers.add(timer);
+};
+const html =
+  '<!doctype html><input type="password" value="native-sensitive-value"><main id="out"></main>';
+
+// Append ownership probes to the existing genuine fixture's lexical helpers.
+// Only its import alias selects the fixed framework factory; the actual owner
+// implementation, native HTTP, Recorder, codec and owned loop remain unchanged.
+async function isolationBundle(mutation?: string): Promise<string> {
+  const original = fs.readFileSync(fixture, "utf8");
+  const anchor =
+    'import { createReplayFetch } from "../../../packages/boundary-shim/src/browser/replay/net.js";';
+  expect(original.split(anchor)).toHaveLength(2);
+  const contents =
+    original.replace(
+      anchor,
+      anchor.replace(
+        "{ createReplayFetch }",
+        "{ createFrameworkReplayFetch as createReplayFetch }",
+      ),
+    ) +
+    "\n" +
+    fs.readFileSync(
+      path.join(__dirname, "fixtures/fetch-response-isolation.inc.js"),
+      "utf8",
+    );
+  const plugins = mutation
+    ? [
+        {
+          name: "actual-owner-isolation-inverse",
+          setup(plugin: import("esbuild").PluginBuild) {
+            plugin.onLoad(
+              { filter: /\/(replay\/net|fetch-preparation)\.ts$/ },
+              async (args) => {
+                let source = await fs.promises.readFile(args.path, "utf8");
+                let from: string, to: string;
+                if (mutation === "scope") {
+                  if (!args.path.endsWith("fetch-preparation.ts")) return;
+                  from = "previous.scope !== scope";
+                  to = "false";
+                } else {
+                  if (!args.path.endsWith("/replay/net.ts")) return;
+                  from =
+                    'if (scope === "fetch" && !meta.has(this)) return settled;';
+                  to =
+                    mutation === "foreign-task"
+                      ? "if (false) return settled;"
+                      : mutation === "identity"
+                        ? 'if (scope === "fetch" && !meta.has(this)) return settled.then(v => v);'
+                        : 'if (scope === "fetch" && !consuming.has(this)) return settled;';
+                }
+                expect(source.split(from), "exact inverse anchor").toHaveLength(
+                  2,
+                );
+                source = source.replace(from, to);
+                return {
+                  contents: source,
+                  loader: "ts",
+                  resolveDir: path.dirname(args.path),
+                };
+              },
+            );
+          },
+        },
+      ]
+    : [];
+  return (
+    await build({
+      stdin: { contents, resolveDir: path.dirname(fixture) },
+      absWorkingDir: root,
+      bundle: true,
+      platform: "browser",
+      format: "iife",
+      target: "es2020",
+      write: false,
+      define: { __FETCH_LEGACY__: "false" },
+      plugins,
+    })
+  ).outputFiles[0].text;
+}
+
+async function bundled(mutation?: string): Promise<string> {
+  if (mutation === "legacy") {
+    const output = await build({
+      entryPoints: [fixture],
+      absWorkingDir: root,
+      bundle: true,
+      platform: "browser",
+      format: "iife",
+      target: "es2020",
+      write: false,
+      metafile: true,
+      define: { __FETCH_LEGACY__: "true" },
+      plugins: [
+        {
+          name: "immutable-original-fetch",
+          setup(plugin) {
+            // Fetch originally shared this module with the extracted factory.
+            // Freeze it too: later body fixes must not rewrite the historical
+            // close-context diagnostic that this baseline witnesses.
+            plugin.onLoad({ filter: /\/stream-body\.ts$/ }, (args) => {
+              const saved = legacy.modules.streamBody;
+              expect(
+                createHash("sha256").update(saved.source).digest("hex"),
+              ).toBe(saved.sha256);
+              return {
+                contents: saved.source,
+                loader: "ts",
+                resolveDir: path.dirname(args.path),
+              };
+            });
+            plugin.onLoad(
+              { filter: /\/(seams-net|replay\/net)\.ts$/ },
+              async (args) => {
+                let source = await fs.promises.readFile(args.path, "utf8");
+                const replay = args.path.endsWith("/replay/net.ts"),
+                  name = replay ? "replayFetch" : "patchFetch",
+                  saved = legacy.functions[name];
+                if (
+                  createHash("sha256").update(saved.source).digest("hex") !==
+                  saved.sha256
+                )
+                  throw Error("immutable legacy function hash changed");
+                const start = source.indexOf("function " + name + "("),
+                  end = source.indexOf(
+                    replay
+                      ? "\nfunction replayBeacon"
+                      : "\n/** `XMLHttpRequest.readyState`",
+                    start,
+                  );
+                if (start < 0 || end < 0)
+                  throw Error("exact legacy replacement anchors changed");
+                source =
+                  source.slice(0, start) +
+                  saved.source +
+                  "\n" +
+                  source.slice(end);
+                source = source.replace(
+                  replay
+                    ? 'import { prepareFetch } from "../fetch-preparation.js";\n'
+                    : 'import { prepareFetch } from "./fetch-preparation.js";\n',
+                  "",
+                );
+                const exported = replay
+                  ? "createReplayFetch"
+                  : "createRecordFetch";
+                source +=
+                  "\nexport function " +
+                  exported +
+                  '(ctx){const before=Object.getOwnPropertyDescriptor(ctx.w,"fetch");' +
+                  name +
+                  '(ctx);const call=ctx.w.fetch;Object.defineProperty(ctx.w,"fetch",before);return call;}\n';
+                return {
+                  contents: source,
+                  loader: "ts",
+                  resolveDir: path.dirname(args.path),
+                };
+              },
+            );
+          },
+        },
+      ],
+    });
+    expect(
+      Object.keys(output.metafile!.inputs).some((file) =>
+        file.includes("fetch-preparation"),
+      ),
+    ).toBe(false);
+    return output.outputFiles![0].text;
+  }
+  const plugins = mutation
+    ? [
+        {
+          name: "exact-fetch-inverse",
+          setup(plugin: import("esbuild").PluginBuild) {
+            plugin.onLoad(
+              { filter: /\/(fetch-preparation|seams-net|replay\/net)\.ts$/ },
+              async (args) => {
+                const source = await fs.promises.readFile(args.path, "utf8");
+                let old: string | undefined, next: string | undefined;
+                if (
+                  mutation === "reuse" &&
+                  args.path.endsWith("/fetch-preparation.ts")
+                ) {
+                  old = "return previous.fetch;";
+                  next = "return make();";
+                }
+                if (
+                  mutation === "conflict" &&
+                  args.path.endsWith("/fetch-preparation.ts")
+                ) {
+                  old =
+                    "previous.context !== context || previous.mode !== mode";
+                  next = "false";
+                }
+                if (
+                  mutation === "global" &&
+                  args.path.endsWith("/fetch-preparation.ts")
+                ) {
+                  old = "preparation.fetch = make();";
+                  next =
+                    "preparation.fetch = make(); (realm as Window).fetch = preparation.fetch;";
+                }
+                if (
+                  mutation === "record-bypass" &&
+                  args.path.endsWith("/seams-net.ts")
+                ) {
+                  old =
+                    "if (!rec.recording) return origFetch.call(w, input, init);";
+                  next = "if (true) return origFetch.call(w, input, init);";
+                }
+                if (
+                  mutation === "replay-global" &&
+                  args.path.endsWith("/replay/net.ts")
+                ) {
+                  old =
+                    "return function fetch(input: RequestInfo | URL, init?: RequestInit) {";
+                  next =
+                    "return w.fetch; return function fetch(input: RequestInfo | URL, init?: RequestInit) {";
+                }
+                if (
+                  mutation === "replay-raw" &&
+                  args.path.endsWith("/replay/net.ts")
+                ) {
+                  old =
+                    "return function fetch(input: RequestInfo | URL, init?: RequestInit) {";
+                  next =
+                    "return orig.fetch!; return function fetch(input: RequestInfo | URL, init?: RequestInit) {";
+                }
+                if (old === undefined) return;
+                if (source.split(old).length !== 2)
+                  throw new Error(
+                    "inverse exact source anchor changed: " + mutation,
+                  );
+                return {
+                  contents: source.replace(old, next!),
+                  loader: "ts",
+                  resolveDir: path.dirname(args.path),
+                };
+              },
+            );
+          },
+        },
+      ]
+    : [];
+  return (
+    await build({
+      entryPoints: [fixture],
+      absWorkingDir: root,
+      bundle: true,
+      platform: "browser",
+      format: "iife",
+      target: "es2020",
+      write: false,
+      define: { __FETCH_LEGACY__: "false" },
+      plugins,
+    })
+  ).outputFiles![0].text;
+}
+beforeAll(async () => {
+  bundle = await bundled();
+  legacyBundle = await bundled("legacy");
+  browser = await loadPlaywright().chromium.launch({ headless: true });
+  server = http.createServer((req, res) => {
+    if (!req.url?.startsWith("/api/")) {
+      res.setHeader("Content-Type", "text/html");
+      res.end(html);
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      requests.push({
+        url: req.url!,
+        body,
+        header: req.headers["x-factory-test"] as string | undefined,
+      });
+      if (req.url!.startsWith("/api/foreign")) {
+        res.setHeader("Content-Type", "application/x-www-form-urlencoded");
+        res.end(
+          req.url!.includes("consumer=json")
+            ? '{"foreign":true}'
+            : "field=value",
+        );
+        return;
+      }
+      if (req.url === "/api/fail") {
+        req.socket.destroy();
+        return;
+      }
+      if (req.url === "/api/redirect") {
+        res.writeHead(302, { Location: "/api/data?redirected=1" });
+        res.end();
+        return;
+      }
+      if (req.url === "/api/late-head") {
+        later(() => {
+          if (!res.destroyed) {
+            res.setHeader("X-Factory", "native");
+            res.end("late");
+          }
+        }, 200);
+        return;
+      }
+      if (req.url === "/api/invalid-json") {
+        res.setHeader("Content-Type", "application/json");
+        res.end("not json");
+        return;
+      }
+      if (req.url === "/api/empty") {
+        res.writeHead(204, { "X-Factory": "native" });
+        res.end();
+        return;
+      }
+      if (req.url!.startsWith("/api/json-body?")) {
+        const params = new URL(req.url!, "http://fixture").searchParams;
+        const bodies: Record<string, string> = {
+          invalid: "not JSON",
+          empty: "",
+          whitespace: "  \n",
+          valid: '{"value":"☃"}',
+          bom: '\uFEFF{"value":"☃"}',
+        };
+        const body = bodies[params.get("body")!];
+        if (body === undefined) throw new Error("unknown JSON body fixture");
+        const id = String(++jsonBodyId);
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "X-Content-Type-Options": "nosniff",
+          "X-Json-Body": id,
+        });
+        if (params.get("timing") === "pending") {
+          jsonBodies.set(id, { response: res, body });
+          res.on("close", () => jsonBodies.delete(id));
+          res.flushHeaders();
+        } else res.end(body);
+        return;
+      }
+      if (req.url!.startsWith("/api/json-release?")) {
+        const id = new URL(req.url!, "http://fixture").searchParams.get("id")!;
+        const held = jsonBodies.get(id);
+        if (!held) throw new Error("missing held JSON body " + id);
+        jsonBodies.delete(id);
+        held.response.end(held.body);
+        res.end("released");
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": req.url!.includes("consumer=formData")
+          ? "application/x-www-form-urlencoded"
+          : "text/plain; charset=utf-8",
+        "X-Factory": "native",
+      });
+      if (req.url!.startsWith("/api/slow")) {
+        res.flushHeaders();
+        // `pending=1`: no body at all until the client goes away. The abort
+        // workflows abort a body they read while it is still pending; with
+        // pieces on a deadline (50 and 100 ms) a starved page's 15 ms abort
+        // came after the whole body, which then read as data.
+        if (req.url!.includes("pending=1")) return;
+        later(() => {
+          if (!res.destroyed) res.write("first:");
+        }, 50);
+        later(() => {
+          if (!res.destroyed) res.end("second");
+        }, 100);
+        return;
+      }
+      res.end(
+        req.url === "/api/large"
+          ? "public body ".repeat(300)
+          : "native response",
+      );
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  origin =
+    "http://127.0.0.1:" +
+    (server.address() as import("node:net").AddressInfo).port;
+}, TIMEOUT);
+afterEach(async () => {
+  await Promise.all(contexts.splice(0).map((c) => c.close()));
+});
+afterAll(async () => {
+  for (const timer of timers) clearTimeout(timer);
+  await Promise.all(contexts.map((c) => c.close()));
+  await browser?.close();
+  if (server !== undefined)
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+});
+async function page(source = bundle): Promise<Page> {
+  const context = await browser.newContext();
+  contexts.push(context);
+  const page = await context.newPage();
+  await page.goto(origin);
+  await page.evaluate((source) => (0, eval)(source), source);
+  return page;
+}
+type Recorded = {
+  result: unknown[];
+  unchanged: boolean;
+  reuse: boolean;
+  log: string;
+  records: { record: string; [key: string]: unknown }[];
+};
+async function record(mode: string, source = bundle): Promise<Recorded> {
+  const p = await page(source);
+  return p.evaluate((mode) => (window as any).factoryRecord(mode), mode);
+}
+async function replay(
+  mode: string,
+  recorded: Recorded,
+  source = bundle,
+  allowPending = false,
+) {
+  const p = await page(source);
+  await p.evaluate(() => {
+    document.querySelector("input")!.value = "replay-placeholder-value";
+  });
+  await p.evaluate(
+    (input) => {
+      void (window as any).factoryReplay(input);
+    },
+    { mode, log: recorded.log },
+  );
+  const deadline = Date.now() + 15_000;
+  let final: any;
+  do {
+    final = await p.evaluate(() => (window as any).factoryFinal?.());
+    if (
+      final &&
+      (final.error ||
+        ["done", "diverged"].includes(final.status.state) ||
+        (allowPending && final.result))
+    )
+      return final;
+    await new Promise((r) => setTimeout(r, 10));
+  } while (Date.now() < deadline);
+  throw new Error("real owned loop did not finish: " + JSON.stringify(final));
+}
+
+describe("direct owner fetch library", () => {
+  for (const consumer of [
+    "text",
+    "json",
+    "arrayBuffer",
+    "blob",
+    "formData",
+    "bytes",
+  ])
+    for (const state of consumer === "formData"
+      ? ["locked", "disturbed", "mime"]
+      : ["locked", "disturbed"])
+      it(
+        `failed body ${consumer}/${state} retains native consumer-state errors`,
+        async () => {
+          const mode = `abort-body-state:${consumer}:${state}`;
+          const nativePage = await page();
+          const native = await nativePage.evaluate(
+            (mode) => (window as any).factoryPlain(mode),
+            mode,
+          );
+          expect(native).toHaveLength(1);
+          expect(native[0]).toMatchObject({
+            name: state === "mime" ? "AbortError" : "TypeError",
+          });
+          const recorded = await record(mode);
+          expect(recorded.result).toEqual(native);
+          const replayed = await replay(mode, recorded);
+          expect(replayed.status.state, JSON.stringify(replayed.status)).toBe(
+            "done",
+          );
+          expect(replayed.result).toEqual(native);
+          expect(replayed.raw).toBe(0);
+        },
+        TIMEOUT,
+      );
+  for (const body of ["invalid", "empty", "whitespace", "valid", "bom"])
+    for (const timing of ["pending", "ready"])
+      for (const copy of ["original", "clone"])
+        it(
+          `JSON ${body}/${timing}/${copy} preserves exact parser and replay diagnostics`,
+          async () => {
+            const mode = `json-body:${body}:${timing}:${copy}:normal`;
+            const nativePage = await page();
+            const native = await nativePage.evaluate(
+              (mode) => (window as any).factoryPlain(mode),
+              mode,
+            );
+            const invalid = ["invalid", "empty", "whitespace"].includes(body);
+            const message =
+              body === "invalid"
+                ? `Unexpected token 'o', "not JSON" is not valid JSON`
+                : "Unexpected end of JSON input";
+            const parsed = [
+              invalid
+                ? { name: "SyntaxError", message }
+                : { value: { value: "☃" } },
+              { bodyUsed: true },
+            ];
+            // The native ready-body WebIDL context is a strict counterexample,
+            // not normalized away or claimed as parser-context parity (§10.1).
+            expect(native).toEqual(
+              invalid && timing === "ready"
+                ? [
+                    {
+                      name: "SyntaxError",
+                      message:
+                        "Failed to execute 'json' on 'Response': " + message,
+                    },
+                    { bodyUsed: true },
+                  ]
+                : parsed,
+            );
+            const recorded = await record(mode);
+            expect(recorded.result).toEqual(parsed);
+            expect(
+              recorded.records.filter((r) => r.record === "Refusal"),
+            ).toEqual([]);
+            const replayed = await replay(mode, recorded);
+            expect(replayed.status.state, JSON.stringify(replayed.status)).toBe(
+              "done",
+            );
+            expect(replayed.result).toEqual(parsed);
+            expect(replayed.status.checkpoints).toBe(1);
+            expect(replayed.raw).toBe(0);
+            expect(replayed.status.tasks).toBe(
+              recorded.records.filter((r) => r.record === "Task").length,
+            );
+          },
+          TIMEOUT,
+        );
+  for (const state of ["locked", "disturbed", "replaced-parser"])
+    for (const copy of ["original", "clone"])
+      it(
+        `JSON ${state}/${copy} retains native behavior and actual replay`,
+        async () => {
+          const mode = `json-body:valid:ready:${copy}:${state}`;
+          const nativePage = await page();
+          const native = await nativePage.evaluate(
+            (mode) => (window as any).factoryPlain(mode),
+            mode,
+          );
+          const recorded = await record(mode);
+          expect(recorded.result).toEqual(native);
+          expect(native[0]).toMatchObject(
+            state === "replaced-parser"
+              ? { value: { value: "☃" } }
+              : { name: "TypeError" },
+          );
+          const replayed = await replay(mode, recorded);
+          expect(replayed.status.state, JSON.stringify(replayed.status)).toBe(
+            "done",
+          );
+          expect(replayed.result).toEqual(native);
+          expect(replayed.raw).toBe(0);
+        },
+        TIMEOUT,
+      );
+  it(
+    "preserves native JSON parse errors through actual owned replay",
+    async () => {
+      const nativePage = await page();
+      const native = await nativePage.evaluate(() =>
+        (window as any).factoryPlain("invalid-json"),
+      );
+      const recorded = await record("invalid-json");
+      expect(recorded.result).toEqual(native);
+      const replayed = await replay("invalid-json", recorded);
+      expect(replayed.status.state, JSON.stringify(replayed.status)).toBe(
+        "done",
+      );
+      expect(replayed.result).toEqual(native);
+      expect(replayed.status.checkpoints).toBe(1);
+      expect(replayed.raw).toBe(0);
+    },
+    TIMEOUT,
+  );
+  for (const mode of [
+    "delayed-text",
+    "ready-text",
+    "clone-meta",
+    "null-body",
+    "opaque-null",
+    "invalid-json",
+    "large",
+    "abort-before",
+    "abort-head",
+    "abort-body",
+    "failure-head",
+  ])
+    it(
+      mode + " uses native records and real owned-loop settlement",
+      async () => {
+        const nativePage = await page(),
+          native = await nativePage.evaluate(
+            (mode) => (window as any).factoryPlain(mode),
+            mode,
+          );
+        const before = requests.length,
+          r = await record(mode);
+        const old = await record(mode, legacyBundle);
+        if (!["invalid-json", "abort-body"].includes(mode))
+          expect(r.result).toEqual(old.result);
+        if (mode === "abort-body") {
+          expect(native).toEqual([
+            {
+              error: "AbortError",
+              message: "The user aborted a request.",
+              same: false,
+            },
+          ]);
+          expect(old.result).toEqual([
+            { error: "TypeError", message: "Failed to fetch", same: false },
+          ]);
+          expect(r.result).toEqual(native);
+        } else if (mode === "invalid-json") {
+          expect(r.result).toEqual(native);
+          expect(native).toEqual([
+            {
+              name: "SyntaxError",
+              message: `Unexpected token 'o', "not json" is not valid JSON`,
+            },
+          ]);
+          expect(old.result).toEqual([
+            {
+              name: "SyntaxError",
+              message: `Failed to execute 'close' on 'ReadableByteStreamController': Unexpected token 'o', "not json" is not valid JSON`,
+            },
+          ]);
+        } else expect(r.result).toEqual(native);
+        expect(r.unchanged).toBe(true);
+        expect(r.reuse).toBe(true);
+        const req = r.records.filter((r) => r.record === "NetRequest");
+        expect(req).toHaveLength(1);
+        expect(
+          r.records.filter((r) => r.record === "TaskReg" && r.kind === 4),
+        ).toHaveLength(1);
+        expect(r.records.filter((r) => r.record === "Checkpoint")).toHaveLength(
+          1,
+        );
+        expect(r.records.at(-1)?.record).toBe("End");
+        expect(
+          Buffer.from(r.log, "base64").includes(
+            Buffer.from("native-sensitive-value"),
+          ),
+        ).toBe(false);
+        if (["delayed-text", "ready-text", "large"].includes(mode)) {
+          expect(
+            requests
+              .slice(before)
+              .some(
+                (r) =>
+                  r.body === "field=native-sensitive-value" &&
+                  r.header === "native-header",
+              ),
+          ).toBe(true);
+          expect(req[0].body_digest).toMatch(/^[0-9a-f]{64}$/);
+        }
+        const count = requests.length,
+          replayed = await replay(mode, r);
+        expect(replayed.witnessed).toBe(true);
+        expect(replayed.raw).toBe(0);
+        if (mode !== "null-body") expect(replayed.error).toBeUndefined();
+        expect(replayed.unchanged).toBe(true);
+        expect(replayed.reuse).toBe(true);
+        if (mode === "null-body") {
+          expect(native[0]).toMatchObject({ status: 204, bodyNull: false });
+          const refusal = r.records.find((r) => r.record === "Refusal");
+          expect(refusal).toEqual({
+            record: "Refusal",
+            seq: "4",
+            feature: "unrecordable-response-body",
+            detail: "fetch response basic 204",
+          });
+          const oldReplayed = await replay(mode, old, legacyBundle);
+          expect(
+            old.records.find((record) => record.record === "Refusal"),
+          ).toEqual(refusal);
+          for (const observed of [replayed, oldReplayed]) {
+            expect(observed.witnessed).toBe(true);
+            expect(observed.raw).toBe(0);
+            expect(observed.unchanged).toBe(true);
+            expect(observed.latched.before).toEqual(observed.latched.after);
+            expect(observed.latched.before).toMatchObject({
+              kind: "Refusal",
+              seq: "4",
+              record: refusal,
+            });
+            expect(observed.latched).toMatchObject({
+              name: "ReplayDivergence",
+              divergence: { kind: "NonReplayable", seq: "4" },
+              same: true,
+            });
+            expect(observed.status.state).toBe("diverged");
+            expect(observed.status.divergence).toMatchObject({
+              kind: "NonReplayable",
+              seq: "4",
+              recorded:
+                'Refusal{feature="unrecordable-response-body", detail="fetch response basic 204"}',
+            });
+            expect(observed.next).toMatchObject({
+              kind: "Refusal",
+              seq: "4",
+              record: refusal,
+            });
+          }
+        } else {
+          expect(replayed.status.state, JSON.stringify(replayed.status)).toBe(
+            "done",
+          );
+          expect(replayed.status.checkpoints).toBe(1);
+          expect(replayed.result).toEqual(r.result);
+          expect(replayed.status.tasks).toBe(
+            r.records.filter((r) => r.record === "Task").length,
+          );
+          if (mode === "opaque-null")
+            expect(r.result).toEqual([
+              { status: 0, type: "opaque", bodyNull: true },
+              "",
+            ]);
+        }
+        expect(replayed.status.pageErrors).toEqual([]);
+        expect(requests.length).toBe(count);
+      },
+      TIMEOUT,
+    );
+  it("keeps immutable legacy callback ASTs except the published body-abort, argument and conversion corrections", () => {
+    const fragments = JSON.parse(
+      fs.readFileSync(
+        path.join(__dirname, "fixtures/fetch-argument-corrections.json"),
+        "utf8",
+      ),
+    );
+    const metadata = (source: string, record: boolean) => {
+      const start = source.indexOf(
+        "const isRequest = input instanceof w.Request;",
+      );
+      expect(start).toBeGreaterThan(0);
+      const end = source.indexOf(
+        record ? "if (digest === null)" : "const reqId",
+        start,
+      );
+      expect(end).toBeGreaterThan(start);
+      return source.slice(start, end);
+    };
+    // Independently bind the entire extracted helper body (including its return
+    // shape) to the immutable Record prefix. Projecting call sites alone could
+    // otherwise hide an incorrect or disconnected extraction.
+    const helperSource = fs.readFileSync(
+      path.join(root, legacy.functions.patchFetch.file),
+      "utf8",
+    );
+    const helperFile = ts.createSourceFile(
+      "metadata.ts",
+      helperSource,
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const helpers = helperFile.statements.filter(
+      (node): node is ts.FunctionDeclaration =>
+        ts.isFunctionDeclaration(node) &&
+        node.name?.text === "fetchRequestMetadata",
+    );
+    expect(helpers).toHaveLength(1);
+    expect(
+      helpers[0].parameters.map((p) => p.name.getText(helperFile)),
+    ).toEqual(["w", "ctx", "input", "init"]);
+    expect(
+      helpers[0].parameters.every((p) => p.initializer === undefined),
+    ).toBe(true);
+    const expectedHelper = ts.createSourceFile(
+      "expected.ts",
+      "function metadata(){" +
+        metadata(legacy.functions.patchFetch.source, true) +
+        "return { method, url, digest };}",
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const printer = ts.createPrinter({ removeComments: false });
+    expect(
+      printer.printNode(ts.EmitHint.Unspecified, helpers[0].body!, helperFile),
+    ).toBe(
+      printer.printNode(
+        ts.EmitHint.Unspecified,
+        (expectedHelper.statements[0] as ts.FunctionDeclaration).body!,
+        expectedHelper,
+      ),
+    );
+    for (const saved of Object.values(legacy.functions) as {
+      file: string;
+      source: string;
+      sha256: string;
+      callbackPrintedSha256: string;
+    }[]) {
+      expect(createHash("sha256").update(saved.source).digest("hex")).toBe(
+        saved.sha256,
+      );
+      const printed = (source: string) => {
+        const sf = ts.createSourceFile(
+          saved.file,
+          source,
+          ts.ScriptTarget.Latest,
+          true,
+        );
+        const found: ts.FunctionExpression[] = [];
+        const visit = (node: ts.Node) => {
+          if (ts.isFunctionExpression(node) && node.name?.text === "fetch")
+            found.push(node);
+          ts.forEachChild(node, visit);
+        };
+        visit(sf);
+        expect(found).toHaveLength(1);
+        return ts
+          .createPrinter({ removeComments: false })
+          .printNode(ts.EmitHint.Unspecified, found[0], sf);
+      };
+      let currentSource = fs.readFileSync(path.join(root, saved.file), "utf8");
+      const project = (from: string, to: string, label: string) => {
+        expect(
+          currentSource.split(from),
+          label + " exact one-occurrence anchor",
+        ).toHaveLength(2);
+        currentSource = currentSource.replace(from, to);
+      };
+      // The pre-header cancellation fallback (no AbortSignal.any, no
+      // rebuilder) and its unreachable-body release are qualified by
+      // tests/boundary/fetch-cancellation.test.ts. Its inverse must restore
+      // the ENTIRE published parent file before the older layers below.
+      const fallback = JSON.parse(
+        fs.readFileSync(
+          path.join(
+            __dirname,
+            "fixtures/fetch-preheader-fallback-corrections.json",
+          ),
+          "utf8",
+        ),
+      );
+      expect(fallback.parent).toBe("aabe50a815833b94eb922f90d990896ea0929341");
+      const fellBack = fallback.entries.filter(
+        (entry: any) => entry.file === saved.file,
+      );
+      expect(fellBack).toHaveLength(1);
+      for (const change of fellBack[0].changes)
+        project(
+          change.current,
+          change.parent,
+          "exact pre-header cancellation fallback correction",
+        );
+      expect(createHash("sha256").update(currentSource).digest("hex")).toBe(
+        fellBack[0].parentSha256,
+      );
+      // The shared Request-constructor conversion correction is qualified by
+      // tests/boundary/fetch-arguments.test.ts. Like the causal correction
+      // below, its inverse must restore the ENTIRE published parent file.
+      const conversion = JSON.parse(
+        fs.readFileSync(
+          path.join(__dirname, "fixtures/fetch-conversion-corrections.json"),
+          "utf8",
+        ),
+      );
+      expect(conversion.parent).toBe(
+        "316baab32d176b42180409b7ec3be34fb4a1bc39",
+      );
+      const converted = conversion.entries.filter(
+        (entry: any) => entry.file === saved.file,
+      );
+      expect(converted).toHaveLength(1);
+      for (const change of converted[0].changes)
+        project(
+          change.current,
+          change.parent,
+          "exact argument conversion correction",
+        );
+      expect(createHash("sha256").update(currentSource).digest("hex")).toBe(
+        converted[0].parentSha256,
+      );
+      // The causal pre-header correction is independently qualified by actual
+      // owner/native tests and compiled production inverses. Its precise inverse
+      // must first restore the ENTIRE published parent file, not merely the
+      // callback fragment compared with the older immutable extraction snapshot.
+      const cancellation = JSON.parse(
+        fs.readFileSync(
+          path.join(__dirname, "fixtures/fetch-cancellation-corrections.json"),
+          "utf8",
+        ),
+      );
+      expect(cancellation.parent).toBe(
+        "e275e1f1957de4d13cbe511e79daec42cfccdc94",
+      );
+      const correction = cancellation.entries.filter(
+        (entry: any) => entry.file === saved.file,
+      );
+      expect(correction).toHaveLength(1);
+      for (const change of correction[0].changes)
+        project(
+          change.current,
+          change.parent,
+          "exact causal cancellation correction",
+        );
+      expect(createHash("sha256").update(currentSource).digest("hex")).toBe(
+        correction[0].parentSha256,
+      );
+      if (saved.file.endsWith("/seams-net.ts")) {
+        project(
+          fragments.recordPrefix,
+          metadata(saved.source, true),
+          "shared Record prefix",
+        );
+      } else {
+        project(
+          fragments.replayPrefix,
+          metadata(saved.source, false),
+          "shared Replay prefix",
+        );
+        const start = saved.source.indexOf("const signal =");
+        const end = saved.source.indexOf(
+          "return new OrigPromise<Response>",
+          start,
+        );
+        expect(start).toBeGreaterThan(0);
+        expect(end).toBeGreaterThan(start);
+        project(
+          fragments.replayConversion,
+          saved.source.slice(start, end),
+          "native argument conversion suffix",
+        );
+        project(
+          fragments.applicationThrow,
+          "reject(failureError(w, r.outcome, signal));",
+          "application getter throw delivery",
+        );
+      }
+      if (saved.file.endsWith("/replay/net.ts")) {
+        // This separately specified repair adds only a body-failure cell to
+        // the extracted callback. Keep the historical snapshot immutable and
+        // require every other statement to remain exactly its original AST.
+        const corrections: [string, string][] = [
+          ["        const failure: BodyFailure = { failed: false };\n", ""],
+          [
+            "              // Once headers were delivered, Chromium's body failure is its\n" +
+              "              // own AbortError, independent of the page's custom signal reason.\n" +
+              "              failure.failed = true;\n" +
+              "              failure.error = failureError(w, outcome, undefined);\n",
+            "",
+          ],
+          [
+            "              const response = responseOf(r, stream, reads);\n" +
+              "              bodyFailures.bind(response, failure);\n" +
+              "              resolve(response);",
+            "              resolve(responseOf(r, stream, reads));",
+          ],
+        ];
+        for (const [from, to] of corrections) {
+          expect(
+            currentSource.split(from),
+            "exact body-abort correction anchor",
+          ).toHaveLength(2);
+          currentSource = currentSource.replace(from, to);
+        }
+      }
+      const old = printed(saved.source),
+        current = printed(currentSource);
+      expect(createHash("sha256").update(old).digest("hex")).toBe(
+        saved.callbackPrintedSha256,
+      );
+      expect(current).toBe(old);
+      // A genuine successful source companion precedes the negative control.
+      // The SAME whole-callback identity rule must reject an unrelated edit;
+      // named correction projections never authorize arbitrary body changes.
+      const requireIdentical = (source: string) => {
+        if (printed(source) !== old)
+          throw new Error("unrelated callback change");
+      };
+      requireIdentical(currentSource);
+      const anchor = saved.file.endsWith("/replay/net.ts")
+        ? "let cancelled = false;"
+        : "return page;";
+      expect(currentSource.split(anchor)).toHaveLength(2);
+      const unrelated = currentSource.replace(
+        anchor,
+        saved.file.endsWith("/replay/net.ts")
+          ? "let cancelled = true;"
+          : "return resp;",
+      );
+      expect(() => requireIdentical(unrelated)).toThrow(
+        "unrelated callback change",
+      );
+    }
+  });
+  for (const consumer of [
+    "text",
+    "json",
+    "arrayBuffer",
+    "blob",
+    "formData",
+    "bytes",
+  ])
+    for (const copy of ["original", "clone"])
+      for (const reason of ["default", "dom", "error"])
+        it(
+          "pending " +
+            consumer +
+            " " +
+            copy +
+            " " +
+            reason +
+            " preserves native rejection and owned replay",
+          async () => {
+            const mode =
+              "abort-consumer:" + consumer + ":" + copy + ":" + reason;
+            const nativePage = await page();
+            expect(
+              await nativePage.evaluate(() =>
+                (window as any).factoryAvailable(),
+              ),
+            ).toEqual([
+              "text",
+              "json",
+              "arrayBuffer",
+              "blob",
+              "formData",
+              "bytes",
+            ]);
+            const native: any = await nativePage.evaluate(
+              (mode) => (window as any).factoryPlain(mode),
+              mode,
+            );
+            const old = await record(mode, legacyBundle),
+              current = await record(mode);
+            expect(current.result).toEqual(native);
+            expect(old.result).toEqual([
+              {
+                ok: false,
+                name: "TypeError",
+                message: "Failed to fetch",
+                sameReason: false,
+              },
+              { pendingBeforeAbort: true, abortCalls: 1 },
+            ]);
+            expect(native).toEqual([
+              {
+                ok: false,
+                name: "AbortError",
+                message: "The user aborted a request.",
+                sameReason: false,
+              },
+              { pendingBeforeAbort: true, abortCalls: 1 },
+            ]);
+            expect(current.unchanged && current.reuse).toBe(true);
+            expect(
+              current.records.filter((r) => r.record === "Refusal"),
+            ).toEqual([]);
+            const ends = current.records.filter(
+              (r) => r.record === "WsMessage" && r.dir === 4,
+            );
+            expect(ends).toHaveLength(1);
+            expect(
+              JSON.parse(
+                new TextDecoder().decode(
+                  Uint8Array.from(Object.values((ends[0].data as any).bytes)),
+                ),
+              ),
+            ).toEqual({ outcome: 3 });
+            const count = requests.length,
+              replayed = await replay(mode, current),
+              legacyReplay = await replay(mode, old, legacyBundle);
+            for (const [observed, recorded] of [
+              [replayed, current],
+              [legacyReplay, old],
+            ] as const) {
+              expect(observed.result).toEqual(recorded.result);
+              expect(observed.error).toBeUndefined();
+              expect(
+                observed.status.state,
+                JSON.stringify(observed.status),
+              ).toBe("done");
+              expect(observed.status.checkpoints).toBe(1);
+              expect(observed.status.pageErrors).toEqual([]);
+              expect(observed.status.tasks).toBe(
+                recorded.records.filter((r) => r.record === "Task").length,
+              );
+              expect(observed.raw).toBe(0);
+              expect(observed.witnessed).toBe(true);
+            }
+            expect(requests.length).toBe(count);
+          },
+          TIMEOUT,
+        );
+  it("reuses one context and rejects another before mutation", async () => {
+    const p = await page(),
+      r = await p.evaluate(() => (window as any).factoryPreflight());
+    expect(r).toEqual({
+      reuse: true,
+      conflict: {
+        name: "TypeError",
+        message: "fetch preparation belongs to another context or mode",
+      },
+      conflictUnchanged: true,
+      unchanged: true,
+    });
+  });
+  it("preserves native Promise, receiver and argument identity when stopped or guard-faulted", async () => {
+    for (const fault of [false, true]) {
+      const p = await page();
+      expect(
+        await p.evaluate(
+          (fault) => (window as any).factoryStopped(fault),
+          fault,
+        ),
+      ).toEqual({
+        identity: true,
+        self: true,
+        args: true,
+        text: "native response",
+        recording: false,
+      });
+    }
+  });
+  it("does not reserve an unsupported original and rejects cross-mode overwrite", async () => {
+    const p = await page();
+    expect(await p.evaluate(() => (window as any).factoryMissing())).toEqual({
+      absent: true,
+      present: true,
+      changed: true,
+    });
+    const r = await record("null-body"),
+      q = await page();
+    for (const key of ["fetch", "Response"]) {
+      const missing = await page();
+      expect(
+        await missing.evaluate(
+          ({ log, key }) => (window as any).factoryReplayMissing(log, key),
+          { log: r.log, key },
+        ),
+      ).toEqual({
+        absent: true,
+        unchanged: true,
+        restored: true,
+        globalUnchanged: true,
+        prepared: true,
+      });
+    }
+    const withoutResponse = await page();
+    expect(
+      await withoutResponse.evaluate(() =>
+        (window as any).factoryRecordMissingResponse(),
+      ),
+    ).toEqual({
+      supported: true,
+      globalUnchanged: true,
+      prototypesUnchanged: true,
+    });
+    expect(
+      await q.evaluate((log) => (window as any).factoryCrossMode(log), r.log),
+    ).toEqual({
+      conflict: {
+        name: "TypeError",
+        message: "fetch preparation belongs to another context or mode",
+      },
+      unchanged: true,
+      reuse: true,
+    });
+  });
+  it("retains original setup failure and rejects reentry and failed retry", async () => {
+    const p = await page(),
+      r = await p.evaluate(() => (window as any).factorySetupFailure());
+    expect(r).toEqual({
+      same: true,
+      reentry: {
+        name: "TypeError",
+        message: "fetch preparation is incomplete or failed",
+      },
+      retry: {
+        name: "TypeError",
+        message: "fetch preparation is incomplete or failed",
+      },
+      unchanged: true,
+    });
+  });
+  it("preserves repeated generic installation and stopped no-op control", async () => {
+    const p = await page();
+    expect(
+      await p.evaluate(() => (window as any).factoryGenericRepeated()),
+    ).toEqual({ same: true, fetch: true, recording: false });
+    const r = await record("null-body"),
+      q = await page();
+    expect(
+      await q.evaluate(
+        (log) => (window as any).factoryGenericReplayRepeated(log),
+        r.log,
+      ),
+    ).toEqual({ same: true, fetch: true });
+  });
+  it("importing reservation module allocates no WeakMap; counter is independently witnessed", async () => {
+    const source = (
+      await build({
+        stdin: {
+          resolveDir: root,
+          contents:
+            "import {prepareFetch} from './packages/boundary-shim/src/browser/fetch-preparation.ts'; globalThis.preparationForTest=prepareFetch;",
+        },
+        bundle: true,
+        platform: "browser",
+        write: false,
+      })
+    ).outputFiles![0].text;
+    const p = await page("");
+    const r = await p.evaluate((source) => {
+      const Native = WeakMap;
+      let count = 0;
+      window.WeakMap = class extends Native {
+        constructor(...args: any[]) {
+          super(...(args as []));
+          count++;
+        }
+      } as typeof WeakMap;
+      new WeakMap();
+      const witnessed = count === 1;
+      count = 0;
+      (0, eval)(source);
+      const allocations = count;
+      window.WeakMap = Native;
+      return { witnessed, allocations };
+    }, source);
+    expect(r).toEqual({ witnessed: true, allocations: 0 });
+  });
+  for (const inverse of [
+    "reuse",
+    "conflict",
+    "global",
+    "record-bypass",
+    "replay-raw",
+    "replay-global",
+  ])
+    it(
+      "exact compiled source inverse " + inverse + " fails its specific oracle",
+      async () => {
+        const mutated = await bundled(inverse);
+        if (inverse === "reuse") {
+          const r = await record("clone-meta", mutated);
+          expect(r.reuse).toBe(false);
+          expect(r.result[1]).toMatchObject({
+            same: false,
+            before: origin + "/api/data?redirected=1",
+            after: "",
+            clone: "",
+          });
+          expect(
+            r.records.filter((r) => r.record === "NetRequest"),
+          ).toHaveLength(1);
+        } else if (inverse === "conflict") {
+          const p = await page(mutated),
+            r = await p.evaluate(() => (window as any).factoryPreflight());
+          expect(r.conflict).toBeNull();
+          expect(r.reuse).toBe(true);
+          expect(r.unchanged).toBe(true);
+        } else if (inverse === "global") {
+          const r = await record("null-body", mutated);
+          expect(r.unchanged).toBe(false);
+          expect(
+            r.records.filter((r) => r.record === "NetRequest"),
+          ).toHaveLength(1);
+          expect(r.result[0]).toMatchObject({ status: 204 });
+        } else if (inverse === "record-bypass") {
+          const r = await record("null-body", mutated);
+          expect(r.result[0]).toMatchObject({ status: 204 });
+          expect(
+            r.records.filter((r) => r.record === "NetRequest"),
+          ).toHaveLength(0);
+          expect(r.records.at(-1)?.record).toBe("End");
+        } else if (inverse === "replay-global") {
+          const r = await record("null-body"),
+            count = requests.length,
+            out = await replay("null-body", r, mutated, true);
+          expect(out.witnessed).toBe(true);
+          expect(out.raw).toBe(0);
+          expect(out.error).toMatchObject({
+            name: "ReplayDivergence",
+            divergence: {
+              kind: "ExtraRead",
+              seq: "1",
+              actual: "TaskReg{task_id=1, kind=13, delay_ms=0}",
+            },
+          });
+          expect(out.status.state).toBe("diverged");
+          expect(requests.length).toBe(count + 1);
+          expect(out.next).toMatchObject({ kind: "NetRequest", seq: "1" });
+        } else {
+          const r = await record("null-body"),
+            out = await replay("null-body", r, mutated);
+          expect(out.witnessed).toBe(true);
+          expect(out.raw).toBe(1);
+          expect(out.error).toMatchObject({
+            name: "Error",
+            message: "raw replay fetch",
+          });
+          expect(out.next).toMatchObject({ kind: "NetRequest", seq: "1" });
+        }
+      },
+      TIMEOUT,
+    );
+});
+
+// Fixed framework entry only; generic/immutable legacy tests above stay intact.
+describe("framework fetch response ownership", () => {
+  let scoped: string;
+  beforeAll(async () => {
+    scoped = await isolationBundle();
+  }, TIMEOUT);
+  for (const consumer of [
+    "text",
+    "json",
+    "arrayBuffer",
+    "blob",
+    "formData",
+    "bytes",
+  ])
+    for (const copy of ["native", "clone", "constructed"])
+      for (const state of ["pending", "done", "diverged"])
+        it(
+          `${consumer}/${copy}/${state} keeps the exact foreign native Promise and cursor`,
+          async () => {
+            const native = await page(scoped);
+            const available = await native.evaluate(() =>
+              (window as any).factoryAvailable(),
+            );
+            expect(available).toContain(consumer);
+            const log = await native.evaluate(() =>
+              (window as any).factoryNeutralLog(),
+            );
+            const p = await page(scoped),
+              beforeRequests = requests.length;
+            const out: any = await p.evaluate(
+              (input) => (window as any).factoryIsolation(input),
+              { log, consumer, copy, state, scope: "fetch" },
+            );
+            expect(out.error).toBeUndefined();
+            expect(out.identity).toBe(true);
+            expect(out.sameReceiver).toBe(true);
+            expect(out.sameArgs).toBe(true);
+            expect(out.sameCallable).toBe(true);
+            expect(out.unchanged).toBe(true);
+            expect(out.globalFetchUnchanged).toBe(true);
+            expect(out.wrongScope).toEqual({
+              name: "TypeError",
+              message: "fetch preparation belongs to another response scope",
+            });
+            expect(out.wrongContext).toEqual({
+              name: "TypeError",
+              message: "fetch preparation belongs to another context or mode",
+            });
+            expect(out.after).toEqual(out.before);
+            expect(out.failedUnchanged).toBe(true);
+            expect(out.counters).toEqual(["1", "1"]);
+            expect(requests.length).toBe(
+              beforeRequests + (copy === "constructed" ? 0 : 1),
+            );
+            const bytes = Array.from(Buffer.from("field=value"));
+            expect(out.value).toEqual(
+              consumer === "text"
+                ? "field=value"
+                : consumer === "json"
+                  ? { foreign: true }
+                  : consumer === "formData"
+                    ? [["field", "value"]]
+                    : consumer === "blob"
+                      ? { size: 11, type: "application/x-www-form-urlencoded" }
+                      : bytes,
+            );
+            if (state === "diverged") {
+              expect(out.status.state).toBe("diverged");
+              expect(out.before.record).toMatchObject({
+                record: "Clock",
+                src: 2,
+              });
+            } else {
+              expect(out.neutral.storage).toMatchObject({
+                record: "StorageRead",
+                area: 1,
+                key: "foreign-neutral",
+                value: "neutral",
+              });
+              expect(out.neutral.clock).toMatchObject({
+                record: "Clock",
+                src: 2,
+              });
+              expect(out.neutral.status.state).toBe("done");
+              expect(out.neutral.status.checkpoints).toBe(1);
+            }
+          },
+          TIMEOUT,
+        );
+  for (const mode of [
+    "delayed-text",
+    "ready-text",
+    "clone-meta",
+    "opaque-null",
+    "abort-head",
+    "abort-body",
+    "failure-head",
+    "invalid-json",
+  ])
+    it(
+      mode + " preserves actual owned replay with fixed response scope",
+      async () => {
+        const r = await record(mode),
+          count = requests.length;
+        const out = await replay(mode, r, scoped);
+        expect(out.status.state, JSON.stringify(out)).toBe("done");
+        expect(out.status.checkpoints).toBe(1);
+        expect(out.result).toEqual(r.result);
+        expect(out.status.tasks).toBe(
+          r.records.filter((r) => r.record === "Task").length,
+        );
+        expect(out.witnessed).toBe(true);
+        expect(out.raw).toBe(0);
+        expect(out.error).toBeUndefined();
+        expect(requests.length).toBe(count);
+      },
+      TIMEOUT,
+    );
+  for (const mutation of ["foreign-task", "identity", "scope"])
+    it(
+      "compiled owner " +
+        mutation +
+        " inverse fails its exact ownership assertion",
+      async () => {
+        const source = await isolationBundle(mutation),
+          r = await page(scoped),
+          log = await r.evaluate(() => (window as any).factoryNeutralLog()),
+          p = await page(source);
+        const out: any = await p.evaluate(
+          (input) => (window as any).factoryIsolation(input),
+          {
+            log,
+            consumer: "text",
+            copy: "constructed",
+            state: "pending",
+            scope: "fetch",
+          },
+        );
+        if (mutation === "foreign-task") {
+          expect(out.error.divergence.kind).toBe("ExtraRead");
+          expect(out.error.divergence.seq).toBe("1");
+          expect(out.after).toEqual(out.before);
+          expect(out.counters).toEqual(["2", "1"]);
+        } else if (mutation === "identity") {
+          expect(out.identity).toBe(false);
+          expect(out.value).toBe("field=value");
+          expect(out.after).toEqual(out.before);
+          expect(out.neutral.status.state).toBe("done");
+        } else {
+          expect(out.wrongScope).toBeNull();
+          expect(out.sameCallable).toBe(true);
+          expect(out.value).toBe("field=value");
+          expect(out.neutral.status.state).toBe("done");
+        }
+      },
+      TIMEOUT,
+    );
+});
+
+describe("framework foreign failure and null-body controls", () => {
+  for (const consumer of [
+    "text",
+    "json",
+    "arrayBuffer",
+    "blob",
+    "formData",
+    "bytes",
+  ])
+    for (const failure of ["used", "receiver"])
+      it(
+        consumer +
+          " " +
+          failure +
+          " retains exact native rejection and Promise",
+        async () => {
+          const scoped = await isolationBundle(),
+            r = await page(scoped),
+            log = await r.evaluate(() => (window as any).factoryNeutralLog()),
+            p = await page(scoped);
+          const out: any = await p.evaluate(
+            (input) => (window as any).factoryIsolation(input),
+            {
+              log,
+              consumer,
+              copy: "constructed",
+              state: "pending",
+              scope: "fetch",
+              failure,
+            },
+          );
+          expect(out.baselineError).toMatchObject({ name: "TypeError" });
+          expect(out.error).toEqual(out.baselineError);
+          expect(out.identity).toBe(true);
+          expect(out.sameReceiver).toBe(true);
+          expect(out.sameArgs).toBe(true);
+          expect(out.after).toEqual(out.before);
+          expect(out.counters).toEqual(["1", "1"]);
+          expect(out.neutral.status.state).toBe("done");
+        },
+        TIMEOUT,
+      );
+  it(
+    "compiled stream-membership inverse leaves the exact owned null-body TaskReg pending",
+    async () => {
+      const mutated = await isolationBundle("stream-membership"),
+        r = await record("opaque-null"),
+        count = requests.length;
+      const out = await replay("opaque-null", r, mutated, true);
+      expect(out.result).toEqual(r.result);
+      expect(out.error).toBeUndefined();
+      expect(out.raw).toBe(0);
+      expect(out.witnessed).toBe(true);
+      expect(out.next).toMatchObject({
+        kind: "TaskReg",
+        record: { record: "TaskReg", kind: 13 },
+      });
+      const pending = r.records.find(
+        (record) => record.record === "TaskReg" && record.kind === 13,
+      );
+      expect(pending).toBeDefined();
+      expect(out.next.record).toEqual(pending);
+      expect(out.status.state).not.toBe("done");
+      expect(out.status.checkpoints).toBe(0);
+      expect(requests.length).toBe(count);
+    },
+    TIMEOUT,
+  );
+});
+
+describe("framework preparation scope lifecycle", () => {
+  for (const key of ["fetch", "Response"])
+    it(
+      "missing " + key + " retains existing no-op without reserving scope",
+      async () => {
+        const source = await isolationBundle(),
+          r = await page(source),
+          log = await r.evaluate(() => (window as any).factoryNeutralLog()),
+          p = await page(source);
+        expect(
+          await p.evaluate(
+            (input) =>
+              (window as any).factoryScopeSetup(
+                input.log,
+                "missing",
+                input.key,
+              ),
+            { log, key },
+          ),
+        ).toEqual({
+          absent: true,
+          unchanged: true,
+          restored: "function",
+          reuse: true,
+        });
+      },
+      TIMEOUT,
+    );
+  it(
+    "rejects reverse realm-to-framework scope before prototype changes",
+    async () => {
+      const source = await isolationBundle(),
+        r = await page(source),
+        log = await r.evaluate(() => (window as any).factoryNeutralLog()),
+        p = await page(source);
+      expect(
+        await p.evaluate(
+          (log) => (window as any).factoryScopeSetup(log, "reverse"),
+          log,
+        ),
+      ).toEqual({
+        conflict: {
+          name: "TypeError",
+          message: "fetch preparation belongs to another response scope",
+        },
+        unchanged: true,
+      });
+    },
+    TIMEOUT,
+  );
+  it(
+    "retains original failure and refuses scoped reentry and retry",
+    async () => {
+      const source = await isolationBundle(),
+        r = await page(source),
+        log = await r.evaluate(() => (window as any).factoryNeutralLog()),
+        p = await page(source);
+      expect(
+        await p.evaluate(
+          (log) => (window as any).factoryScopeSetup(log, "failure"),
+          log,
+        ),
+      ).toEqual({
+        same: true,
+        partialChanged: true,
+        reentry: {
+          name: "TypeError",
+          message: "fetch preparation is incomplete or failed",
+        },
+        retry: {
+          name: "TypeError",
+          message: "fetch preparation is incomplete or failed",
+        },
+        unchanged: true,
+      });
+    },
+    TIMEOUT,
+  );
+  it(
+    "native foreign read preserves the following genuine owned request and neutral records",
+    async () => {
+      const source = await isolationBundle(),
+        r = await page(source),
+        recorded: any = await r.evaluate(() =>
+          (window as any).factoryIsolationRecordSequence(),
+        ),
+        p = await page(source),
+        count = requests.length;
+      await p.evaluate(() => {
+        document.querySelector("input")!.value = "replay-placeholder-value";
+      });
+      const out: any = await p.evaluate(
+        (log) => (window as any).factoryIsolationReplaySequence(log),
+        recorded.log,
+      );
+      expect(out.before).toEqual(out.after);
+      expect(out.before.kind).toBe("NetRequest");
+      expect(out.text).toBe("field=value");
+      expect(out.clock).toMatchObject({ record: "Clock", src: 2 });
+      expect(out.storage).toMatchObject({
+        record: "StorageRead",
+        key: "foreign-neutral",
+        value: "neutral",
+      });
+      expect(out.result).toEqual(recorded.result);
+      expect(out.raw).toBe(0);
+      expect(out.witnessed).toBe(true);
+      expect(out.status.state).toBe("done");
+      expect(out.status.checkpoints).toBe(1);
+      expect(out.status.tasks).toBe(
+        recorded.records.filter((r: any) => r.record === "Task").length,
+      );
+      expect(requests.length).toBe(count + 1);
+      expect(requests.at(-1)!.url).toBe("/api/foreign?consumer=text");
+    },
+    TIMEOUT,
+  );
+});

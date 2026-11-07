@@ -1,0 +1,37 @@
+{
+  "parent": "316baab32d176b42180409b7ec3be34fb4a1bc39",
+  "entries": [
+    {
+      "file": "packages/boundary-shim/src/browser/seams-net.ts",
+      "changes": [
+        {
+          "current": "        ids !== undefined && responses !== undefined\n          ? prepareFetchCancellation(orig, input, init)\n          : undefined;\n      if (ids === undefined) return origFetch.call(w, input, init);\n      const p = convertedFetch(\n        ctx,\n        origFetch,\n        input,\n        cancellation?.init ?? init,\n      );\n      return p.then(\n        (resp: Response) => {\n          cancellation?.head();\n",
+          "parent": "        ids !== undefined && responses !== undefined\n          ? prepareFetchCancellation(orig, input, init)\n          : undefined;\n      const p = origFetch.call(w, input, cancellation?.init ?? init);\n      if (ids === undefined) return p;\n      return p.then(\n        (resp: Response) => {\n          cancellation?.head();\n"
+        },
+        {
+          "current": "      );\n    };\n  });\n}\n\n/**\n * Native fetch of the page's arguments, converted first by the captured\n * Request constructor: the conversion fetch itself performs (Fetch, \"fetch()\"\n * step 2, https://fetch.spec.whatwg.org/#fetch-method), so every getter,\n * coercion and validation runs once, in the same order, on the same\n * receivers. Replay converts with the same constructor (replay/net.ts), so a\n * conversion exception, whether a value application code threw or the\n * platform's own validation TypeError, is the identical value in both legs.\n * The page sees the constructor's diagnostic context (\"Failed to construct\n * 'Request'\" in Chromium) rather than fetch's, the one native difference\n * (JS-Boundary-Recording \u00a79.7, \"Fetch argument conversion\"). Like fetch, an\n * exception rejects the returned Promise instead of being thrown.\n */\nfunction convertedFetch(\n  { w, orig }: SeamContext,\n  fetch: typeof globalThis.fetch,\n  input: RequestInfo | URL,\n  init: RequestInit | undefined,\n): Promise<Response> {\n  // A realm without a captured constructor keeps native conversion.\n  if (orig.Request === undefined) return fetch.call(w, input, init);\n  let request: Request;\n  try {\n    request = new orig.Request(input, init);\n  } catch (error) {\n    return new orig.Promise<Response>((_, reject) => reject(error));\n  }\n  return fetch.call(w, request);\n}\n\n/** `XMLHttpRequest.readyState` values (XHR standard). */\n",
+          "parent": "      );\n    };\n  });\n}\n\n/** `XMLHttpRequest.readyState` values (XHR standard). */\n"
+        }
+      ],
+      "parentSha256": "05236ca99345884ac99db2149e0ca583bb570f2b763527d865a4308dc571673d"
+    },
+    {
+      "file": "packages/boundary-shim/src/browser/replay/net.ts",
+      "changes": [
+        {
+          "current": "        body_digest: digest ?? \"\",\n      });\n      replay.registerTask(taskId, TaskKind.networkCompletion, 0);\n      // Record converts the page's arguments with this same captured\n      // constructor before its native fetch (seams-net.ts, convertedFetch), so\n      // conversion runs the page's getters and coercions once, as Record did,\n      // and its exception (a value application code threw, of any type, or the\n      // platform's own validation TypeError) is the value Record's page\n      // received. Its provenance is never classified.\n      let conversionThrew = false;\n      let conversionError: unknown;\n      let signal: AbortSignal | undefined;\n      try {\n        const request = new orig.Request(input, init);\n        signal = orig.requestSignal?.descriptor.get?.call(request);\n      } catch (error) {\n        // The recorded network completion, not this synchronous constructor,\n        // owns delivery of the request's rejection.\n        conversionThrew = true;\n        conversionError = error;\n      }\n\n      // Pre-header cancellation returns the actual page reason, including\n",
+          "parent": "        body_digest: digest ?? \"\",\n      });\n      replay.registerTask(taskId, TaskKind.networkCompletion, 0);\n      // Native conversion supplies the suffix Record's real fetch performed.\n      // Capture only an actual top-level application getter throw. Constructor\n      // validation and nested coercion errors keep the existing failure mapping;\n      // an Error/TypeError's name or message never establishes its provenance.\n      let applicationThrew = false;\n      let applicationError: unknown;\n      const observedInit =\n        init !== null &&\n        (typeof init === \"object\" || typeof init === \"function\")\n          ? new Proxy(Object.create(null) as RequestInit, {\n              get(_target, key) {\n                try {\n                  return Reflect.get(init, key, init);\n                } catch (error) {\n                  applicationThrew = true;\n                  applicationError = error;\n                  throw error;\n                }\n              },\n            })\n          : init;\n      let signal: AbortSignal | undefined;\n      try {\n        const request = new orig.Request(input, observedInit);\n        signal = orig.requestSignal?.descriptor.get?.call(request);\n      } catch {\n        // The recorded network completion, not this synchronous constructor,\n        // owns delivery of the request's rejection.\n      }\n\n      // Pre-header cancellation returns the actual page reason, including\n"
+        },
+        {
+          "current": "                    \"abort\",\n                    () => {\n                      reject(\n                        conversionThrew\n                          ? conversionError\n                          : requestFailure(r.outcome),\n                      );\n                      done();\n",
+          "parent": "                    \"abort\",\n                    () => {\n                      reject(\n                        applicationThrew\n                          ? applicationError\n                          : requestFailure(r.outcome),\n                      );\n                      done();\n"
+        },
+        {
+          "current": "                });\n              }\n              reject(\n                conversionThrew ? conversionError : requestFailure(r.outcome),\n              );\n            }\n            return;\n",
+          "parent": "                });\n              }\n              reject(\n                applicationThrew ? applicationError : requestFailure(r.outcome),\n              );\n            }\n            return;\n"
+        }
+      ],
+      "parentSha256": "1dd70dde02d38be3e39f2ae90997cc4ce356555445696113418b514693508a0a"
+    }
+  ]
+}

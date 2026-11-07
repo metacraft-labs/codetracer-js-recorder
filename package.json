@@ -8,8 +8,12 @@
     "packages/instrumenter",
     "packages/instrumenter-core",
     "packages/runtime",
+    "packages/boundary-format",
     "packages/runtime-browser",
+    "packages/boundary-shim",
     "packages/cli",
+    "packages/boundary-replay",
+    "packages/boundary-conformance",
     "packages/express",
     "packages/vite-plugin",
     "packages/webpack-plugin",
@@ -18,17 +22,21 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces",
-    "test": "vitest run && npm run test:verify-cli-convention && npm run test:verify-request-spans",
+    "test": "vitest run && npm run test:verify-cli-convention && npm run test:verify-request-spans && npm run test:verify-jsbound-vectors",
     "test:watch": "vitest",
     "test:verify-cli-convention": "bash tests/verify-cli-convention-no-silent-skip.sh",
-    "test:verify-request-spans": "bash tests/verify-request-spans-no-silent-skip.sh"
+    "test:verify-request-spans": "bash tests/verify-request-spans-no-silent-skip.sh",
+    "test:verify-jsbound-vectors": "bash scripts/vendor-jsbound-vectors.sh --check"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.5.1",
     "@types/node": "^22.0.0",
+    "esbuild": "^0.27.3",
     "express": "^4.21.2",
     "prettier": "^3.4.0",
+    "rollup": "^4.59.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "vitest": "^3.0.0",
+    "webpack": "^5.111.1"
   }
 }

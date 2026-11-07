@@ -35,6 +35,13 @@ import type {
   ManifestSlice,
   MergedManifest,
 } from "@codetracer/instrumenter-core";
+import {
+  injectBoundaryShim,
+  rewriteHtmlImports,
+  rewriteWithEdits,
+  shiftMappings,
+} from "@codetracer/boundary-shim";
+import type { ShimConfig } from "@codetracer/boundary-shim";
 
 /**
  * Dev-server route serving the merged manifest as JSON.
@@ -289,3 +296,78 @@ export function codetracerVitePlugin(
 
 /** Default export for the `import codetracer from "@codetracer/vite-plugin"` shape. */
 export default codetracerVitePlugin;
+
+/**
+ * A Vite plugin that installs the generic boundary-recording shim
+ * (CodeTracer's JS-Boundary-Recording specification, §10) in record mode:
+ * its `transformIndexHtml` inserts the shim's bootstrap `<script>` as the
+ * first element of `<head>`, so the shim patches the page's globals before
+ * any application module runs. With `config.importSeam` (default off) it
+ * also rewrites every dynamic `import()` of `index.html`'s inline scripts
+ * and of every chunk into a call of the shim's seam (§6, §8.1), moving each
+ * chunk's source-map segments past the inserted text; it changes the
+ * page's own code, so it is only done when asked (§16 Q2).
+ *
+ * It does not instrument anything. Boundary recording runs the deployed,
+ * uninstrumented bundle (§8), and the two modes never run together in one
+ * page (§14), so this is a separate plugin rather than an option of
+ * {@link codetracerVitePlugin}.
+ */
+export interface CodetracerBoundaryShimVitePlugin {
+  name: string;
+  enforce: "post";
+  transformIndexHtml(html: string): string;
+  generateBundle(
+    options: unknown,
+    bundle: Record<string, BoundaryShimOutput>,
+  ): void;
+}
+
+/** The slice of a Rollup output chunk (or asset) the plugin rewrites. */
+export interface BoundaryShimOutput {
+  type: "chunk" | "asset";
+  fileName: string;
+  code?: string;
+  map?: { mappings: string } | null;
+}
+
+/**
+ * Build the boundary-shim plugin; `config` is written into every session's
+ * `Header`, and `config.importSeam` turns on the dynamic `import()` seam.
+ */
+export function codetracerBoundaryShimPlugin(
+  config: ShimConfig = {},
+): CodetracerBoundaryShimVitePlugin {
+  return {
+    name: "codetracer:boundary-shim",
+    // After every other plugin's HTML transform, so nothing is inserted
+    // ahead of the shim by a later string transform.
+    enforce: "post",
+    transformIndexHtml(html: string): string {
+      const page =
+        config.importSeam === true
+          ? rewriteHtmlImports(html, "index.html")
+          : html;
+      return injectBoundaryShim(page, config);
+    },
+    // The dynamic import() seam (§6, §10.1), when asked for, in every chunk
+    // the build writes, as `boundary-shim --import-seam` puts it into a
+    // built site; the chunk's source map follows the edits exactly.
+    generateBundle(_options, bundle) {
+      if (config.importSeam !== true) return;
+      for (const out of Object.values(bundle)) {
+        if (out.type !== "chunk" || typeof out.code !== "string") continue;
+        const r = rewriteWithEdits(out.code, out.fileName);
+        if (r.edits.length === 0) continue;
+        out.code = r.code;
+        if (out.map) {
+          out.map.mappings = shiftMappings(
+            out.map.mappings,
+            r.original,
+            r.edits,
+          );
+        }
+      }
+    },
+  };
+}

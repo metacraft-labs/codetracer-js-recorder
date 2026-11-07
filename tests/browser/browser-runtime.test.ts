@@ -494,6 +494,73 @@ class TimingTransport implements BrowserTransport {
   }
 }
 
+// ── The runtime's own read of the page's visibility ─────────────────────
+//
+// In a replayed page (CodeTracer's JS-Boundary-Recording specification
+// §10.5) the boundary shim answers the page's reads of
+// `document.visibilityState` from the log, and the runtime, which flushes
+// when the page is hidden, must not consume one: it reads through the
+// accessor the replay runner published (`__ctReplay.originals`). This suite
+// has no DOM, so the document is a stand-in whose `visibilityState` is the
+// page's (patched) one, counting its reads, and the published original is
+// the platform's; the browser path is held by the boundary suites.
+
+describe("test_runtime_reads_visibility_through_the_published_original", () => {
+  it("flushes when the original says hidden and never reads the page's accessor", () => {
+    const g = globalThis as unknown as Record<string, unknown>;
+    const saved = {
+      document: g.document,
+      addEventListener: g.addEventListener,
+      __ctReplay: g.__ctReplay,
+    };
+    let pageReads = 0;
+    const listeners = new Map<string, () => void>();
+    const doc = {
+      title: "page",
+      addEventListener: (type: string, f: () => void) => listeners.set(type, f),
+    };
+    Object.defineProperty(doc, "visibilityState", {
+      get() {
+        pageReads++;
+        return "visible";
+      },
+    });
+    g.document = doc;
+    g.addEventListener = () => undefined;
+    g.__ctReplay = {
+      originals: {
+        visibilityState: {
+          descriptor: {
+            get(this: unknown) {
+              expect(this).toBe(doc);
+              return "hidden";
+            },
+          },
+        },
+      },
+    };
+    try {
+      const transport = new FakeTransport();
+      const rt = createBrowserRuntime({
+        transportFactory: makeFactory(transport),
+        flushIntervalMs: 0,
+        flushThreshold: 1000,
+      });
+      rt.step(1);
+      expect(transport.sentBatches).toHaveLength(0);
+      listeners.get("visibilitychange")!();
+      expect(pageReads).toBe(0);
+      expect(transport.sentBatches).toHaveLength(1);
+      rt.stop();
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete g[k];
+        else g[k] = v;
+      }
+    }
+  });
+});
+
 describe("test_short_session_streams_before_stop", () => {
   it("delivers a sub-threshold session to the transport during the run", async () => {
     const transport = new TimingTransport();

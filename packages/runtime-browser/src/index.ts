@@ -155,6 +155,89 @@ export type BrowserEvent =
   | SessionStartEvent
   | SessionEndEvent;
 
+// ── Captured originals ──────────────────────────────────────────────────
+//
+// A page recorded at the boundary (CodeTracer's JS-Boundary-Recording
+// specification, §6 and §8) has its `setTimeout`, `WebSocket` and clocks
+// patched by the boundary shim, which logs every timer the page registers and
+// every socket it opens. The runtime's own flush timer and daemon socket are
+// not the page's: if they went through the patched globals they would appear
+// in the recorded task order, and a replay of the instrumented build would
+// diverge from the uninstrumented recording on the first flush. So the
+// runtime uses the functions as they were before any patching:
+//
+//   1. the originals the replay runner publishes (`__ctReplay.originals`);
+//   2. else the originals the boundary shim published when it installed
+//      (`__ctBoundaryShim.originals`) — the shim is the first script of the
+//      page, so it captured them before anything else could patch them;
+//   3. else the globals as they were when this module was evaluated.
+
+/** The platform functions the runtime calls, captured before any patching. */
+export interface RuntimeOriginals {
+  setTimeout: typeof setTimeout;
+  clearTimeout: typeof clearTimeout;
+  WebSocket: (new (url: string) => unknown) | undefined;
+  dateNow: () => number;
+  performanceNow: (() => number) | undefined;
+  /**
+   * `Document.prototype.visibilityState`'s accessor, read when the page is
+   * hidden to flush: in a replayed page the shim answers the page's reads
+   * of it from the log, and the runtime's own read is none of them.
+   */
+  visibilityState: { descriptor: PropertyDescriptor } | undefined;
+}
+
+type PublishedOriginals = Partial<RuntimeOriginals> | undefined;
+
+function globalOriginals(): RuntimeOriginals {
+  const g = globalThis as {
+    WebSocket?: new (url: string) => unknown;
+    performance?: { now?: () => number };
+    Document?: { prototype: Document };
+  };
+  const visibility =
+    g.Document === undefined
+      ? undefined
+      : Object.getOwnPropertyDescriptor(
+          g.Document.prototype,
+          "visibilityState",
+        );
+  return {
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+    WebSocket: g.WebSocket,
+    dateNow: Date.now,
+    performanceNow: g.performance?.now,
+    visibilityState:
+      visibility?.get === undefined ? undefined : { descriptor: visibility },
+  };
+}
+
+const MODULE_ORIGINALS: RuntimeOriginals = globalOriginals();
+
+/**
+ * The originals the runtime uses (see the lookup order above). Each entry
+ * falls back separately, so a publisher that captured only some of them
+ * still wins for those.
+ */
+export function resolveOriginals(): RuntimeOriginals {
+  const g = globalThis as {
+    __ctReplay?: { originals?: PublishedOriginals };
+    __ctBoundaryShim?: { originals?: PublishedOriginals };
+  };
+  const published = g.__ctReplay?.originals ?? g.__ctBoundaryShim?.originals;
+  return {
+    setTimeout: published?.setTimeout ?? MODULE_ORIGINALS.setTimeout,
+    clearTimeout: published?.clearTimeout ?? MODULE_ORIGINALS.clearTimeout,
+    WebSocket: published?.WebSocket ?? MODULE_ORIGINALS.WebSocket,
+    dateNow: published?.dateNow ?? MODULE_ORIGINALS.dateNow,
+    performanceNow:
+      published?.performanceNow ?? MODULE_ORIGINALS.performanceNow,
+    visibilityState:
+      published?.visibilityState ?? MODULE_ORIGINALS.visibilityState,
+  };
+}
+
 // ── Transport ────────────────────────────────────────────────────────────
 
 /**
@@ -174,15 +257,16 @@ export interface BrowserTransport {
 export type TransportFactory = (url: string) => BrowserTransport;
 
 /**
- * Default transport factory — uses the WHATWG `WebSocket` global.
+ * Default transport factory — uses the WHATWG `WebSocket` constructor as it
+ * was before any patching ({@link resolveOriginals}), so a boundary shim on
+ * the page does not log the daemon socket as one the page opened.
  *
  * Bundler-plugin / test environments can override this so the runtime
  * never references the `WebSocket` symbol at module-evaluation time
  * (avoids `ReferenceError` in non-browser smoke tests).
  */
 export const defaultWebSocketFactory: TransportFactory = (url) => {
-  const Ctor = (globalThis as { WebSocket?: new (u: string) => unknown })
-    .WebSocket;
+  const Ctor = resolveOriginals().WebSocket;
   if (!Ctor) {
     throw new Error(
       "WebSocket is not available in this environment; provide a custom transportFactory",
@@ -560,6 +644,9 @@ export function createBrowserRuntime(
   const threshold = options.flushThreshold ?? DEFAULT_FLUSH_THRESHOLD;
   const flushIntervalMs = options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
   const factory = options.transportFactory ?? defaultWebSocketFactory;
+  // The flush timer goes through the originals, not the page's globals:
+  // see resolveOriginals.
+  const originals = resolveOriginals();
 
   let transport: BrowserTransport | null = null;
   try {
@@ -581,7 +668,7 @@ export function createBrowserRuntime(
   function cancelFlushTimer(): void {
     if (flushTimer === null) return;
     try {
-      clearTimeout(flushTimer);
+      originals.clearTimeout.call(globalThis, flushTimer);
     } catch {
       // Some sandboxed contexts restrict timers; never let it propagate.
     }
@@ -590,9 +677,13 @@ export function createBrowserRuntime(
 
   function armFlushTimer(): void {
     if (flushIntervalMs <= 0 || flushTimer !== null || stopped) return;
-    if (typeof setTimeout !== "function") return;
+    if (typeof originals.setTimeout !== "function") return;
     try {
-      flushTimer = setTimeout(onFlushDeadline, flushIntervalMs);
+      flushTimer = originals.setTimeout.call(
+        globalThis,
+        onFlushDeadline,
+        flushIntervalMs,
+      );
       // Node keeps its event loop alive for a pending timer.  A recorder
       // must never be the reason a process (or a test runner) refuses to
       // exit; browsers have no `unref` and need none.
@@ -679,7 +770,14 @@ export function createBrowserRuntime(
       globalThis.addEventListener("beforeunload", safeFlushOnLifecycle);
       if (typeof document !== "undefined") {
         document.addEventListener("visibilitychange", () => {
-          if (document.visibilityState === "hidden") {
+          // Through the original accessor (resolveOriginals): in a replayed
+          // page the shim answers the page's reads from the log.
+          const get = originals.visibilityState?.descriptor.get;
+          const state =
+            get === undefined
+              ? document.visibilityState
+              : (get.call(document) as unknown);
+          if (state === "hidden") {
             safeFlushOnLifecycle();
           }
         });
@@ -823,3 +921,21 @@ export function installBrowserRuntime(
   (globalThis as { __ct?: CtBrowserRuntime }).__ct = runtime;
   return runtime;
 }
+
+// ── Boundary recording's batched upload transport ───────────────────────
+//
+// `HttpBatchTransport` (CodeTracer's JS-Boundary-Recording specification
+// §11.1) lives in its own module so the boundary shim's bundle can import it
+// without the `__ct` runtime above (`@codetracer/runtime-browser/dist/batch-transport.js`).
+export * from "./batch-transport.js";
+
+// ── Browser error reports ───────────────────────────────────────────────
+//
+// The opt-in error reporter (uncaught errors and unhandled rejections become
+// scrubbed reports, uploaded only with the page's consent and never under Do
+// Not Track or Global Privacy Control) and the server-rendered response's
+// W3C trace context it attaches. Each is its own module, importable by its
+// subpath like the transport.
+export * from "./error-report.js";
+export * from "./trace-context.js";
+export * from "./error-frames.js";
