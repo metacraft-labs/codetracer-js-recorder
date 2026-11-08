@@ -32,7 +32,12 @@ function checkpoint(seq: number, ordinal: number): Rec {
 
 /** Records after the due point, closed by a final checkpoint and `End`. */
 function run(...middle: Rec[]): Rec[] {
-  const tail = [...middle, checkpoint(0, 1), { record: "End", seq: 0 }];
+  const finalOrdinal = middle.filter((r) => r.record === "Checkpoint").length;
+  const tail = [
+    ...middle,
+    checkpoint(0, finalOrdinal),
+    { record: "End", seq: 0 },
+  ];
   // Renumber so seqs ascend from the due prefix; the final checkpoint takes
   // the seq after the middle records.
   let seq = 257;
@@ -74,5 +79,38 @@ describe("checkpointCadence: a checkpoint's place relative to a sensitive input"
       ),
       violations.join("\n"),
     ).toBe(true);
+  });
+});
+
+describe("checkpointCadence: which record a missing-checkpoint violation names", () => {
+  it("names the Task, not the Scrubbed before it, when a checkpoint sits between them", () => {
+    // Scrubbed(257) Checkpoint(258) Task(259): the macrotask starts at the
+    // Scrubbed, which no checkpoint precedes, so the due checkpoint is
+    // reported missing. The message names the Task, not the Scrubbed.
+    const records = run(
+      { record: "Scrubbed", seq: 0, target: "t", class: 1, length: 4 },
+      checkpoint(0, 0),
+      { record: "Task", seq: 0, kind: 5 },
+      { record: "Input", seq: 0 },
+    );
+    const { violations } = checkpointCadence(records);
+    expect(violations).toEqual(["no checkpoint before the task at seq 259"]);
+  });
+
+  it("names the Task after a run of DomEffects and Scrubbeds with no checkpoint", () => {
+    const records = run(
+      { record: "DomEffect", seq: 0, target: "t", effect: 1, value: '"x"' },
+      { record: "Scrubbed", seq: 0, target: "t", class: 1, length: 4 },
+      { record: "Task", seq: 0, kind: 5 },
+      { record: "Input", seq: 0 },
+    );
+    const { violations } = checkpointCadence(records);
+    expect(violations).toEqual(["no checkpoint before the task at seq 259"]);
+  });
+
+  it("names a Task that no pre-Task record precedes by its own seq", () => {
+    const records = run({ record: "Task", seq: 0, kind: 5 });
+    const { violations } = checkpointCadence(records);
+    expect(violations).toEqual(["no checkpoint before the task at seq 257"]);
   });
 });

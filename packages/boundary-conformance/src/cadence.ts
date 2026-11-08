@@ -68,6 +68,26 @@ function isTaskStart(records: readonly BoundaryRecord[], i: number): boolean {
   return !isPreTaskRecord(records[i - 1]);
 }
 
+/**
+ * The `seq` a violation about the macrotask starting at `i` names: its
+ * `Task`, the record a checkpoint taken at this boundary precedes, not the
+ * `DomEffect` or `Scrubbed` before it. A checkpoint can sit between the two
+ * (the recorder takes it at the start of the next macrotask, which for an
+ * input event is before its pre-`Task` records, but a log whose checkpoint
+ * is later still has the macrotask start at the first of them; a
+ * `Checkpoint` there is skipped over to reach the `Task`), and naming
+ * the first record would point at a place the checkpoint is not at. A run
+ * of pre-`Task` records that no `Task` ends names its first record.
+ */
+function taskSeq(records: readonly BoundaryRecord[], i: number): number {
+  let j = i;
+  while (isPreTaskRecord(records[j]) || records[j]?.record === "Checkpoint") {
+    j += 1;
+  }
+  const t = records[j]?.record === "Task" ? records[j] : records[i];
+  return Number((t as { seq: number | bigint }).seq);
+}
+
 /** Check `records` (a decoded log, in order) against §7.3's cadence. */
 export function checkpointCadence(
   records: readonly BoundaryRecord[],
@@ -143,7 +163,9 @@ export function checkpointCadence(
       return;
     }
     if (isTaskStart(records, i) && due()) {
-      violations.push(`no checkpoint before the task at seq ${r.seq}`);
+      violations.push(
+        `no checkpoint before the task at seq ${taskSeq(records, i)}`,
+      );
     }
     since += 1;
     if (r.record === "Clock") {
