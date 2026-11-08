@@ -7,7 +7,8 @@
  *
  * §7.3: a checkpoint is taken at a quiescent point, which a recorder sees
  * as the start of the next macrotask (before its `Task`, or for an input
- * event before the `DomEffect`s its `Task` follows), at most once there;
+ * event before the `DomEffect`s and `Scrubbed` records its `Task` follows),
+ * at most once there;
  * it is due when 256 seq-bearing records, or 2000 ms of recorded time, have
  * passed since the last one; and a final checkpoint precedes `End` when
  * anything was written since the last one. Recorded time comes from the
@@ -47,14 +48,24 @@ export function clockValue(bits: bigint): number {
 }
 
 /**
+ * Whether `r` is a record an input event writes before its `Task`: a
+ * `DomEffect` for a default action, or a `Scrubbed` in place of a value
+ * `DomEffect` at a sensitive field (§9.5, §11.3.9: "a `Scrubbed` record
+ * precedes an `Input` as a `DomEffect` does").
+ */
+function isPreTaskRecord(r: BoundaryRecord | undefined): boolean {
+  return r?.record === "DomEffect" || r?.record === "Scrubbed";
+}
+
+/**
  * Whether the record at `i` starts a macrotask: a `Task` that no
- * `DomEffect` precedes, or the first of a run of `DomEffect`s (which an
- * input event's `Task` follows).
+ * pre-`Task` record precedes, or the first of a run of pre-`Task` records
+ * (`DomEffect`s and `Scrubbed`s, which an input event's `Task` follows).
  */
 function isTaskStart(records: readonly BoundaryRecord[], i: number): boolean {
   const r = records[i];
-  if (r.record === "Task") return records[i - 1]?.record !== "DomEffect";
-  return r.record === "DomEffect" && records[i - 1]?.record !== "DomEffect";
+  if (r.record !== "Task" && !isPreTaskRecord(r)) return false;
+  return !isPreTaskRecord(records[i - 1]);
 }
 
 /** Check `records` (a decoded log, in order) against §7.3's cadence. */
