@@ -426,6 +426,16 @@ async function tickRunsOf(page: TPage): Promise<TickRun[]> {
 const CLOCK_GRAIN_MS = 0.5;
 
 /**
+ * How long after Chromium computed a tick's next fire time the page reads
+ * `performance.now()` in that tick's callback. Both are in one task, so the
+ * gap is the renderer running that task's first statements, and a
+ * preemption inside it adds to the gap. {@link pageRuns} takes the previous
+ * tick's read back by this much, so its bound stays a lower bound. An
+ * assumption: 5 ms (one tick of the page's interval), not a measured maximum.
+ */
+const TICK_READ_LAG_MS = 5;
+
+/**
  * Each page time read (a `Clock` of `performance.now()`), sorted by when it
  * ran, with a lower bound on when it came due.
  *
@@ -440,12 +450,16 @@ const CLOCK_GRAIN_MS = 0.5;
  * The grid starts no earlier than the `t0` the page read just before it
  * called `setInterval`, so the run's `k`-th tick is due no earlier than
  * `t0 + k * interval`: at that grid point, or at a later one after a skip.
- * The bound holds whatever the page's tasks cost, which a bound taken from
- * when the tick before ran does not: the browser takes the time it
- * schedules the next tick from before the shim and the page start their
- * work, and a stalled renderer can stop between the two (under a 32-way CPU
- * load such a bound put a tick 3 ms after it ran in two runs of five). After a
- * skip the bound is low by the points skipped, which only excuses more.
+ * The run's `k`-th tick is also due on the grid after the time the
+ * `(k-1)`-th tick ran: Blink computes the next fire time before it runs the
+ * callback, as the first grid point after the tick's own time, so a skip
+ * moves the next due time up to that point, which the grid bound does not
+ * (after a skip it is low by the points skipped, which only excuses more).
+ * The tick's own time is the browser's, and the page reads it a little later
+ * in the same task, so this takes the previous read back by
+ * {@link TICK_READ_LAG_MS}. A gap longer than that (a renderer preempted in
+ * that task) would put the bound above the true due time; the bound never
+ * exceeds the time the tick ran, so the model's check above still holds.
  * A read that is not one of the run's ticks (the page's `t0` itself, a
  * read past the run's last tick, or one before any run) gets no bound:
  * nothing says when it came due, so it never counts as due after an aim.
@@ -458,6 +472,8 @@ function pageRuns(
   const out: { ran: number; due: number }[] = [];
   let phase: TickRun | undefined;
   let k = 0;
+  // The previous tick of the run, as the page recorded it.
+  let prev: number | undefined;
   for (const ran of sorted) {
     // The run of ticks this read belongs to: the latest started by then.
     const current = runs
@@ -468,13 +484,32 @@ function pageRuns(
     if (current !== phase) {
       phase = current;
       k = 0;
+      prev = undefined;
     }
     if (phase === undefined || ran === phase.t0 || k >= phase.ticks) {
       out.push({ ran, due: -Infinity });
       continue;
     }
     k += 1;
-    const due = phase.t0 + k * phase.interval;
+    const grid = phase.t0 + k * phase.interval;
+    // Chromium computes a repeating timer's next fire time before it runs
+    // the callback (`TimerBase::RunInternal`): the first grid point after
+    // the tick's own time. So tick k is due on the grid after tick k-1 ran,
+    // less the lag between that time and this read. The grid bound alone
+    // falls behind by every point a run skipped.
+    const scheduled =
+      prev === undefined
+        ? -Infinity
+        : phase.t0 +
+          (Math.floor((prev - TICK_READ_LAG_MS - phase.t0) / phase.interval) +
+            1) *
+            phase.interval;
+    // A tick cannot run before it came due, so the schedule term never
+    // exceeds the time the tick ran: a read lagged further than
+    // TICK_READ_LAG_MS would otherwise put it above that. The grid term is
+    // not clamped, so the model's check below still bites on it.
+    const due = Math.max(grid, Math.min(scheduled, ran));
+    prev = ran;
     // The model's own check: no tick runs before the bound says it came
     // due. A browser that scheduled intervals otherwise, or a read the page
     // made among its ticks, fails here, loudly, rather than by excusing
@@ -1967,6 +2002,28 @@ describe("the flush-deadline oracle", () => {
     const sends = new Map([
       [0, { t: 626, answered: 627 }],
       [1, { t: 833.9 }],
+    ]);
+    expect(() => checkWaits(got, sends, deadline, RUNS)).toThrow(
+      /came due after the aim/,
+    );
+  });
+
+  it("oracle_fails_a_tick_due_after_the_aim_once_the_run_skipped_points", () => {
+    // Positive control for the schedule bound: the page stalled from 700 to
+    // 800, skipping the grid points between, then ticked on time to 830.
+    // The tick read at 830 came due after the tick read at 825 ran, so no
+    // earlier than 825 less the read's lag: after the aim (820). It ran
+    // before the batch left at 834, so the flush timer was aimed late. The
+    // grid bound for it is 735 (its 28th run, taken as the 28th grid point,
+    // which skipped points make too early) and would excuse it; the schedule
+    // bound does not.
+    const got = [
+      batchOf(0, onTime(600, 625)),
+      batchOf(1, [...onTime(630, 700), ...onTime(800, 830)]),
+    ];
+    const sends = new Map([
+      [0, { t: 626, answered: 627 }],
+      [1, { t: 834 }],
     ]);
     expect(() => checkWaits(got, sends, deadline, RUNS)).toThrow(
       /came due after the aim/,
