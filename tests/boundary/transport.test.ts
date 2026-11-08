@@ -458,8 +458,10 @@ const TICK_READ_LAG_MS = 5;
  * The tick's own time is the browser's, and the page reads it a little later
  * in the same task, so this takes the previous read back by
  * {@link TICK_READ_LAG_MS}. A gap longer than that (a renderer preempted in
- * that task) would put the bound above the true due time; the bound never
- * exceeds the time the tick ran, so the model's check above still holds.
+ * that task) would put the schedule term above the true due time, so that
+ * term is clamped: it never exceeds the time the tick ran. The grid term is
+ * not clamped; the model's check below catches a grid term above the time
+ * the tick ran.
  * A read that is not one of the run's ticks (the page's `t0` itself, a
  * read past the run's last tick, or one before any run) gets no bound:
  * nothing says when it came due, so it never counts as due after an aim.
