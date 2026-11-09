@@ -21,6 +21,19 @@
  * parsed (a `Loading` record with phase 1) is parsing from its start until
  * a `Loading` with a later phase, or the `DocTask` of `DOMContentLoaded` or
  * `load`; the `Loading` that starts a macrotask precedes its checkpoint.
+ *
+ * Which macrotask a due checkpoint lands before is decided by event
+ * dispatch, not by the cadence: the recorder takes it at the first
+ * macrotask start after the 256th record (or the 2000 ms mark). Measured
+ * at codetracer-js-recorder `e1a67fe` (the generic shim, level 0, the
+ * `sensitive-*` fixtures, 12 busy loops on the host, 2026-11-09): a typed
+ * character is five macrotasks (keydown, keypress, beforeinput, input,
+ * keyup), the checkpoint lands at seq 257 or 259, and which of the five
+ * the 256th record falls before moves with the log's length so far, which
+ * timing changes. In 2 of 180 logs the 256th record ended `beforeinput`,
+ * so the checkpoint came before the `input` macrotask, whose first record
+ * is a `Scrubbed`; in the rest it came before a keydown or keyup `Task`.
+ * The oracle accepts every such start.
  */
 
 import type { BoundaryRecord } from "@codetracer/boundary-format";
