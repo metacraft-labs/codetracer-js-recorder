@@ -30,9 +30,9 @@
  * character is five macrotasks (keydown, keypress, beforeinput, input,
  * keyup), the checkpoint lands at seq 257 or 259, and which of the five
  * the 256th record falls before moves with the log's length so far, which
- * timing changes. In 2 of 180 logs the 256th record ended `beforeinput`,
- * so the checkpoint came before the `input` macrotask, whose first record
- * is a `Scrubbed`; in the rest it came before a keydown or keyup `Task`.
+ * timing changes. Of 180 logs, 176 had the checkpoint before a keyup
+ * `Task`, 2 before a keypress `Task`, and 2 before the `input` macrotask,
+ * whose first record is a `Scrubbed` (the 256th record ended `beforeinput`).
  * The oracle accepts every such start.
  */
 
