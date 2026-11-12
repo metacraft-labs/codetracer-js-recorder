@@ -97,6 +97,19 @@ jobs:
         # Re-runs the legacy `just build` path inside the same env so
         # we catch silent divergences between `repro build` outputs
         # and what the dev shell + Justfile produce today.
+        #
+        # Windows: a bound, so a hang fails this leg instead of holding one
+        # of the fleet's two Windows slots until the job's 6 h limit. On
+        # 2026-11-12 (run 43202169561) this step went silent after `npx napi
+        # build` and was cancelled 2 h 18 min later. The step does the same
+        # cargo release build as `repro build` above plus `npm install` and
+        # `tsc`; `repro build` from cold took 4 min 17 s to 4 min 56 s on
+        # windows-x64 (runs 42312739264, 42322746979, 43202169561), and no
+        # Windows run had reached the napi build before, so 20 min is about
+        # four times the measured cold build. Linux and macOS keep the job
+        # default until a run of theirs gives this step a duration to size
+        # from.
+        timeout-minutes: ${{ matrix.os == 'windows' && 20 || 360 }}
         run: dev-exec just build
 
       - name: Build codetracer test binaries
