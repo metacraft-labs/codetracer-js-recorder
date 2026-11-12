@@ -23,12 +23,10 @@
  *   3. The page-side `__ct.value("z", z)` value is recorded against its
  *      name (proof that the value path lowers cleanly into the recording).
  *
- * Skip discipline (Recorder-CLI-Conventions §1 / §6): the test prints
- * `SKIP:` with the precise missing prerequisite so a CI runner that
- * does not ship the relevant infrastructure has an actionable failure
- * reason rather than a silent pass.  The companion CI script at
- * `codetracer-specs/Planned-Features/value-origin-ci-scripts/run-m26-full-stack.sh`
- * is the runnable surface for an infra-equipped runner.
+ * Skip discipline: the test prints `SKIP:` with the precise missing
+ * prerequisite so a CI runner that does not ship the relevant
+ * infrastructure has an actionable failure reason rather than a silent
+ * pass.
  */
 
 import { describe, it, expect } from "vitest";

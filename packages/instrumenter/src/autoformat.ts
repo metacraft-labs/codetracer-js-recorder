@@ -1,8 +1,6 @@
 /**
  * Recorder-side autoformat for minified JavaScript / TypeScript sources.
  *
- * Spec: `codetracer-specs/Planned-Features/Column-Aware-Tracing-And-Deminification.milestones.org` §P6.2.
- *
  * When a recorded source looks minified (average non-empty line length
  * exceeds the configurable threshold), we shell out to `prettier` once
  * at record-start, capture the formatted output, and synthesise a

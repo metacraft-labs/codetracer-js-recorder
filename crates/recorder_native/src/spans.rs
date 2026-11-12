@@ -23,10 +23,9 @@
 //!
 //! # The structural bits are measured, never declared
 //!
-//! `codetracer-specs/Planned-Features/Trace-Spans.md` §2.4 is explicit that
 //! `contiguous_on_one_thread` is a property of the recorder's stream layout,
-//! not of the language, and that a recorder must compute it rather than copy a
-//! row from the worked-examples table.  For this recorder:
+//! not of the language, so a recorder must compute it from what it recorded
+//! rather than assume a fixed value for its language.  For this recorder:
 //!
 //! * **`shares_timeline` is always true.**  A Node process is one recording
 //!   with one exec stream; every span is a slice of that one ordering.
@@ -94,8 +93,8 @@ impl PendingSpan {
     /// The span's metadata as the settled record should carry it: the
     /// open-time pairs in emission order, then the close-time pairs, with a
     /// close-time value replacing an open-time one **in place** when the keys
-    /// collide.  Metadata order is part of the wire contract
-    /// (`CTFS-Request-Span-Streams.md` §"Record Model"), so this must be
+    /// collide.  Metadata order is part of the span record's wire format
+    /// (a reader sees the pairs in the order written), so this must be
     /// deterministic and must not go through a hash map.
     pub fn merged_metadata(&self) -> Vec<(String, String)> {
         let mut merged = self.open_metadata.clone();

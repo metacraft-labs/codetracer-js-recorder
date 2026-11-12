@@ -2,8 +2,9 @@
 ##
 ## Ships an npm package whose native addon is implemented in Rust +
 ## napi-rs. The recipe expresses the cargo build + test edges
-## natively per ``codetracer-specs/Repo-Requirements.md`` §2.8 — no
-## ``shell(command = "just ..."")`` delegations.
+## natively — no ``shell(command = "just ..."")`` delegations — so the
+## engine sees each edge's inputs and outputs and can cache and invalidate
+## them, which a delegated ``just`` call would hide from it.
 ##
 ## **Tool provisioning.** The engine refuses ``uses:`` declarations
 ## without a provisioning mode (it will not fall back to PATH

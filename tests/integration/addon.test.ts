@@ -93,7 +93,7 @@ describe("test_addon_start_recording", () => {
 
     // The trace directory should exist with the canonical CTFS .ct
     // container.  The legacy `trace.json` events sidecar must NOT exist
-    // (Recorder-CLI-Conventions.md §4 — CTFS-only).  The legacy
+    // (the recorder writes only CTFS).  The legacy
     // `trace_metadata.json` / `trace_paths.json` operational sidecars
     // were retired with the v3 CTFS rollout (follow-up #254 phase 2);
     // program / paths metadata now lives in `meta.dat` inside the `.ct`

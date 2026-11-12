@@ -9,11 +9,11 @@
 #
 #   metacraft-labs/codetracer/.github/workflows/launcher-recorder-e2e.yml
 #
-# Design: codetracer-specs/Testing/Launcher-Recorder-Compatibility-Tests.md
-#         section 6 "CI wiring: three trigger edges, one reusable workflow".
-# Milestone: LRC-4 (the js edge of the fan-out; the workflow itself is LRC-3).
+# The gate has three trigger edges -- a change to the launcher, to the desktop
+# core, or to a recorder -- and all three call that one reusable workflow.
+# This file is the edge for a change to this recorder.
 #
-# WHY THIS EDGE IN PARTICULAR.  `.js` is the extension milestone LRC-1 ADDED to
+# WHY THIS EDGE IN PARTICULAR.  `.js` is an extension that was only later ADDED to
 # codetracer/resources/codetracer-desktop-capabilities.  Before that fix the
 # capability file declared `record .py .rb .nr .styl .wasm`, so the launcher
 # returned `mkNone` for `ct record app.js` and refused to route it: THIS
@@ -27,8 +27,9 @@
 # `${{ github.sha }}`, and inside a reusable workflow that context is the
 # caller's.  The launcher, the desktop core and codetracer-trace-format-nim are
 # cloned beside it at the revisions the per-commit WORKSPACE LOCK pins for this
-# commit, per metacraft-dev-guidelines/policies/ci-shared-dev-env.md section
-# 3.2.  Until milestone LRC-6 this caller passed `recorder-ref:
+# commit: a CI run builds the siblings a lock names, never a branch tip, so
+# a re-run of the same commit builds the same sources.  Until that change this
+# caller passed `recorder-ref:
 # ${{ github.sha }}` and the other three repos were taken at their mainline
 # branch TIP, which pins nothing: the same commit of this repo built against a
 # different launcher on every re-run, and `clone-siblings` reported it with a

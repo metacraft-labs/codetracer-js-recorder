@@ -4,18 +4,19 @@
  * Mirrors `@codetracer/runtime`'s `__ct.step/enter/ret/write` surface but
  * targets a *browser* environment. Instead of buffering to a Rust N-API
  * addon (which requires Node) it produces a **newline-delimited JSON event
- * stream** and ships it over WebSocket to the M26 daemon receiver.
+ * stream** and ships it over WebSocket to the recording daemon's receiver
+ * (`session-manager record-web`).
  *
- * Wire format and policy come from
- * `codetracer-specs/GUI/Debugging-Features/Value-Origin-Tracking.md` §14.4:
+ * The wire format and its policy:
  *
  *   * One event per line, JSON-encoded.
  *   * Event variants mirror `TraceLowLevelEvent`
- *     (`Step`, `Call`, `Return`, `Assignment`, `Value`, …) as documented in
- *     `codetracer-specs/Trace-Files/Trace-Event-Types.md`.
+ *     (`Step`, `Call`, `Return`, `Assignment`, `Value`, …), the event enum
+ *     of the codetracer-trace-format crates
+ *     (https://github.com/metacraft-labs/codetracer-trace-format).
  *   * **No protocol shims.** The browser recorder never intercepts
  *     `fetch` / `XMLHttpRequest` / `WebSocket` / `window.postMessage`.
- *     Cross-process correlation rides on the M25 user-placed marker
+ *     Cross-process correlation rides on the user-placed marker
  *     mechanism (`ct.mark_correlation_send(...)` / `mark_correlation_recv(...)`)
  *     emitted as a regular tracepoint event through the same JSON stream.
  *
@@ -27,8 +28,8 @@
 
 // ── JSON event vocabulary ───────────────────────────────────────────────
 //
-// These shapes mirror the canonical `TraceLowLevelEvent` enum in
-// `codetracer-specs/Trace-Files/Trace-Event-Types.md`. We send the JSON
+// These shapes mirror the canonical `TraceLowLevelEvent` enum of the
+// codetracer-trace-format crates. We send the JSON
 // representation on the wire (one event per line); the daemon translates
 // to the CTFS split-binary / CBOR-Zstd encoding before persisting.
 
@@ -334,15 +335,13 @@ const DEFAULT_ENDPOINT = "ws://localhost:9230/ct-stream";
 //
 // Two bounds, and the buffer drains at whichever is reached first. Both
 // numbers are here rather than inline because the trade-off between them is
-// the whole design and the count alone had no rationale recorded against it
-// (M38d).
+// the whole design and the count alone had no rationale recorded against it.
 //
 // The cost being traded is a WebSocket frame per event against a recording
-// that only exists once the page has ended. `WASM-Replay-Snapshots-And-Slices.md`
-// §2 requires the second not to happen: a replaying consumer derives snapshots
-// from this stream *while the page runs*, so a recording delivered in one batch
-// at `stop()` makes §2's timeline unreachable however promptly everything
-// downstream works. A count-only policy does exactly that for any page
+// that only exists once the page has ended. The second must not happen: a
+// replaying consumer derives snapshots from this stream *while the page runs*,
+// so a recording delivered in one batch at `stop()` leaves it nothing to work
+// on until the page is gone, however promptly everything downstream works. A count-only policy does exactly that for any page
 // producing fewer events than the threshold — which is most short pages, and
 // every fixture in this repo.
 //
@@ -575,9 +574,10 @@ export interface CtBrowserRuntime {
   write(siteId: number, value?: unknown): void;
   value(name: string, value: unknown): void;
   /**
-   * M25 user-placed correlation marker.  Mirrors the Python helpers from
-   * `codetracer-specs/GUI/Debugging-Features/Correlation-Markers.md` §3.
-   * No protocol shim runs — the user's own code calls this at the source
+   * User-placed correlation marker.  Mirrors the Python recorder's
+   * `mark_correlation_send` / `mark_correlation_recv` helpers: the two ends of
+   * one value crossing a process boundary carry the same id, so a reader can
+   * pair them.  No protocol shim runs — the user's own code calls this at the source
    * location where the value crosses a boundary.
    */
   markCorrelation(

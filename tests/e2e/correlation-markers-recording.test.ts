@@ -20,9 +20,10 @@
  * data structure cannot see, and the reason every assertion below goes
  * through a decoder rather than through the recorder's internals.
  *
- * See `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`
- * §10.2 (one index, two kinds), §11a (one writer-library API, thin
- * bindings) and §11a.6 (a marker mints no step).
+ * The contract these assertions hold the recorder to: correlation markers
+ * and span-coverage declarations share one index in the container, told
+ * apart by kind; every recorder writes them through the one trace-writer
+ * library API, its own bindings staying thin; and a marker mints no step.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";

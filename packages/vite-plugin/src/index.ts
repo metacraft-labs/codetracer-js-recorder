@@ -18,11 +18,8 @@
  * downstream that reasons about source (origin chains, the editor pane,
  * correlation-marker locations) degrades to opaque ids.
  *
- * Spec cross-reference:
- *   * `Planned-Features/Value-Origin-Tracking.milestones.org` M26
- *     deliverable 6 — Vite plugin instruments during dev-server
- *     transform; HMR-triggered re-builds re-instrument only changed
- *     modules.
+ * What it must do: instrument during the dev-server transform, and on an
+ * HMR-triggered re-build re-instrument only the modules that changed.
  */
 
 import {

@@ -93,8 +93,6 @@ export interface WriteEntry {
  * debugger pairs them by `(boundary, key)`. The pairing is string
  * equality on the key, so the *same* logical identifier must be passed
  * on both sides.
- *
- * See `codetracer-specs/GUI/Debugging-Features/Correlation-Markers.md`.
  */
 export interface CorrelationMarkerEntry {
   /** Discriminates the two kinds the correlation index holds. */
@@ -132,9 +130,8 @@ export interface CorrelationMarkerEntry {
  * {@link CorrelationMarkerEntry} but NOT its shape: a span has no
  * send/recv sense and no pairing domain, so forcing it into a
  * `MarkerPayload` would make the pair index try to pair spans with each
- * other. See
- * `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md` §10.2 —
- * one namespace, two kinds.
+ * other. Both kinds share one namespace in the container's correlation
+ * index, told apart by `kind`.
  */
 export interface SpanCoverageMarkerEntry {
   /** Discriminates the two kinds the correlation index holds. */

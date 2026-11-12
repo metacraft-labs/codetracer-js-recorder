@@ -34,8 +34,8 @@ if (command === "--version" || command === "-V") {
 
 if (!command || command === "--help" || command === "-h") {
   // The recorder always writes the canonical CTFS multi-stream container.
-  // There is no `--format` flag and no `CODETRACER_FORMAT` env var — see
-  // codetracer-specs/Recorder-CLI-Conventions.md §4.  For human-readable
+  // There is no `--format` flag and no `CODETRACER_FORMAT` env var: like
+  // every CodeTracer recorder it writes no other format.  For human-readable
   // conversion of the produced `.ct` bundle, use `ct print` shipped with
   // codetracer-trace-format-nim.
   console.log(`Usage:

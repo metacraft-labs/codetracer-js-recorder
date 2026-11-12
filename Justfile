@@ -54,13 +54,14 @@ build-codetracer-test-bins:
 verify-jsbound-vectors:
     bash scripts/vendor-jsbound-vectors.sh --check
 
-# Verify the RS-M9 web-request span coverage is present and running.
+# Verify the web-request span coverage is present and running.
 # This is a no-silent-skip shell guard — every assertion either passes
 # or fails loudly.  Wired into both `just lint` and `just test`.
 verify-request-spans:
     bash tests/verify-request-spans-no-silent-skip.sh
 
-# Verify CLI convention compliance (Recorder-CLI-Conventions.md §4 / §5).
+# Verify CLI convention compliance: CTFS-only output (no `--format` flag, no
+# CODETRACER_FORMAT) and the environment-variable fallbacks for the flags.
 # This is a no-silent-skip shell guard — every assertion either passes
 # or fails loudly.  Wired into both `just lint` and `just test`.
 verify-cli-convention:
@@ -148,9 +149,11 @@ bump-version version:
         f.write_text(json.dumps(data, indent=2) + "\n")
         print(f"{f} -> {new}")
 
-# --- M13: Packaging UX Standardization ---
-# Implements Repo-Requirements.md §2.5 packaging UX for the JS
-# language-ecosystem recorder. Single channel: npm.
+# --- Packaging ---
+# Every recorder exposes the same packaging recipes: `build-package <channel>`
+# builds a release artifact and `verify-package <channel>` checks it, with a
+# `build-<channel>` / `verify-<channel>` shortcut per channel. The JS
+# language-ecosystem recorder has a single channel: npm.
 
 # Build a release artifact for the given channel.
 # Supported channels: npm
@@ -198,7 +201,7 @@ build-npm:
 verify-npm:
     just verify-package npm
 
-# --- RS-M9: Request Panel (web-request spans) ---
+# --- Request Panel (web-request spans) ---
 #
 # Record the Express demo app under `test-programs/web/express/` and leave a
 # real `.ct` container — spans included — in $CODETRACER_DEMO_DIR.
@@ -216,7 +219,7 @@ demo-request-panel-js SCHEDULE="sequential": build
     #!/usr/bin/env bash
     set -euo pipefail
     demo_dir="${CODETRACER_DEMO_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/codetracer/demos/request-panel-js}"
-    echo "=== RS-M9 Request Panel demo — js/express ({{SCHEDULE}}) ==="
+    echo "=== Request Panel demo — js/express ({{SCHEDULE}}) ==="
     case "{{SCHEDULE}}" in
       sequential) concurrent=0 ;;
       concurrent) concurrent=1 ;;
@@ -253,7 +256,7 @@ demo-request-panel-js SCHEDULE="sequential": build
     echo "[demo] (or run this through codetracer's recipe, which supplies ct:"
     echo "         direnv exec ../codetracer just demo-request-panel js)"
 
-# RS-M9 — regenerate the committed JS request-panel fixture consumed by
+# Regenerate the committed JS request-panel fixture consumed by
 # codetracer's `vm_js_request_panel_rows` ViewModel test.
 #
 # OUT is a directory in the codetracer checkout; the recorded trace folder (the

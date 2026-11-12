@@ -4,13 +4,13 @@ name: CI (reprobuild)
 # deterministic dev env through reprobuild instead of `nix develop` or
 # `env.ps1`. Runs alongside the existing `ci.yml` (`nix`) and any
 # `windows-build.yml` (`windows-diy`) entries so regressions in either
-# of the older paths still gate merges — see
-# `codetracer-specs/Repo-Requirements.md` §2.9 and
-# `metacraft-dev-guidelines/policies/ci-shared-dev-env.md` §4 for the
-# rollout shape.
+# of the older paths still gate merges. The rollout keeps every existing
+# environment flavour gating while the reprobuild one is added beside it, and
+# retires an older flavour only once the reprobuild run is green on every
+# host the older one covers.
 #
 # The `setup-dev-env` composite action accepts `env-flavor: reprobuild`
-# (target state per the policy). When the action's reprobuild branch
+# (the target flavour for every repository). When the action's reprobuild branch
 # lands, this workflow exercises it end-to-end on every supported
 # host without any other repo-side change.
 

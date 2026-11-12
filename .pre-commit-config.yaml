@@ -1,9 +1,10 @@
 # THE MCL STANDARD HOOK SET (`mcl-standard-hooks`), portable committed form --
 # PARTIAL ADOPTION, AND THE SHORTFALL IS STATED RATHER THAN HIDDEN.
 #
-# metacraft-dev-guidelines/policies/repo-requirements.md §4 requires the whole
-# set, so this file is a RECORDED SHORTFALL, not a claim of compliance. What it
-# carries is the committed-binaries tier of §4.3 -- the two mandatory refusals.
+# The project's repository requirements ask for the whole set of hooks --
+# formatting as well as refusing committed binaries -- so this file is a
+# RECORDED SHORTFALL, not a claim of compliance. What it carries is the
+# committed-binaries tier -- the two mandatory refusals.
 # What it does not carry is the formatting tier, for the reason below.
 #
 # MEASURED STATE OF THIS REPOSITORY WHEN THE HOOKS WERE ADOPTED:
@@ -11,14 +12,15 @@
 # recording(s) and 0 exceed the 1024 KB ceiling. Neither count can be failed
 # by these hooks: both act only on files a commit ADDS.
 #
-# §4.1 says which adoption form is ours. This repository does not install the
+# Which adoption form is ours: This repository does not install the
 # standard set through the devops-modules flake, so the form is the portable
 # one: the block from devops-modules' `git-hooks/mcl-standard-hooks.yaml`, with
-# `rev:` pinned to a devops-modules sha. §4.1 is explicit that a repo which is
-# flake-free, or whose flake does not wire hooks, is not thereby defective --
-# "its fix is a committed config, not a new flake". Having NO hooks was the
+# `rev:` pinned to a devops-modules sha. A repo which is flake-free, or whose
+# flake does not wire hooks, is not thereby defective -- its fix is a
+# committed config, not a new flake. Having NO hooks was the
 # defect: before this file there was neither a `.pre-commit-config.yaml` nor a
-# `.git/hooks/pre-commit` here, so §4.3 was satisfied on paper by nothing at all.
+# `.git/hooks/pre-commit` here, so the binary refusals were required on paper
+# and enforced by nothing at all.
 #
 # Install:  automatic on dev-shell entry (scripts/install-git-hooks.sh);
 #           elsewhere `prek install` (or: pre-commit install)
@@ -29,7 +31,7 @@
 # cannot exec on NixOS ("Could not start dynamically linked executable"). The
 # hooks then fail to INSTALL, and the commit fails for a reason that has nothing
 # to do with its content -- a gate that refuses everything is not a gate, it is
-# an outage. See repo-requirements.md §4.x.
+# an outage.
 #
 # WHY THESE TWO CAN LAND WITH NOTHING ELSE MOVING. Both act on ADDED files only
 # (`git diff --staged --diff-filter=A`), never on files already tracked, so they

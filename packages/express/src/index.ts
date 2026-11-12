@@ -1,10 +1,11 @@
 /**
- * Express middleware emitting CodeTracer web-request spans (RS-M9).
+ * Express middleware emitting CodeTracer web-request spans.
  *
  * One span per request, written **inline** into the `.ct` container the
  * recorder is already producing: no `codetracer_spans.jsonl` sidecar, no
- * second file to find, tail or keep in sync.  See
- * `codetracer-specs/Trace-Files/CTFS-Request-Span-Streams.md`.
+ * second file to find, tail or keep in sync.  The span record is the
+ * container's span stream, written and read by the codetracer-trace-format
+ * libraries.
  *
  * ## How it binds to the recording
  *
