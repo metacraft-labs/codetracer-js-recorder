@@ -50,12 +50,21 @@ describe("declared-arms output custody", () => {
   });
   it("accepts a new external output without creating directories", () => {
     const requested = path.join(root, "external", "output");
-    expect(resolveControlOutputRoot(source, requested)).toBe(requested);
+    // The resolver answers the canonical path: the realpath of the part that
+    // exists, with the rest appended. `os.tmpdir()` is itself reached
+    // through a symlink on macOS (`/var` is `/private/var`), so the expected
+    // value is built from the realpath of the part of `requested` that
+    // exists, not from `requested` as written.
+    expect(resolveControlOutputRoot(source, requested)).toBe(
+      path.join(fs.realpathSync(root), "external", "output"),
+    );
     expect(fs.existsSync(path.join(root, "external"))).toBe(false);
   });
   it("accepts a sibling sharing the input path prefix", () => {
     const requested = path.join(root, "source-other");
-    expect(resolveControlOutputRoot(source, requested)).toBe(requested);
+    expect(resolveControlOutputRoot(source, requested)).toBe(
+      path.join(fs.realpathSync(root), "source-other"),
+    );
     expect(fs.existsSync(requested)).toBe(false);
   });
   it("fails closed on a dangling alias without writing into its target", () => {
