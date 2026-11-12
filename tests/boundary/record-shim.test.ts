@@ -689,9 +689,21 @@ describe("record-side generic boundary shim", () => {
       const START = Date.UTC(2026, 0, 2, 3, 4, 5);
       const server = await serve(shimDir);
       const { page, pageErrors } = await newPage([]);
-      await page.clock.install({ time: START });
+      // Pin the clock before the page loads, in one call, so how long the
+      // load takes cannot matter. `install({ time: START })` followed by a
+      // `pauseAt` after `goto` made the test depend on the machine's speed:
+      // the installed clock runs in real time, and a live `pauseAt` refuses
+      // a time the clock has already passed ("Cannot fast-forward to the
+      // past"), so a load that took longer than the gap failed the test on
+      // an oversubscribed CI host. A `pauseAt` issued before navigation
+      // installs the clock (still at its epoch-0 start, so the live call on
+      // the blank page always moves forward), and the new document replays
+      // it by setting the time to START outright and staying paused; no
+      // timer of the page runs until `runFor` drives it. playwright-core
+      // 1.56.1, `ClockController.pauseAt`, `_innerFastForwardTo` and
+      // `_replayLogOnce`; https://playwright.dev/docs/api/class-clock
+      await page.clock.pauseAt(START);
       await page.goto(`${server.origin}/cadence.html`);
-      await page.clock.pauseAt(START + 1000);
       await page.click("#go");
       await waitForDone(page, () => page.clock.runFor(100));
       const log = await stopAndDecode(page);
