@@ -367,6 +367,42 @@ const CHROMIUM_PRECISE_TIMER_MAX_MS = 31;
  */
 const AIM_SLACK_MS = 5;
 
+/**
+ * An init script, run before the shim, that gives the test a witness of
+ * whether the page runs: a repeating timer, started and stopped by the test
+ * (`__ctWitnessStart(interval)`, `__ctWitnessStop()`), whose ticks note the
+ * browser time in `window.__ctWitness`. It uses the `setInterval`,
+ * `clearInterval` and `performance.now` the page had before the shim
+ * wrapped them, so its ticks are neither tasks the shim records nor clock
+ * reads it logs: they add nothing to any batch and do not change what the
+ * transport sends. The page's own tick runs stop with their last tick, so
+ * the flush timer of the last deadline-cut batch after them waits with no
+ * tick of the page's that could show a stall; the witness keeps running
+ * until the transport has gone idle, so every batch's wait has ticks that
+ * show whether the page ran (see {@link checkWaits}).
+ */
+const WITNESS =
+  "(() => { const si = window.setInterval; const ci = window.clearInterval; " +
+  "const now = performance.now.bind(performance); " +
+  "let handle; " +
+  "window.__ctWitness = { run: null, reads: [] }; " +
+  "window.__ctWitnessStart = function (interval) { " +
+  "const t0 = now(); " +
+  "window.__ctWitness.run = { t0: t0, interval: interval, ticks: 0 }; " +
+  "handle = si(function () { window.__ctWitness.reads.push(now()); }, interval); }; " +
+  "window.__ctWitnessStop = function () { ci(handle); " +
+  "const w = window.__ctWitness; if (w.run) w.run.ticks = w.reads.length; " +
+  "return w; }; })();";
+
+/** The witness's ticks (WITNESS): its run, and when each tick ran. */
+interface Witness {
+  run: TickRun;
+  reads: number[];
+}
+
+/** The witness's interval, the page's fast tick interval. */
+const WITNESS_INTERVAL_MS = 5;
+
 async function sendsOf(page: TPage): Promise<Send[]> {
   return page.evaluate(
     () => (globalThis as unknown as { __ctSends: Send[] }).__ctSends,
@@ -562,12 +598,21 @@ function pageRuns(
  * with no tick showing it (under the same load the flush timer ran 10 to 19
  * ms past its aim with no tick due in between, on a 25 ms page with no tick
  * due, and after the page's ticks had ended), and is counted in `unseen`.
+ *
+ * `witness`, when given, adds the ticks of {@link WITNESS} to the page's own:
+ * a timer the shim does not see, running until the transport is idle, so a
+ * batch whose wait falls after the page's last tick (the last deadline-cut
+ * batch: a 2 s wait with no page tick at all, which once left 32.7 ms late
+ * with nothing to show a stall) is judged on ticks too. A witness tick due
+ * after the aim that ran before the send fails the batch as a page tick
+ * does: both are timers of the page, run in the order they came due.
  */
 function checkWaits(
   got: ParsedBatch[],
   sends: Map<number, { t: number; answered?: number }>,
   deadlineOf: (batch: number) => number,
   runs: TickRun[],
+  witness?: Witness,
 ): {
   oldestWait: Map<number, number>;
   stalls: number;
@@ -588,10 +633,21 @@ function checkWaits(
       }
     }
   }
-  const page = pageRuns(
-    waits.map((w) => sends.get(w.batch)!.t - w.wait),
-    runs,
-  );
+  // The page's own ticks (from the batches), and the witness's, each placed
+  // on its own run's grid: the two run at once, so one model cannot tell
+  // whose a read is.
+  const page = [
+    ...pageRuns(
+      waits.map((w) => sends.get(w.batch)!.t - w.wait),
+      runs,
+    ).map((p) => ({ ...p, src: "page" })),
+    ...(witness === undefined || witness.reads.length === 0
+      ? []
+      : pageRuns(witness.reads, [witness.run]).map((p) => ({
+          ...p,
+          src: "witness",
+        }))),
+  ].sort((a, b) => a.ran - b.ran);
   const oldestWait = new Map<number, number>();
   for (const w of waits) {
     expect(w.wait, `batch ${w.batch}`).toBeGreaterThanOrEqual(0);
@@ -609,15 +665,21 @@ function checkWaits(
     const dueMeanwhile = page.filter(
       (p) => p.ran > aim && p.ran < sent - 3 && p.due > aim,
     );
-    // The least delay no tick shows: none at all, or the best tick's.
+    // The part of the delay no tick shows: the time in [goal, sent] that no
+    // tick's wait [due, ran] covers. One stall leaves the time before it and
+    // after it; a wait the host interrupted more than once (a long one, the
+    // 2 s of a batch at the cap, under load) has several, each shown by its
+    // own ticks, and only the union of what they show is excused.
     const late = sent - goal;
-    const shown = page
-      .filter((p) => Number.isFinite(p.due))
-      .map(
-        (p) =>
-          Math.max(0, p.due - goal) + Math.max(0, Math.min(late, sent - p.ran)),
+    const unshown =
+      late -
+      coveredLength(
+        page
+          .filter((p) => Number.isFinite(p.due))
+          .map((p) => [p.due, p.ran] as [number, number]),
+        goal,
+        sent,
       );
-    const unshown = Math.min(late, ...shown);
     const detail = `batch ${batch}: waited ${wait} ms, deadline ${deadline} ms, left ${late} ms late, ${unshown} ms of it shown by no tick; ticks ${JSON.stringify(dueMeanwhile)} came due after the aim ${aim} and ran before the send`;
     expect(dueMeanwhile, detail).toEqual([]);
     expect(unshown, detail).toBeLessThanOrEqual(LATE_TIMER_SLACK_MS);
@@ -625,6 +687,26 @@ function checkWaits(
     else stalls += 1;
   }
   return { oldestWait, stalls, unseen, timed: waits.length };
+}
+
+/** How much of `[from, to]` the intervals cover, counting overlaps once. */
+function coveredLength(
+  intervals: [number, number][],
+  from: number,
+  to: number,
+): number {
+  const clipped = intervals
+    .map(([a, b]) => [Math.max(a, from), Math.min(b, to)] as [number, number])
+    .filter(([a, b]) => b > a)
+    .sort((x, y) => x[0] - y[0]);
+  let total = 0;
+  let end = -Infinity;
+  for (const [a, b] of clipped) {
+    if (b <= end) continue;
+    total += b - Math.max(a, end);
+    end = b;
+  }
+  return total;
 }
 
 /**
@@ -1322,12 +1404,23 @@ describe("the batched upload transport", () => {
       const context = await browser.newContext();
       let sends: Send[];
       let runs: TickRun[];
+      let witness: Witness;
       let fastFrom: number;
       try {
         const page = await context.newPage();
         await page.addInitScript({ content: SEND_RECORDER });
+        await page.addInitScript({ content: WITNESS });
         await page.goto(`${server.origin}/transport.html`);
         await until(() => status(page), idle, "the transport did not go idle");
+        await page.evaluate(
+          (interval) =>
+            (
+              globalThis as unknown as {
+                __ctWitnessStart(i: number): void;
+              }
+            ).__ctWitnessStart(interval),
+          WITNESS_INTERVAL_MS,
+        );
         await page.click("#steady-slow");
         await until(
           () => textOf(page, "steady-done"),
@@ -1360,6 +1453,11 @@ describe("the batched upload transport", () => {
         );
         sends = await sendsOf(page);
         runs = await tickRunsOf(page);
+        witness = await page.evaluate(() =>
+          (
+            globalThis as unknown as { __ctWitnessStop(): Witness }
+          ).__ctWitnessStop(),
+        );
       } finally {
         await context.close();
       }
@@ -1390,17 +1488,29 @@ describe("the batched upload transport", () => {
       // 25 ms one, then the 5 ms one, started after `fastFrom`.
       expect(runs.map((r) => r.interval)).toEqual([25, 5]);
       expect(runs[1].t0).toBeGreaterThanOrEqual(fastFrom);
+      // The witness ran over every batch's wait: it started before the
+      // first tick and its last tick ran after the last send.
+      const lastSend = Math.max(...[...sent.values()].map((x) => x.t));
+      expect(witness.reads.length, "witness ticks").toBeGreaterThan(0);
+      expect(witness.run.t0).toBeLessThan(runs[0].t0);
+      expect(
+        Math.max(...witness.reads),
+        "the witness ran past the last send",
+      ).toBeGreaterThan(lastSend);
       const { oldestWait, stalls, unseen } = checkWaits(
         got,
         sent,
         (b) => schedule.get(b)!,
         runs,
+        witness,
       );
-      // Most batches met their deadline outright.
+      // Most batches met their deadline outright. How many waits the host
+      // interrupts is the host's, not the test's: each batch excused as a
+      // stall is one whose delay the page's or the witness's ticks show the
+      // page did not run through (checkWaits), so no fixed count of them is
+      // asserted (2 was; a loaded host with the witness showed 3 in 3 of 10
+      // runs, every one of them shown).
       expect(stalls + unseen, "batches excused").toBeLessThan(got.length / 2);
-      expect(stalls, "batches excused by a stalled page").toBeLessThanOrEqual(
-        2,
-      );
       // At the cap, in the slow phase: batches cut by the 2 s deadline,
       // whose oldest record really waited most of it, sent about 2 s apart:
       // 30 requests a minute.
@@ -1430,17 +1540,31 @@ describe("the batched upload transport", () => {
       for (const s of fast) {
         expect(sent.get(s)!.deadline, `batch ${s}`).toBe(DEADLINE_MAX_MS);
       }
+      // Each full batch was cut by its size: it left before the deadline
+      // would have cut it (the flush timer is aimed FLUSH_TIMER_LEAD_MS
+      // ahead). How long its 256 records took to come is the host's: on an
+      // idle one 0.64 s, under load up to 1.9 s were measured.
       for (const s of full) {
-        expect(oldestWait.get(s) ?? 0, `batch ${s}`).toBeLessThan(1500);
+        expect(oldestWait.get(s) ?? 0, `batch ${s}`).toBeLessThan(
+          DEADLINE_MAX_MS - FLUSH_TIMER_LEAD_MS,
+        );
       }
-      // Between the first full batch and the last batch of the run, every
-      // batch is full: none leaves before its oldest record's deadline (a
-      // flush timer armed for a record a full batch took is cancelled with
-      // it, or it would fire early and send a part batch).
+      // Between the first full batch and the last batch of the run, no
+      // batch leaves before its oldest record's deadline (a flush timer armed
+      // for a record a full batch took is cancelled with it, or it would fire
+      // early and send a part batch): each is full, or was cut by the
+      // deadline, which a page the host slows below 256 records in 2 s makes.
+      // "Cut by the deadline" is the transport's own test (`pump`'s
+      // `deadlineReached`): the oldest record reached the flush timer's aim
+      // less a millisecond, for a timer whose delay the browser rounded.
       for (const s of fast.filter(
         (x) => x > full[0] && x < fast[fast.length - 1],
       )) {
-        expect(got[s].records.length, `batch ${s}`).toBe(256);
+        if (got[s].records.length === 256) continue;
+        expect(
+          oldestWait.get(s) ?? 0,
+          `batch ${s} left with ${got[s].records.length} records`,
+        ).toBeGreaterThanOrEqual(DEADLINE_MAX_MS - FLUSH_TIMER_LEAD_MS - 1);
       }
       // Every record arrived: one contiguous run of seqs, no drops.
       const seqs = got.flatMap(seqsOf);
@@ -1977,6 +2101,76 @@ describe("the flush-deadline oracle", () => {
   // Batch 1 holds the ticks from 630 (its oldest record) under a 200 ms
   // deadline: the flush timer is aimed at 820.
   const deadline = () => 200;
+
+  /** A witness (WITNESS) started at 595 on a 5 ms grid, ticking at `reads`. */
+  function witnessOf(reads: number[]): Witness {
+    return { run: { t0: 595, interval: 5, ticks: reads.length }, reads };
+  }
+  // The last deadline-cut batch: its one record is the page's last tick, at
+  // 630, and it left 32.7 ms past its 200 ms deadline (goal 830) with no
+  // page tick after it: the shape of the 2026-11-13 failure.
+  const lastBatch = () => [batchOf(0, onTime(600, 625)), batchOf(1, [630])];
+  const lastSends = () =>
+    new Map([
+      [0, { t: 626, answered: 627 }],
+      [1, { t: 862.7 }],
+    ]);
+
+  it("oracle_fails_a_late_batch_after_the_last_tick_without_a_witness", () => {
+    expect(() => checkWaits(lastBatch(), lastSends(), deadline, RUNS)).toThrow(
+      /32\.7\d* ms of it shown by no tick/,
+    );
+  });
+
+  it("oracle_excuses_a_late_batch_after_the_last_tick_a_stalled_witness_shows", () => {
+    // The witness ran on time to 815, then nothing in the page ran until
+    // 860: its tick due at 820 ran then, and shows all but the last 2.7 ms.
+    const witness = witnessOf([...onTime(600, 815), ...onTime(860, 900)]);
+    const { stalls } = checkWaits(
+      lastBatch(),
+      lastSends(),
+      deadline,
+      RUNS,
+      witness,
+    );
+    expect(stalls).toBe(1);
+  });
+
+  it("oracle_excuses_a_wait_two_stalls_show_together", () => {
+    // Two stalls in one wait (the 2026-11-13 run: 124 ms late, one tick
+    // showing 83 ms of it): nothing ran from 815 to 870, the tick due then
+    // ran at 870, and nothing again until 919, past the send less 3 ms. The
+    // batch left at 920, 90 ms past its goal (830). Each tick alone leaves
+    // 41 ms or more unshown; together they show all but 1 ms.
+    const sends = new Map([
+      [0, { t: 626, answered: 627 }],
+      [1, { t: 920 }],
+    ]);
+    const witness = witnessOf([...onTime(600, 815), 870, 919]);
+    const { stalls } = checkWaits(lastBatch(), sends, deadline, RUNS, witness);
+    expect(stalls).toBe(1);
+    // Control: without the second stall's tick, the 49 ms from 870 to the
+    // send is shown by nothing.
+    expect(() =>
+      checkWaits(
+        lastBatch(),
+        sends,
+        deadline,
+        RUNS,
+        witnessOf([...onTime(600, 815), 870]),
+      ),
+    ).toThrow(/shown by no tick/);
+  });
+
+  it("oracle_fails_a_late_batch_after_the_last_tick_a_running_witness_shows", () => {
+    // Negative control for the witness: it ticked on time through the
+    // batch's wait, so the page ran, and its tick due at 825, after the aim,
+    // ran before the send: the flush timer, not the host, was late.
+    const witness = witnessOf(onTime(600, 900));
+    expect(() =>
+      checkWaits(lastBatch(), lastSends(), deadline, RUNS, witness),
+    ).toThrow(/came due after the aim/);
+  });
 
   it("oracle_excuses_a_tick_due_before_the_aim_that_ran_after_it", () => {
     // The issue's run: the tick due at the aim (820) ran 4.7 ms after it,
