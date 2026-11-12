@@ -49,7 +49,11 @@ export function ctPrintPath(): string {
   // tests/helpers -> tests -> repo root -> workspace root.
   const repoRoot = path.resolve(__dirname, "..", "..");
   const workspaceRoot = path.dirname(repoRoot);
-  return path.join(workspaceRoot, "codetracer-trace-format-nim", "ct-print");
+  // The sibling's `buildCtPrint` writes `ct-print.exe` on Windows
+  // (`build_writer_artifacts.ctPrintPath`), and `fs.existsSync` does not
+  // apply PATHEXT, so the bare name would never be found there.
+  const binary = process.platform === "win32" ? "ct-print.exe" : "ct-print";
+  return path.join(workspaceRoot, "codetracer-trace-format-nim", binary);
 }
 
 /** Returns true if a usable `ct-print` binary is reachable. */
