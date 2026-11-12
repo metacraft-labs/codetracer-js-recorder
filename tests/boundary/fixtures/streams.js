@@ -235,14 +235,25 @@
 
     // An XMLHttpRequest whose body arrives in three pieces: the page sees
     // each piece at readyState 3 (LOADING) before the response is done.
+    // The server writes the next piece when the page asks for it
+    // (`step`, /api/release), which it does once it has read this one, so
+    // no two pieces reach the page together.
     "xhr-stream": function () {
       var x = new XMLHttpRequest();
       var states = [];
-      x.open("GET", "/api/stream?n=3&interval=100");
+      var read = 0;
+      x.open("GET", "/api/stream?n=3&step=xhr-stream");
       x.onreadystatechange = function () {
         if (x.readyState === 3) {
           states.push("3:" + JSON.stringify(x.responseText));
           window.__readAt = Date.now();
+          var pieces = x.responseText.split("\n").length - 1;
+          if (pieces > read) {
+            read = pieces;
+            var r = new XMLHttpRequest();
+            r.open("GET", "/api/release?id=xhr-stream");
+            r.send();
+          }
         } else {
           states.push(String(x.readyState));
         }
@@ -426,8 +437,11 @@
     },
 
     // An EventSource on a stream that never ends: two events, then close.
+    // The server writes the next event when the page asks for it (`step`,
+    // /api/release), after reading this one, so a page that runs late
+    // still reads the events one at a time and never sees a third.
     sse: function () {
-      var es = new EventSource("/api/sse?n=forever&interval=100");
+      var es = new EventSource("/api/sse?n=forever&step=sse");
       var got = [];
       es.onmessage = function (e) {
         got.push(e.data);
@@ -436,6 +450,10 @@
           es.close();
           slot("events", got.join("|"));
           done();
+        } else {
+          var r = new XMLHttpRequest();
+          r.open("GET", "/api/release?id=sse");
+          r.send();
         }
       };
     },

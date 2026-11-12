@@ -145,6 +145,13 @@ const RELEASE_SETTLE_MS = 250;
  * response's progress events are length-computable. `hold=<id>` keeps the
  * response open after its `n` chunks until `/api/release?id=<id>` (see
  * `releaseHeld`) writes `end\n` and ends it.
+ *
+ * `step=<id>` paces the chunks by the page instead of by `interval`: each
+ * chunk after the first is written when `/api/release?id=<id>` comes, so a
+ * page that releases the next chunk from the listener that read this one
+ * reads every chunk on its own, however late the host runs that listener.
+ * Paced by a delay, chunks that arrive while the page waits for the CPU are
+ * read together, and how many reads the page makes is the scheduler's.
  */
 function serveStream(
   res: http.ServerResponse,
@@ -152,11 +159,13 @@ function serveStream(
   sse: boolean,
   streamEnds: StreamEnd[],
   held: Map<string, http.ServerResponse>,
+  heldPieces: Map<string, () => void>,
 ): void {
   const forever = url.searchParams.get("n") === "forever";
   const n = forever ? Infinity : Number(url.searchParams.get("n") ?? "3");
   const interval = Number(url.searchParams.get("interval") ?? "100");
   const hold = url.searchParams.get("hold");
+  const step = url.searchParams.get("step");
   // `event=<name>` names every server-sent event and `id=1` gives each an
   // id (`event:` and `id:` fields, HTML "Server-sent events").
   const event = url.searchParams.get("event");
@@ -182,7 +191,12 @@ function serveStream(
   const write = () => {
     res.write(chunk(written));
     written++;
-    if (written < n) {
+    if (written < n && step !== null) {
+      heldPieces.set(step, () => {
+        heldPieces.delete(step);
+        if (!res.destroyed) write();
+      });
+    } else if (written < n) {
       timer = setTimeout(write, interval);
     } else if (hold !== null) {
       held.set(hold, res);
@@ -197,6 +211,7 @@ function serveStream(
   res.on("close", () => {
     clearTimeout(timer);
     if (hold !== null) held.delete(hold);
+    if (step !== null) heldPieces.delete(step);
     streamEnds.push({ url: url.pathname + url.search, written, finished });
   });
   const firstParam = url.searchParams.get("first");
@@ -321,6 +336,7 @@ export async function startFixtureServer(
           pathname === "/api/sse",
           streamEnds,
           held,
+          heldPieces,
         );
         return;
       }

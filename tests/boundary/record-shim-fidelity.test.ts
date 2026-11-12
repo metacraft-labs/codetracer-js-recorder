@@ -466,12 +466,15 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
         .filter((st) => st.startsWith("3:"))
         .map((st) => JSON.parse(st.slice(2)) as string);
       // Vacuity: the page saw the body grow while it was still loading.
-      expect(loading.length).toBeGreaterThanOrEqual(3);
-      expect(loading[0]).toBe("c0\n");
+      // The page releases each next piece only after reading this one
+      // (`step`), so it reads c0 alone and then c0c1 before c2 exists; c2
+      // may reach it together with the response's end, so a third LOADING
+      // state is the host's, not the test's.
+      expect(loading.slice(0, 2)).toEqual(["c0\n", "c0\nc1\n"]);
       expect(s["r-text"]).toBe(`text=${JSON.stringify("c0\nc1\nc2\n")}`);
 
       const log = await stopAndDecode(x.page);
-      const { reqId, taskId } = request(log, "/api/stream?n=3&interval=100");
+      const { reqId, taskId } = request(log, "/api/stream?n=3&step=xhr-stream");
       const head = recordsOf(log, "NetResponse", (r) => r.req_id === reqId);
       expect(head).toMatchObject([{ outcome: 5, status: 200 }]);
       expect(log.records[log.records.indexOf(head[0]) - 1]).toMatchObject({
@@ -521,7 +524,7 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
       expect(es.pageErrors).toEqual([]);
       expect((await slots(es.page))["r-events"]).toBe("events=e0|e1");
       const elog = await stopAndDecode(es.page);
-      const e = request(elog, "/api/sse?n=forever&interval=100");
+      const e = request(elog, "/api/sse?n=forever&step=sse");
       const events = indicesOf(elog, isChunk(e.reqId));
       expect(
         events.map((i) =>
