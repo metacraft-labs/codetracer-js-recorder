@@ -304,3 +304,8 @@ record-mixed-request-panel-fixture OUT:
 # Runs `nix develop`, so it is not part of the in-shell test recipes.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
+
+# Compiled declaration controls and separately rebuilt genuine companions.
+test-declared-arms-controls: build
+    node node_modules/vitest/vitest.mjs run tests/boundary/declared-arms-output-root.test.ts --maxWorkers=1
+    node tests/boundary/declared-arms-controls.mjs

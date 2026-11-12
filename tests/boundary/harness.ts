@@ -226,8 +226,18 @@ function releaseHeld(
   res: http.ServerResponse,
   url: URL,
   held: Map<string, http.ServerResponse>,
+  heldPieces: Map<string, () => void>,
 ): void {
   const id = url.searchParams.get("id") ?? "";
+  // A held piece of a page (see `serveFile`) is written at once: its
+  // response is not a stream whose progress a page reads.
+  const piece = heldPieces.get(id);
+  if (piece !== undefined) {
+    piece();
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("released");
+    return;
+  }
   const target = held.get(id);
   if (target === undefined) {
     res.writeHead(404);
@@ -251,7 +261,8 @@ function releaseHeld(
  * redirects to `/api/data?redirected=1`, `/api/slow?ms=`
  * answers `slow` after `ms` milliseconds, `/api/stall` neither reads the
  * request body nor answers, `/api/stream` and `/api/sse` stream (see
- * `serveStream`), and `/api/release` ends a held stream (see `releaseHeld`).
+ * `serveStream`), and `/api/release` ends a held stream or writes a held
+ * piece of a page (see `releaseHeld` and `serveFile`).
  */
 export async function startFixtureServer(
   root: string,
@@ -260,6 +271,7 @@ export async function startFixtureServer(
   const requests: ServedRequest[] = [];
   const streamEnds: StreamEnd[] = [];
   const held = new Map<string, http.ServerResponse>();
+  const heldPieces = new Map<string, () => void>();
   const server = http.createServer((req, res) => {
     if (req.url?.startsWith("/api/stall")) {
       // Never reads the request body and never answers: a large upload
@@ -311,7 +323,7 @@ export async function startFixtureServer(
         return;
       }
       if (pathname === "/api/release") {
-        releaseHeld(res, new URL(url, "http://x"), held);
+        releaseHeld(res, new URL(url, "http://x"), held, heldPieces);
         return;
       }
       if (pathname === "/api/redirect") {
@@ -340,7 +352,7 @@ export async function startFixtureServer(
         res.end();
         return;
       }
-      serveFile(res, file, new URL(url, "http://x").searchParams);
+      serveFile(res, file, new URL(url, "http://x").searchParams, heldPieces);
     });
   });
   server.on("upgrade", (req, socket) => serveWebSocket(req, socket, requests));
@@ -539,15 +551,21 @@ export const CHUNK_MARKER = "<!--ct:chunk-->";
  * script, style sheet or image). `chunks=<ms>` sends an HTML page in pieces,
  * cut after each {@link CHUNK_MARKER}, `ms` apart, as a server streaming its
  * response does: the browser parses each piece as it arrives, and runs
- * other tasks while it waits for the next.
+ * other tasks while it waits for the next. `hold=<id>` (with `chunks`) holds
+ * the pieces after the first until `/api/release?id=<id>` writes them (see
+ * `releaseHeld`), so a test decides when the rest of the page arrives, by
+ * what the page has done, rather than by a delay. A held page whose release
+ * never comes stays open until the client gives up.
  */
 function serveFile(
   res: http.ServerResponse,
   file: string,
   params: URLSearchParams,
+  heldPieces: Map<string, () => void>,
 ): void {
   const delay = Number(params.get("delay") ?? "0");
   const gap = Number(params.get("chunks") ?? "0");
+  const hold = params.get("hold");
   const send = () => {
     if (res.destroyed) return;
     res.writeHead(200, {
@@ -569,6 +587,10 @@ function serveFile(
       at = cut + CHUNK_MARKER.length;
     }
     pieces.push(text.slice(at));
+    // The id whose release the next piece waits for, once: the first piece
+    // goes at once, the one after it waits for the release, and the rest
+    // are paced by `gap` as before.
+    let awaiting = hold;
     const next = () => {
       if (res.destroyed) return;
       const piece = pieces.shift()!;
@@ -577,6 +599,16 @@ function serveFile(
         return;
       }
       res.write(piece);
+      if (awaiting !== null) {
+        const id = awaiting;
+        awaiting = null;
+        heldPieces.set(id, () => {
+          heldPieces.delete(id);
+          next();
+        });
+        res.once("close", () => heldPieces.delete(id));
+        return;
+      }
       setTimeout(next, gap);
     };
     next();

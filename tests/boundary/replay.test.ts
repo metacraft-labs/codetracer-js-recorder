@@ -719,7 +719,9 @@ const MOVES_BEFORE_LOAD = 3;
  * Only the recording is constrained: what it logs is still the browser's
  * own order, and the replay under test gets that log unchanged.
  */
-async function recordSlowLoad(): Promise<BoundaryRecord[]> {
+async function recordSlowLoad(
+  fixture = "slow-load.html",
+): Promise<BoundaryRecord[]> {
   const context = (await browser.newContext()) as unknown as Context;
   // Moves started and completed so far. A move in flight when
   // `DOMContentLoaded` is seen may have been dispatched before it, so only
@@ -749,7 +751,7 @@ async function recordSlowLoad(): Promise<BoundaryRecord[]> {
       }
     });
     await mouse.move(3, 3);
-    await page.goto(`${recorded.server.origin}/slow-load.html?chunks=250`, {
+    await page.goto(`${recorded.server.origin}/${fixture}?chunks=250`, {
       waitUntil: "commit",
     });
     // A hang guard, not a measure: a starved host takes many times longer.
@@ -844,6 +846,83 @@ describe("tasks recorded while the document loaded", () => {
       expect(report.checkpoints).toBe(
         records.filter((r) => r.record === "Checkpoint").length,
       );
+      expect(report.injections).toBe(phases.length);
+    },
+    TIMEOUT,
+  );
+});
+
+/**
+ * The inputs that ran directly after a `Loading` of phase 2 or 3 (the document
+ * parsed) and right after an input that ran while it parsed: the records that
+ * follow the input are that `Loading`, so the replay takes it with nothing
+ * else to move the document on, and the parser must already be there.
+ */
+function directlyAfterParseInputs(records: BoundaryRecord[]): number {
+  let phase = 0;
+  let count = 0;
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.record === "Loading") {
+      if (
+        r.phase >= 2 &&
+        i > 0 &&
+        records[i - 1].record === "Input" &&
+        phase === 1
+      ) {
+        count++;
+      }
+      phase = r.phase;
+    }
+    if (r.record === "DocTask" && r.kind === 3) phase = 0;
+  }
+  return count;
+}
+
+describe("a task after parsing, at a position the replay holds", () => {
+  it(
+    "replay_reproduces_a_task_that_ran_after_parsing_at_a_held_position",
+    async () => {
+      // JS-Boundary-Recording.md §6, "The position": the `Loading` of phase
+      // 2 says the document had been parsed. The replay reaches that point
+      // by letting the parser go on past its gates, and only when the
+      // scheduler moves the document on. Recorded where the page runs
+      // nothing between an input while the parser waits and the next input
+      // after the parse (`slow-load-quiet.html`), the log has that input
+      // directly before the `Loading` of phase 2: a replay that takes the
+      // `Loading` without the parser there runs the second input in a
+      // document that lacks the parsed elements, and the notes the page
+      // writes at load diverge at the last checkpoint.
+      const records = await recordSlowLoad("slow-load-quiet.html");
+      const phases = inputPhases(records);
+      expect(
+        phases.filter((p) => p === 1).length,
+        "inputs while parsing",
+      ).toBeGreaterThan(0);
+      expect(
+        phases.filter((p) => p === 2 || p === 3).length,
+        "inputs between parsing and load",
+      ).toBeGreaterThan(0);
+      // Vacuity: the pattern this test exists for is in the log.
+      expect(
+        directlyAfterParseInputs(records),
+        "inputs after parsing, directly after an input while parsing",
+      ).toBeGreaterThan(0);
+      const last = records[records.length - 2];
+      expect(last.record, "the session ends with a checkpoint").toBe(
+        "Checkpoint",
+      );
+
+      const report = await replaySession({
+        log: assemble(records),
+        build: recorded.build,
+        browser,
+        timeoutMs: 60_000,
+      });
+      expect(
+        report.status,
+        JSON.stringify(report.divergence ?? report.error),
+      ).toBe("replayed");
       expect(report.injections).toBe(phases.length);
     },
     TIMEOUT,

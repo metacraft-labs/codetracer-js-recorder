@@ -85,7 +85,12 @@ jobs:
         run: dev-exec repro build
 
       - name: repro test
-        # Materialises the `test` collection.
+        # Materialises the `test` collection. It also builds ct-print in the
+        # sibling `../codetracer-trace-format-nim`, which the vitest suite of
+        # `just test (cross-check)` below decodes every recording with:
+        # `repro.nim` declares that compile as an edge, through the sibling's
+        # own `buildCtPrint` constructor, so the declared C compiler and
+        # zstd-dev reach it on every host, Windows included.
         run: dev-exec repro test
 
       - name: just build (cross-check)
