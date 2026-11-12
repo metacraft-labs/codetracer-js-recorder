@@ -89,6 +89,18 @@ package codetracer_js_recorder:
     when not defined(windows):
       "pkg-config"
       "openssl"
+    # playwright-core and the headless Chromium the vitest suite drives
+    # (``tests/boundary/harness.ts`` ``loadPlaywright``). On Linux and macOS
+    # the flake dev shell supplies both from nixpkgs' ``playwright-driver``
+    # and exports ``PLAYWRIGHT_CORE_PATH`` / ``PLAYWRIGHT_BROWSERS_PATH``.
+    # On Windows the stdlib ``playwright`` package realizes playwright-core
+    # with its pinned browser builds under ``<prefix>/.local-browsers/``,
+    # Playwright's own hermetic layout, and sets no variables; the dev env
+    # publishes the prefix as ``REPRO_PREFIX_PLAYWRIGHT`` and the Justfile
+    # ``test`` recipe points the two variables at it (see there).
+    # https://playwright.dev/docs/browsers#hermetic-install
+    when defined(windows):
+      "playwright"
     # ``just`` and the shells its recipes run. CI's cross-check steps run
     # ``dev-exec just build`` and ``dev-exec just test`` on every leg
     # (``.github/workflows/ci-reprobuild.yml``). On Linux and macOS the

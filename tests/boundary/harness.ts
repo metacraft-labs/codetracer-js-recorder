@@ -70,7 +70,9 @@ export function loadPlaywright(): Playwright {
     throw new Error(
       "PLAYWRIGHT_CORE_PATH and PLAYWRIGHT_BROWSERS_PATH are not set: run the " +
         "tests inside the dev shell (`nix develop`), which provides headless " +
-        "Chromium and playwright-core from nixpkgs' playwright-driver.",
+        "Chromium and playwright-core from nixpkgs' playwright-driver, or on " +
+        "Windows through `just test` in the reprobuild dev env, which points " +
+        "them at the realized `playwright` package.",
     );
   }
   playwright = createRequire(__filename)(core) as Playwright;

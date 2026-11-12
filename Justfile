@@ -1,6 +1,19 @@
 alias t := test
 alias fmt := format
 
+# Where the vitest suite finds playwright-core and its headless Chromium
+# (tests/boundary/harness.ts `loadPlaywright`). On Linux and macOS the flake
+# dev shell exports PLAYWRIGHT_CORE_PATH and PLAYWRIGHT_BROWSERS_PATH from
+# nixpkgs' playwright-driver, so this is empty there. On Windows there is no
+# dev shell: `repro.nim` declares `playwright`, whose prefix the reprobuild
+# dev env publishes as REPRO_PREFIX_PLAYWRIGHT. That prefix is the
+# playwright-core package directory with the browsers under its own
+# `.local-browsers/`, which is where playwright-core looks when
+# PLAYWRIGHT_BROWSERS_PATH is `0` (https://playwright.dev/docs/browsers#hermetic-install).
+# A value already set in the environment wins; an unset prefix fails here,
+# naming the cause, instead of as a missing-dev-shell error inside vitest.
+playwright_env := if os_family() == "windows" { "PLAYWRIGHT_CORE_PATH=\"${PLAYWRIGHT_CORE_PATH:-${REPRO_PREFIX_PLAYWRIGHT:?is unset: run inside the reprobuild dev env (repro exec), whose repro.nim declares playwright}}\" PLAYWRIGHT_BROWSERS_PATH=\"${PLAYWRIGHT_BROWSERS_PATH:-0}\"" } else { "" }
+
 # Install npm dependencies (idempotent).
 #
 # `build-native` shells out to `npx napi`, and the workspace build/test
@@ -23,7 +36,7 @@ test: install
     cargo test --manifest-path crates/recorder_native/Cargo.toml
     just build-native
     npm run build
-    npm test
+    {{playwright_env}} npm test
     just verify-cli-convention
     just verify-request-spans
     just verify-jsbound-vectors

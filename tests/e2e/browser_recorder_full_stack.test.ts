@@ -35,6 +35,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as net from "node:net";
+import { createRequire } from "node:module";
 import {
   ctPrintAvailable,
   ctPrintFull,
@@ -46,6 +47,14 @@ const CLI_PATH = path.join(REPO_ROOT, "packages/cli/dist/index.js");
 const RUNTIME_BROWSER_SRC = path.join(
   REPO_ROOT,
   "packages/runtime-browser/src/index.ts",
+);
+// The runtime's own dependency: a workspace package whose dist is CommonJS,
+// served from outside node_modules, so Vite's dependency optimiser does not
+// convert it and its named exports do not resolve as ES module imports. Its
+// TypeScript source is ESM, as the runtime's is.
+const BOUNDARY_FORMAT_SRC = path.join(
+  REPO_ROOT,
+  "packages/boundary-format/src/index.ts",
 );
 const VITE_PLUGIN_DIST = path.join(
   REPO_ROOT,
@@ -69,10 +78,63 @@ function findSessionManagerBin(): string | null {
   return null;
 }
 
-/** Try to load Playwright; returns the module or null. */
-function tryRequirePlaywright(): typeof import("playwright") | null {
+/** The slice of playwright-core's API this test drives. */
+interface PlaywrightCore {
+  chromium: {
+    launch(options: {
+      headless: boolean;
+      executablePath?: string;
+      args?: string[];
+    }): Promise<PwBrowser>;
+    executablePath(): string;
+  };
+}
+interface PwBrowser {
+  newContext(): Promise<PwContext>;
+  close(): Promise<void>;
+}
+interface PwContext {
+  newPage(): Promise<PwPage>;
+  close(): Promise<void>;
+}
+interface PwPage {
+  on(
+    event: "response",
+    f: (r: { status(): number; url(): string }) => void,
+  ): void;
+  on(event: "pageerror", f: (e: Error) => void): void;
+  on(
+    event: "console",
+    f: (m: { type(): string; text(): string }) => void,
+  ): void;
+  goto(
+    url: string,
+    options: { waitUntil: "load"; timeout: number },
+  ): Promise<unknown>;
+  waitForSelector(
+    selector: string,
+    options: { timeout: number },
+  ): Promise<unknown>;
+  evaluate(fn: () => void): Promise<void>;
+  waitForTimeout(ms: number): Promise<void>;
+}
+
+/**
+ * Load playwright-core the way the boundary suites do
+ * (`tests/boundary/harness.ts` `loadPlaywright`): from
+ * `PLAYWRIGHT_CORE_PATH` when it is set, which the Nix dev shell exports
+ * from nixpkgs' playwright-driver and the Windows `just test` recipe points
+ * at the reprobuild `playwright` package; else from a `playwright-core`
+ * Node resolves from the repository. Returns null only when neither exists
+ * (the test then says so and skips); a `PLAYWRIGHT_CORE_PATH` that does not
+ * load is an error, not a skip.
+ */
+function tryRequirePlaywright(): PlaywrightCore | null {
+  const req = createRequire(path.join(REPO_ROOT, "noop.js"));
+  const fromEnv = process.env.PLAYWRIGHT_CORE_PATH;
+  if (fromEnv) return req(fromEnv) as PlaywrightCore;
   try {
-    return require("playwright");
+    return req("playwright-core") as PlaywrightCore;
   } catch {
     return null;
   }
@@ -88,6 +150,27 @@ function tryRequireVite(): typeof import("vite") | null {
 }
 
 /**
+ * The directory `PLAYWRIGHT_BROWSERS_PATH` names, or null when it names none.
+ *
+ * `0` is not a directory: it is Playwright's sentinel for a hermetic install,
+ * where the browsers live in the playwright-core package's own
+ * `.local-browsers/` (https://playwright.dev/docs/browsers#hermetic-install;
+ * playwright-core `lib/server/registry/index.js`, `registryDirectory`). The
+ * Windows reprobuild dev env uses that layout, with the package directory in
+ * `PLAYWRIGHT_CORE_PATH`, so the root is resolved from there. Taken as a path,
+ * `0` would be resolved against the working directory instead.
+ */
+function browsersRootFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const browsers = env.PLAYWRIGHT_BROWSERS_PATH;
+  if (!browsers) return null;
+  if (browsers !== "0") return browsers;
+  const core = env.PLAYWRIGHT_CORE_PATH;
+  return core ? path.join(core, ".local-browsers") : null;
+}
+
+/**
  * Discover a chromium executable Playwright can launch.  In Nix dev
  * shells Playwright's bundled-browser version doesn't always match the
  * `/nix/store/.../playwright-browsers/` content, so we walk common
@@ -97,8 +180,8 @@ function findChromiumExecutable(): string | null {
   const explicit = process.env.PLAYWRIGHT_CHROMIUM_BIN;
   if (explicit) return fs.existsSync(explicit) ? explicit : null;
   const roots: string[] = [];
-  if (process.env.PLAYWRIGHT_BROWSERS_PATH)
-    roots.push(process.env.PLAYWRIGHT_BROWSERS_PATH);
+  const fromEnv = browsersRootFromEnv();
+  if (fromEnv) roots.push(fromEnv);
   try {
     for (const entry of fs.readdirSync("/nix/store")) {
       if (entry.includes("playwright-browsers"))
@@ -125,6 +208,9 @@ function findChromiumExecutable(): string | null {
         path.join(root, child, "chrome-linux64", "chrome"),
         path.join(root, child, "chrome-linux", "chrome"),
         path.join(root, child, "chrome-linux", "headless_shell"),
+        // Playwright's Windows builds (its registry's EXECUTABLE_PATHS `win`).
+        path.join(root, child, "chrome-win", "headless_shell.exe"),
+        path.join(root, child, "chrome-win", "chrome.exe"),
       ];
       for (const t of tries) if (fs.existsSync(t)) return t;
     }
@@ -254,10 +340,11 @@ function writeFixture(dir: string, daemonPort: number): void {
   );
 
   // Vite config.  Wires `@codetracer/vite-plugin` and aliases
-  // `@codetracer/runtime-browser` to its .ts source (the dist is CJS;
-  // serving CJS through Vite's ESM pipeline mis-resolves named exports).
+  // `@codetracer/runtime-browser`, and the `@codetracer/boundary-format` it
+  // imports, to their .ts sources (the dists are CJS; serving CJS through
+  // Vite's ESM pipeline mis-resolves named exports).
   // The plugin's `exclude` skips bootstrap.js (it installs __ct itself)
-  // and the runtime-browser package tree (it DEFINES __ct).
+  // and the runtime's package trees (they DEFINE __ct).
   const viteConfig = [
     "import { codetracerVitePlugin } from '@codetracer/vite-plugin';",
     "export default {",
@@ -267,11 +354,13 @@ function writeFixture(dir: string, daemonPort: number): void {
     "      '**/node_modules/**',",
     "      '**/bootstrap.js',",
     "      '**/packages/runtime-browser/**',",
+    "      '**/packages/boundary-format/**',",
     "    ],",
     "  })],",
     "  resolve: {",
     "    alias: {",
     `      '@codetracer/runtime-browser': ${JSON.stringify(RUNTIME_BROWSER_SRC)},`,
+    `      '@codetracer/boundary-format': ${JSON.stringify(BOUNDARY_FORMAT_SRC)},`,
     `      '@codetracer/vite-plugin': ${JSON.stringify(VITE_PLUGIN_DIST)},`,
     "    },",
     "  },",
@@ -349,15 +438,35 @@ async function killChild(
 
 // ── The test ────────────────────────────────────────────────────────────
 
+describe("browsersRootFromEnv", () => {
+  it("returns a browsers directory as given", () => {
+    expect(
+      browsersRootFromEnv({ PLAYWRIGHT_BROWSERS_PATH: "/opt/pw-browsers" }),
+    ).toBe("/opt/pw-browsers");
+  });
+  it("maps the hermetic-install sentinel 0 to the package's .local-browsers", () => {
+    expect(
+      browsersRootFromEnv({
+        PLAYWRIGHT_BROWSERS_PATH: "0",
+        PLAYWRIGHT_CORE_PATH: "/opt/playwright-core",
+      }),
+    ).toBe(path.join("/opt/playwright-core", ".local-browsers"));
+  });
+  it("names no directory for 0 without a package, or for an unset variable", () => {
+    expect(browsersRootFromEnv({ PLAYWRIGHT_BROWSERS_PATH: "0" })).toBeNull();
+    expect(browsersRootFromEnv({})).toBeNull();
+  });
+});
+
 describe("test_browser_recorder_full_stack", () => {
   it("records a .ct trace from a real Vite dev server + headless Chromium + record-web daemon", async () => {
-    // ── Prereq gate (SKIP-narrow, per CLI conventions §6) ──────────────
+    // ── Prereq gate (SKIP-narrow: name the missing prerequisite) ──────
     const sessionManagerBin = findSessionManagerBin();
     if (!sessionManagerBin) {
       console.warn(
         "SKIP: session-manager binary not found (build " +
-          "`codetracer/src/backend-manager` or set SESSION_MANAGER_BIN; " +
-          "see codetracer-specs/Planned-Features/value-origin-ci-scripts/run-m26-full-stack.sh).",
+          "`codetracer/src/backend-manager` with `cargo build --bin " +
+          "session-manager`, or set SESSION_MANAGER_BIN).",
       );
       return;
     }
@@ -368,7 +477,9 @@ describe("test_browser_recorder_full_stack", () => {
     }
     const pw = tryRequirePlaywright();
     if (!pw) {
-      console.warn("SKIP: playwright module not installed.");
+      console.warn(
+        "SKIP: playwright-core not found (set PLAYWRIGHT_CORE_PATH, as the dev shell does).",
+      );
       return;
     }
     const chromiumExec = findChromiumExecutable();
@@ -432,7 +543,7 @@ describe("test_browser_recorder_full_stack", () => {
 
     // ── Launch Vite + Chromium, drive the page ─────────────────────────
     let viteServer: Awaited<ReturnType<typeof vite.createServer>> | null = null;
-    let browser: import("playwright").Browser | null = null;
+    let browser: PwBrowser | null = null;
     try {
       viteServer = await vite.createServer({
         configFile: path.join(fixtureDir, "vite.config.js"),
@@ -476,9 +587,16 @@ describe("test_browser_recorder_full_stack", () => {
         timeout: 15_000,
       });
       // `data-ct-ready=1` is set by app.js after `__ct.value('z', z)`.
-      await page.waitForSelector("body[data-ct-ready='1']", {
-        timeout: 10_000,
-      });
+      try {
+        await page.waitForSelector("body[data-ct-ready='1']", {
+          timeout: 10_000,
+        });
+      } catch (e) {
+        // Name what the page reported, which is why it never got ready.
+        throw new Error(
+          `${(e as Error).message}\npage errors:\n${pageErrors.join("\n")}`,
+        );
+      }
       // Graceful flush: invoke the page-side __ct.stop() (synchronous
       // queue drain + SessionEnd), then synthesise a `pagehide` so the
       // runtime's lifecycle listener also fires.
