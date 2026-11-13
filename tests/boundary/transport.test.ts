@@ -1187,13 +1187,27 @@ describe("the batched upload transport", () => {
       const context = await browser.newContext();
       let sends: Send[];
       let runs: TickRun[];
+      let witness: Witness;
       try {
         const page = await context.newPage();
         // Before the shim: the shim captures this wrapper as `fetch`, so the
         // transport's requests pass through it (see the header).
         await page.addInitScript({ content: SEND_RECORDER });
+        // The witness (WITNESS): the batches after the page's last tick,
+        // cut by a deadline of up to 400 ms here, wait with no tick of the
+        // page's to show whether the page ran.
+        await page.addInitScript({ content: WITNESS });
         await page.goto(`${server.origin}/transport.html`);
         await until(() => status(page), idle, "the transport did not go idle");
+        await page.evaluate(
+          (interval) =>
+            (
+              globalThis as unknown as {
+                __ctWitnessStart(i: number): void;
+              }
+            ).__ctWitnessStart(interval),
+          WITNESS_INTERVAL_MS,
+        );
         // A known rate: a 5 ms interval, each tick a Task and a Clock.
         await page.click("#ticks");
         await until(
@@ -1212,12 +1226,25 @@ describe("the batched upload transport", () => {
         await until(() => status(page), idle, "the transport did not go idle");
         sends = await sendsOf(page);
         runs = await tickRunsOf(page);
+        witness = await page.evaluate(() =>
+          (
+            globalThis as unknown as { __ctWitnessStop(): Witness }
+          ).__ctWitnessStop(),
+        );
       } finally {
         await context.close();
       }
       const sent = sendTimes(sends);
       const got = ingest.batches.map((b) => b.parsed);
       expect(sent.size).toBe(got.length);
+      // The witness ran over every batch's wait: it started before the
+      // first tick and its last tick ran after the last send.
+      expect(witness.reads.length, "witness ticks").toBeGreaterThan(0);
+      expect(witness.run.t0).toBeLessThan(runs[0].t0);
+      expect(
+        Math.max(...witness.reads),
+        "the witness ran past the last send",
+      ).toBeGreaterThan(Math.max(...[...sent.values()].map((x) => x.t)));
       // At most 256 records per batch.
       for (const b of got) {
         expect(
@@ -1240,6 +1267,7 @@ describe("the batched upload transport", () => {
         sent,
         (b) => schedule.get(b)!,
         runs,
+        witness,
       );
       // Most batches met their deadline outright.
       expect(stalls + unseen, "batches excused").toBeLessThan(got.length / 2);
