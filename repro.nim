@@ -55,6 +55,15 @@ package codetracer_js_recorder:
     when not defined(windows):
       "pkg-config"
       "openssl"
+    # Workspace siblings, resolved BY PATH: the addon's Cargo.toml
+    # path-depends on codetracer-trace-format's crates (types, ctfs,
+    # reader and the Nim-backed codetracer_trace_writer_nim, whose build
+    # script compiles codetracer-trace-format-nim's Nim library). The
+    # storage-contract conformance
+    # test calls codetracer_ctfs::recorder_conformance. Naming them here
+    # is what puts their pinned revisions in this repo's repro.lock.
+    "codetracer-trace-format"
+    "codetracer-trace-format-nim"
 
   library codetracerJsRecorder
 
@@ -110,7 +119,8 @@ package codetracer_js_recorder:
       manifestPath = cargoManifest,
       actionId = "codetracer-js-recorder.cargo-test-build",
       extraInputs = @[cargoManifest, cargoLockfile,
-                      "crates/recorder_native/src"],
+                      "crates/recorder_native/src",
+                      "crates/recorder_native/tests"],
       extraOutputs = @["crates/recorder_native/target/debug/deps"])
 
     let cargoTestsRun = cargo.test(
@@ -120,6 +130,7 @@ package codetracer_js_recorder:
       extraInputs = @[
         cargoManifest, cargoLockfile,
         "crates/recorder_native/src",
+        "crates/recorder_native/tests",
         "crates/recorder_native/target/debug/deps"
       ])
 
