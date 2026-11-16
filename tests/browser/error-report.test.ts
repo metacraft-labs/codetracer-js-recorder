@@ -341,11 +341,16 @@ async function runCase(
   status: Status;
   shown: unknown[];
   page: Page;
+  requests: { method: string; url: string }[];
   close: () => Promise<void>;
 }> {
   const context = await browser.newContext();
   const page = await context.newPage();
   page.on("pageerror", () => undefined);
+  const requests: { method: string; url: string }[] = [];
+  context.on("request", (request) =>
+    requests.push({ method: request.method(), url: request.url() }),
+  );
   if (options.initScript !== undefined) {
     await page.addInitScript({ content: options.initScript });
   }
@@ -402,7 +407,7 @@ async function runCase(
   const shown = await page.evaluate(
     () => (window as unknown as { __shown: unknown[] }).__shown,
   );
-  return { status, shown, page, close: () => context.close() };
+  return { status, shown, page, requests, close: () => context.close() };
 }
 
 /** The trace id an upload carries, from its `traceparent`. */
@@ -509,6 +514,24 @@ describe("browser error report (real Chromium, real OpenTelemetry backend)", () 
       expect(upload.content_type).toBe("application/json");
       // The page was shown exactly what was sent.
       expect(run.shown).toEqual([report]);
+    } finally {
+      await run.close();
+    }
+  });
+
+  // A report goes to the endpoint the site named and to nothing else.
+  it("sends the report to the site's own endpoint and nowhere else", async () => {
+    const run = await runCase(browser, backend, "only-site", { consent: "yes" });
+    try {
+      expect(run.status).toMatchObject({ sent: 1, accepted: 1 });
+      const posts = run.requests.filter((r) => r.method !== "GET");
+      expect(posts).toEqual([
+        { method: "POST", url: `${backend.origin}/reports` },
+      ]);
+      const elsewhere = run.requests.filter(
+        (r) => new URL(r.url).origin !== backend.origin,
+      );
+      expect(elsewhere).toEqual([]);
     } finally {
       await run.close();
     }
