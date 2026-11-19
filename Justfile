@@ -80,9 +80,11 @@ verify-request-spans:
 verify-cli-convention:
     bash tests/verify-cli-convention-no-silent-skip.sh
 
-# Build the Rust native addon via napi-rs
+# Build the Rust native addon via napi-rs. The script fails unless this run
+# wrote crates/recorder_native/index.node: napi exiting 0 is not proof that it
+# ran (see the script's header for the Windows case that showed it).
 build-native: install
-    npx napi build --release --manifest-path crates/recorder_native/Cargo.toml --output-dir crates/recorder_native/
+    bash scripts/build-native.sh
 
 # Build all packages
 build: install
