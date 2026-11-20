@@ -188,7 +188,7 @@ describe("HCR (Hot Code Reload) validation", () => {
       const traceDir = traceDirMatch[1].trim();
       expect(fs.existsSync(traceDir)).toBe(true);
 
-      // Per Recorder-CLI-Conventions.md §4 the recorder is CTFS-only —
+      // The recorder writes only the CTFS container —
       // no `trace.json` events sidecar is written.
       const ctFiles = fs.readdirSync(traceDir).filter((f) => f.endsWith(".ct"));
       expect(ctFiles.length).toBeGreaterThan(0);

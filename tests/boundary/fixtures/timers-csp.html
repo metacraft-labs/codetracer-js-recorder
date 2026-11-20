@@ -10,7 +10,8 @@
     />
     <title>string timer handlers under CSP</title>
   </head>
-  <body>
+  <!-- Four string timer calls are refused: setTimeout x3, setInterval x1. -->
+  <body data-expect-violations="4">
     <ul id="out"></ul>
     <script src="timers.js"></script>
   </body>

@@ -2,8 +2,8 @@
  * Helper to invoke `ct-print` (shipped with `codetracer-trace-format-nim`)
  * against a recorded `.ct` bundle and return its decoded JSON.
  *
- * Per `codetracer-specs/Recorder-CLI-Conventions.md` §4 the JS recorder is
- * CTFS-only — there is no JSON sidecar produced by the recorder itself.
+ * The JS recorder, like every CodeTracer recorder, writes only the CTFS
+ * `.ct` container — there is no JSON sidecar produced by the recorder itself.
  * Tests that previously asserted on `trace.json` content must now record
  * via the canonical CTFS path and pipe the produced `.ct` container
  * through `ct-print --json` (or `--full`) to obtain a textual oracle.
@@ -49,7 +49,11 @@ export function ctPrintPath(): string {
   // tests/helpers -> tests -> repo root -> workspace root.
   const repoRoot = path.resolve(__dirname, "..", "..");
   const workspaceRoot = path.dirname(repoRoot);
-  return path.join(workspaceRoot, "codetracer-trace-format-nim", "ct-print");
+  // The sibling's `buildCtPrint` writes `ct-print.exe` on Windows
+  // (`build_writer_artifacts.ctPrintPath`), and `fs.existsSync` does not
+  // apply PATHEXT, so the bare name would never be found there.
+  const binary = process.platform === "win32" ? "ct-print.exe" : "ct-print";
+  return path.join(workspaceRoot, "codetracer-trace-format-nim", binary);
 }
 
 /** Returns true if a usable `ct-print` binary is reachable. */
@@ -318,8 +322,8 @@ export interface CtMarkerPayload {
  * `ct-print --correlation-index --json-out` reports it.
  *
  * Boundary crossings and span-coverage declarations share the index and
- * are told apart by `kind` — see
- * `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md` §10.2.
+ * are told apart by `kind`: a crossing has a pairing domain and a
+ * direction, a span-coverage declaration has neither.
  */
 export type CtCorrelationIndexEntry =
   | {
@@ -439,9 +443,7 @@ export interface CtFullBundle {
        * A stream-presence HINT, not a gate: the container's file entry is
        * the authority. Its value is that a consumer can tell "never
        * indexed" from "indexed and covers nothing" without opening the
-       * namespace. See
-       * `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`
-       * §9 and §12.
+       * namespace.
        */
       has_correlation_index?: boolean;
     };

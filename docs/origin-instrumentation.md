@@ -1,11 +1,12 @@
 # Origin-tracking instrumentation overhead
 
-This document records the recorder-side perf budget for the
-Value Origin Tracking milestones M16a (simple assignments) and M16b
-(complex assignment patterns).  It satisfies the
-`docs/origin-instrumentation.md` deliverable pinned in
-`codetracer-specs/Planned-Features/Value-Origin-Tracking.milestones.org`
-§M16b.
+This document records the recorder-side cost of value-origin
+tracking: the `__ct.write` sites the instrumenter adds for simple
+assignments and for the complex assignment patterns (destructuring,
+rest / spread, optional chaining, nullish coalescing).  The budget it
+is measured against: origin tracking may add **less than 25%** on top
+of the plain step / enter / ret instrumentation, in instrumented
+source size and in trace-write throughput.
 
 The measurements below are produced by `scripts/measure-m16b-overhead.mjs`
 against the freshly built workspaces (`just build`).  Re-run that
@@ -25,10 +26,12 @@ immediately after the original assignment.  The write-site metadata
 on the manifest carries the `target` identifier plus the `RValue`
 description (`Literal`, `Simple`, `FieldAccess`, `IndexAccess`,
 `FunctionReturn`, `Compound`) the runtime needs to synthesise the
-`BindVariable + Assignment` pair on flush — see
-`codetracer-specs/Trace-Files/Trace-Event-Types.md` §RValue.
+`BindVariable + Assignment` pair on flush.  An `RValue` describes
+where the assigned value came from: a literal, another variable, a
+field or index of another value, a function's return value, or a
+compound of several of these.
 
-### Destructuring patterns (M16b)
+### Destructuring patterns
 
 For an LHS destructuring pattern the visitor emits **one write site
 per unpacked element**.  Example:
@@ -73,24 +76,23 @@ fixed `__ct.enter` / `__ct.ret` module prologue.
 
 | Fixture                                  | Source B | Instr B | Factor | Write sites | Step sites |
 |------------------------------------------|---------:|--------:|-------:|------------:|-----------:|
-| M16a baseline (simple assignment chain)  |     3750 |   11881 |  ×3.17 |         250 |        250 |
-| M16b object destructuring                |     3450 |    9981 |  ×2.89 |         250 |        100 |
-| M16b array destructuring                 |     2950 |   10631 |  ×3.60 |         300 |        100 |
-| M16b rest / spread                       |     2950 |    8081 |  ×2.74 |         150 |        100 |
-| M16b optional chaining                   |     3650 |    8681 |  ×2.38 |         150 |        150 |
-| M16b nullish coalescing                  |     1650 |    4831 |  ×2.93 |         100 |        100 |
+| Simple assignment chain (baseline)       |     3750 |   11881 |  ×3.17 |         250 |        250 |
+| Object destructuring                     |     3450 |    9981 |  ×2.89 |         250 |        100 |
+| Array destructuring                      |     2950 |   10631 |  ×3.60 |         300 |        100 |
+| Rest / spread                            |     2950 |    8081 |  ×2.74 |         150 |        100 |
+| Optional chaining                        |     3650 |    8681 |  ×2.38 |         150 |        150 |
+| Nullish coalescing                       |     1650 |    4831 |  ×2.93 |         100 |        100 |
 
-The destructuring fixtures sit *below* the M16a baseline factor
+The destructuring fixtures sit *below* the simple-assignment factor
 because the visitor emits one `__ct.write` per unpacked element but
 only one `__ct.step` per source statement — destructuring concentrates
 write sites without proportionally growing the step-site population.
 
-Across the M16-series shapes the expansion factor stays in the
-**×2.4 – ×3.6** band.  For comparison the pre-M16 baseline
-(plain step / enter / ret instrumentation) is **×3.0 ± 0.2** on the
-same fixtures; the M16-series additions therefore stay inside the
-documented "< 25% added overhead" budget pinned on M16a deliverable 6
-of `Value-Origin-Tracking.milestones.org`.
+Across these shapes the expansion factor stays in the
+**×2.4 – ×3.6** band.  For comparison the instrumentation without
+origin tracking (plain step / enter / ret) is **×3.0 ± 0.2** on the
+same fixtures; the origin-tracking sites therefore stay inside the
+"< 25% added overhead" budget stated at the top.
 
 ## Runtime cost per `__ct.write(siteId)` call
 
@@ -112,10 +114,8 @@ walk and converge in cost.
 
 The per-event cost is well below the existing flush-batch overhead
 (events flush in batches of 4 096 to the native addon), so the
-M16-series additions do **not** measurably change the
-trace-write throughput.  This is consistent with the M16a perf
-budget assertion in `Value-Origin-Tracking.milestones.org` §M16a
-deliverable 6.
+origin-tracking sites do **not** measurably change the
+trace-write throughput, which keeps them inside the same budget.
 
 ## Why the destructuring path is constant-time per element
 
@@ -128,13 +128,13 @@ positional index for array patterns).  The runtime never inspects
 the LHS at runtime — every unpacked element is a single typed-array
 push.
 
-This is the M16b §2 deliverable ("runtime-dynamic destructuring
-widths") realised as a **per-element manifest entry + single
-`__ct.write` call**, mirroring the M16a single-site shape.  The
-spec mentions an alternative `__ct.write_index(lhs_id, source_id,
-index, line, col)` API; the implementation collapses that onto the
-existing one-argument `__ct.write(siteId)` so the bytecode-level
-call cost is identical to M16a.
+This is how destructuring of any width is recorded: a
+**per-element manifest entry + single `__ct.write` call**, the same
+single-site shape as a simple assignment.  A separate
+`__ct.write_index(lhs_id, source_id, index, line, col)` API was
+considered; the implementation collapses that onto the existing
+one-argument `__ct.write(siteId)` so the bytecode-level call cost is
+identical to a simple assignment's.
 
 ## Reproducing the figures
 

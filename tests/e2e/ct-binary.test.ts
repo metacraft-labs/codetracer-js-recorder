@@ -1,8 +1,7 @@
 /**
  * Tests for the canonical CTFS multi-stream `.ct` output.
  *
- * The JS recorder is CTFS-only per
- * `codetracer-specs/Recorder-CLI-Conventions.md` §4 — there is no
+ * The JS recorder writes only the CTFS container — there is no
  * `--format` flag, no `CODETRACER_FORMAT` env var, and no JSON events
  * sidecar.  These tests verify:
  *   - A .ct file is produced when recording a simple JS program
@@ -10,8 +9,9 @@
  *   - The .ct file has the expected CTFS version
  *   - The .ct file has the expected block size (4096)
  *
- * See: Trace-Files/CTFS-Container-Format.md in codetracer-specs for the
- * CTFS container format specification.
+ * The container format is defined, written and read by the
+ * codetracer-trace-format libraries
+ * (https://github.com/metacraft-labs/codetracer-trace-format).
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -119,7 +119,7 @@ describe("ct binary output", () => {
     const traceDir = extractTraceDir(stdout);
 
     // The recorder is CTFS-only — the legacy `trace.json` events sidecar
-    // must NOT be written (Recorder-CLI-Conventions.md §4).
+    // must NOT be written.
     expect(fs.existsSync(path.join(traceDir, "trace.json"))).toBe(false);
 
     // At least one .ct file should exist. The name is derived from the

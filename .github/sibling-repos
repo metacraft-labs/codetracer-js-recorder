@@ -1,5 +1,7 @@
-# Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
-# revisions (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
+# Cross-repo siblings cloned by setup-dev-env beside this checkout, at the
+# revisions the workspace lock for this commit pins (the mainline tip when no
+# lock covers the commit), so CI builds against the same sibling sources a
+# developer's workspace does.
 codetracer-trace-format
 codetracer-trace-format-nim
 # The boundary replay tests run two codetracer binaries, `ct-jsbound`

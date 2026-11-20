@@ -28,6 +28,12 @@
  * data changes, or removals, reports mismatches, so the comparison
  * discriminates.
  *
+ * The server holds each cut until the page reports that its timer ran with
+ * the parser stopped at that cut (see {@link GAPS}), so that the timer checks
+ * in each wait happen however little CPU the host grants the renderer. A
+ * fixed wait would leave their number to the scheduler: on a loaded CI host,
+ * three 300 ms waits once granted the 1 ms timer four turns in all.
+ *
  * No mocks: the server, the browser and the census are real.
  */
 
@@ -44,9 +50,68 @@ import {
 const TIMEOUT = 120_000;
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 
-/** Where the server cuts the page, waiting {@link GAP_MS} before the rest. */
+/** Where the server cuts the page; it sends the rest when the page reports. */
 const CUT = "<!--ct:chunk-->";
-const GAP_MS = 300;
+
+/**
+ * How the page tells, in its timer, which cut the parser is stopped at: the
+ * last condition that holds names it. They read the tree only through
+ * `lastChild` and `querySelector`, never a live collection's length, so they
+ * add nothing to the reads the census is checked for. Cut 0 follows the
+ * "after templates" script, cut 1 is inside the run of text (the body's last
+ * child is that text), and cut 2 is inside the `<textarea>`.
+ */
+const GAPS = `[
+  () => seenLabels.has("after templates"),
+  () => { const t = document.body && document.body.lastChild;
+          return !!t && t.nodeType === 3 && t.data.includes("the network cut"); },
+  () => document.querySelector("textarea") !== null,
+]`;
+
+/**
+ * The page's own `__check` calls, in the order they run: every script in
+ * {@link PAGE} but the timer's. The module script runs after the parser
+ * finishes, so after "end".
+ */
+const SCRIPT_CHECKS = [
+  "head",
+  "one of CodeTracer's own scripts running",
+  "after a paragraph",
+  "after a table",
+  "after the adoption agency",
+  "data grown",
+  "comment added",
+  "innerHTML",
+  "insertBefore",
+  "comment data",
+  "removed",
+  "template",
+  "own script added",
+  "own script text",
+  "own script removed",
+  "script added",
+  "script type",
+  "marker set",
+  "marker removed",
+  "document.write",
+  "after document.write",
+  "external script running",
+  "after an external script",
+  "after svg",
+  "after templates",
+  "end",
+  "module",
+];
+
+/**
+ * How long the server waits for the page's report before sending a cut's
+ * remainder anyway. Reached only when no timer ran with the parser stopped
+ * there; the test then fails naming the cut, instead of hanging until the
+ * test's own timeout. The three cuts' limits together stay inside
+ * {@link TIMEOUT}, and the page's navigation is bounded by them rather than
+ * by Playwright's own 30 s default (see `census`).
+ */
+const GAP_REPORT_LIMIT_MS = 20_000;
 
 const PAGE = `<!doctype html><html><head><title>census</title>
 <script>__check("head")</script>
@@ -112,6 +177,13 @@ let server: http.Server;
 let origin: string;
 let progressSource: string;
 
+/** The page load being served, which `/gap/<load>/<cut>` reports belong to. */
+let currentLoad = 0;
+/** Resolves the server's wait at a cut when the page reports it. */
+const gapReported = new Map<number, () => void>();
+/** The cuts of the current load whose wait ended without a report. */
+let unreportedGaps: number[] = [];
+
 beforeAll(async () => {
   browser = await loadPlaywright().chromium.launch({ headless: true });
   const bundle = await esbuild.build({
@@ -137,12 +209,32 @@ beforeAll(async () => {
       res.end('__check("external script running");');
       return;
     }
+    const gap = /^\/gap\/(\d+)\/(\d+)$/.exec(req.url ?? "");
+    if (gap) {
+      res.writeHead(204).end();
+      if (Number(gap[1]) === currentLoad) gapReported.get(Number(gap[2]))?.();
+      return;
+    }
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     const pieces = PAGE.split(CUT);
     const next = (i: number) => {
       res.write(i === 0 ? pieces[0] : CUT + pieces[i]);
-      if (i + 1 < pieces.length) setTimeout(() => next(i + 1), GAP_MS);
-      else res.end();
+      if (i + 1 >= pieces.length) {
+        res.end();
+        return;
+      }
+      // Hold the remainder until the page's timer ran with the parser
+      // stopped at this cut (GAPS), or, failing that, the limit.
+      const limit = setTimeout(() => {
+        gapReported.delete(i);
+        unreportedGaps.push(i);
+        next(i + 1);
+      }, GAP_REPORT_LIMIT_MS);
+      gapReported.set(i, () => {
+        gapReported.delete(i);
+        clearTimeout(limit);
+        next(i + 1);
+      });
     };
     next(0);
   });
@@ -156,8 +248,20 @@ afterAll(async () => {
   await new Promise<void>((resolve) => server?.close(() => resolve()));
 });
 
+/** One `__check` the page made. */
+interface Check {
+  label: string;
+  /** Whether the census answered it (the document was parsing). */
+  incremental: boolean;
+  /** `document.readyState` when it was made. */
+  state: string;
+  /** For a timer check, the cut the parser was stopped at, if any (GAPS). */
+  gap?: number;
+}
+
 interface Census {
   checks: number;
+  log: Check[];
   /** Live collection length reads by the census's answers. */
   wholeReads: number;
   /** ... and by the whole-document measure's (the control). */
@@ -169,6 +273,9 @@ interface Census {
 
 /** Load the page with `DocumentProgress` made first; `sabotage` runs before. */
 async function census(sabotage = ""): Promise<Census> {
+  const load = ++currentLoad;
+  unreportedGaps = [];
+  gapReported.clear();
   const context = await browser.newContext();
   try {
     await context.addInitScript({
@@ -177,7 +284,10 @@ ${sabotage}
 (() => {
   const progress = new CtProgress.DocumentProgress(window);
   const seen = new Set();
-  const out = { checks: 0, incremental: 0, positions: [], mismatches: [], wholeReads: 0, fullReads: 0 };
+  const out = { checks: 0, log: [], incremental: 0, positions: [], mismatches: [], wholeReads: 0, fullReads: 0 };
+  const seenLabels = new Set();
+  const gaps = ${GAPS};
+  let reportedGap = -1;
   // Reads of a live collection's length, which Blink answers by counting
   // the document again after every change to it: the census must make none.
   const lengthOf = Object.getOwnPropertyDescriptor(HTMLCollection.prototype, "length").get;
@@ -199,11 +309,26 @@ ${sabotage}
     if (incremental) out.incremental++;
     if (!seen.has(a)) { seen.add(a); out.positions.push(a); }
     if (a !== b) out.mismatches.push(label + ": census " + a + ", full " + b);
+    const entry = { label, incremental, state: document.readyState };
+    seenLabels.add(label);
+    if (label === "timer") {
+      let gap = -1;
+      for (let i = gaps.length - 1; i >= 0 && gap < 0; i--) if (gaps[i]()) gap = i;
+      if (gap >= 0) entry.gap = gap;
+      // The first timer check at a cut releases the rest of the page.
+      if (gap > reportedGap) {
+        reportedGap = gap;
+        fetch("/gap/${load}/" + gap).catch(() => {});
+      }
+    }
+    out.log.push(entry);
   };
 })();`,
     });
     const page = await context.newPage();
-    await page.goto(`${origin}/`, { waitUntil: "load" });
+    // No navigation timeout of its own: the server bounds each cut's wait
+    // (GAP_REPORT_LIMIT_MS), and the test's TIMEOUT is the hang guard.
+    await page.goto(`${origin}/`, { waitUntil: "load", timeout: 0 });
     return await page.evaluate(
       () => (globalThis as unknown as { __census: Census }).__census,
     );
@@ -217,16 +342,35 @@ describe("the census of a parsing document", () => {
     "census_counts_what_the_whole_document_measure_counts",
     async () => {
       const got = await census();
+      expect(unreportedGaps, "cuts no timer ran at").toEqual([]);
       expect(got.mismatches).toEqual([]);
       // The census answered without counting the document again; the
       // whole-document measure did count it (the control).
       expect(got.wholeReads).toBe(0);
       expect(got.fullReads).toBeGreaterThan(got.checks);
-      // Vacuity guards: the page's checks ran, the timers ran while the
-      // parser waited, most of them with the census answering, and the
-      // positions differ.
-      expect(got.checks).toBeGreaterThan(60);
-      expect(got.incremental).toBeGreaterThan(50);
+      // Vacuity guards, each on what the page itself makes happen rather
+      // than on how many timer turns the host grants: every page script's
+      // check ran, in order; at each cut a timer check ran while the parser
+      // waited there, with the census answering; every check made while the
+      // document was loading was answered by the census; and the page
+      // scripts' checks saw distinct positions.
+      const scripts = got.log.filter((c) => c.label !== "timer");
+      expect(scripts.map((c) => c.label)).toEqual(SCRIPT_CHECKS);
+      for (const cut of [0, 1, 2]) {
+        expect(
+          got.log.some(
+            (c) => c.gap === cut && c.incremental && c.state === "loading",
+          ),
+          `a timer check with the census answering at cut ${cut}`,
+        ).toBe(true);
+      }
+      expect(
+        got.log.filter((c) => c.state === "loading" && !c.incremental),
+        "checks while loading that the census did not answer",
+      ).toEqual([]);
+      expect(got.incremental).toBe(
+        got.log.filter((c) => c.state === "loading").length,
+      );
       expect(got.positions.length).toBeGreaterThan(20);
       // Some checks ran while the document parsed (the census answered).
       expect(

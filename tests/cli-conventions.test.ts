@@ -1,9 +1,10 @@
 /**
  * Recorder CLI convention compliance tests (2026-05-08).
  *
- * Mirrors the cairo precedent (commit 2710b5e) — locks in the four
- * convention-compliance assertions required by
- * `Recorder-CLI-Conventions.md` §4 (CTFS-only) and §5 (env vars):
+ * Mirrors the cairo precedent (commit 2710b5e) — locks in the
+ * convention-compliance assertions every CodeTracer recorder meets: it
+ * writes only the CTFS container, and each output flag has an
+ * environment-variable fallback:
  *
  *   1. `--format` is rejected by the CLI with a non-zero exit code.
  *   2. `--help` does NOT advertise `--format` or `CODETRACER_FORMAT`.
@@ -278,10 +279,9 @@ describe("test_env_disabled_skips_recording", () => {
 // test_target_exit_code_is_propagated
 // =============================================
 /**
- * `Recorder-CLI-Conventions.md` §6: "By default, the recorder's exit code
- * should mirror the target program's exit code. If the target exits with
- * code 42, the recorder exits with code 42. This allows CI pipelines to
- * detect target program failures."
+ * By default, the recorder's exit code mirrors the target program's: if the
+ * target exits with code 42, the recorder exits with code 42, so a CI
+ * pipeline that records a test run still sees the tests fail.
  *
  * This is a regression guard with a name attached. `record` used to catch
  * the child's non-zero status, print `Warning: recorded program exited
@@ -289,8 +289,7 @@ describe("test_env_disabled_skips_recording", () => {
  * check into a silent self-pass. It is how
  * `codetracer/src/db-backend/tests/javascript_hcr_ctfs_integration.rs`
  * reported success for two months against a program that died at its first
- * `require`. See
- * `codetracer-specs/Testing/Silent-Self-Pass-Audit-2026-08-23.md`.
+ * `require`.
  */
 describe("test_target_exit_code_is_propagated", () => {
   let tmp: string;

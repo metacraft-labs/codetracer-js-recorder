@@ -2,8 +2,8 @@ name: launcher-integration
 
 # Single-edge cross-repo CI: when codetracer-js-recorder changes,
 # verify the launcher's bundled-tarball build still works against
-# this recorder's source. Mirrors the pattern in
-# codetracer-specs/Testing/Cross-Repo-CI-Integration.md.
+# this recorder's source. Same pattern as the other cross-repo checks: the
+# sibling repositories are cloned beside this checkout and built from source.
 #
 # ---------------------------------------------------------------------------
 # SCOPE: PACKAGING ONLY. **NON-AUTHORITATIVE FOR THE RECORD CONTRACT.**
@@ -21,7 +21,7 @@ name: launcher-integration
 # path nothing else covers, and it fails in seconds rather than in an hour.
 #
 # The authority for the launcher <-> recorder RECORD contract is the
-# end-to-end gate added by milestone LRC-4, which routes `ct record <sample>`
+# end-to-end gate (launcher-recorder-e2e.yml), which routes `ct record <sample>`
 # through the real launcher into the real desktop core and this real recorder
 # and validates the produced CTFS trace with `ct-print`:
 #
@@ -30,9 +30,10 @@ name: launcher-integration
 #   metacraft-labs/codetracer/.github/workflows/launcher-recorder-e2e.yml
 #   metacraft-labs/codetracer/ci/test/launcher-recorder-e2e.sh
 #
-# Design: codetracer-specs/Testing/Launcher-Recorder-Compatibility-Tests.md
-#         ("Motivation" explains why `ct --version` is not enough; section 6
-#         records that these smoke workflows stay as a fast pre-check).
+# Why this is not enough on its own: `ct --version` succeeding says nothing
+# about whether the launcher routes a recording to this recorder or whether
+# the trace it produces decodes. That is what the end-to-end gate checks; this
+# smoke workflow stays as a fast pre-check in front of it.
 # ---------------------------------------------------------------------------
 
 on:

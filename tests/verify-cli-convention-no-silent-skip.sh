@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# Verify that the codetracer-js-recorder CLI complies with
-# `Recorder-CLI-Conventions.md` (no silent skip — every assertion
-# either passes or fails loudly):
+# Verify that the codetracer-js-recorder CLI complies with the
+# conventions every CodeTracer recorder follows (no silent skip — every
+# assertion either passes or fails loudly). A recorder writes only the
+# CTFS `.ct` container, has a `--out-dir` flag, and reads an
+# environment-variable fallback for its output directory and a switch
+# that disables recording:
 #
-#   * `--format` is absent from `--help` (CTFS-only — convention §4)
-#   * `CODETRACER_FORMAT` is absent from `--help` (convention §5)
-#   * `--out-dir` is present in `--help` (§3)
-#   * `--help` mentions `ct print` (the canonical conversion tool, §4)
+#   * `--format` is absent from `--help` (CTFS-only)
+#   * `CODETRACER_FORMAT` is absent from `--help` (no format variable)
+#   * `--out-dir` is present in `--help`
+#   * `--help` mentions `ct print` (the canonical conversion tool)
 #   * `CODETRACER_JS_RECORDER_OUT_DIR` is referenced in source so the
-#     env-var fallback (§5) cannot regress silently.
+#     env-var fallback cannot regress silently.
 #   * `CODETRACER_JS_RECORDER_DISABLED` is referenced in source so the
-#     disable-recording env-var (§5) cannot regress silently.
+#     disable-recording env-var cannot regress silently.
 #   * The recorder's output dispatch in `crates/recorder_native/src/lib.rs`
 #     no longer mentions the legacy `trace.json` events sidecar (CTFS-
-#     only — §4).
+#     only).
 #
 # Wire-up: see `Justfile` (`just lint` and `just test` both run this
 # script) and `package.json` (the `test:verify-cli-convention` script).
@@ -130,8 +133,8 @@ echo "ok: CODETRACER_JS_RECORDER_DISABLED referenced in source"
 # ---------------------------------------------------------------------------
 
 # The native crate's `flush_and_stop` used to write a `trace.json` events
-# sidecar in addition to the CTFS `.ct` container.  Convention §4 makes
-# the recorder CTFS-only; the events sidecar must be gone from the
+# sidecar in addition to the CTFS `.ct` container.  The recorder is now
+# CTFS-only; the events sidecar must be gone from the
 # write path.  We allow the string in comments/docs but not in any
 # `fs::write` call site.
 if grep -nE 'fs::write\([^)]*"trace\.json"' \
@@ -146,7 +149,7 @@ echo "ok: native crate has no trace.json fs::write call"
 # ---------------------------------------------------------------------------
 
 # The addon's `start_recording` used to extract a `format` named
-# property from the N-API options object.  Convention §4 means there is
+# property from the N-API options object.  Being CTFS-only means there is
 # no format selector — the N-API surface must not require it.
 if grep -nE '"format"' \
    "${REPO_ROOT}/crates/recorder_native/src/lib.rs" \

@@ -1,14 +1,14 @@
 /**
- * M26 verification suite: browser-side JavaScript recorder.
+ * Verification suite: browser-side JavaScript recorder.
  *
- * Pins the browser runtime + the AOT CLI + the Vite plugin against the
- * milestone's verification tests.  Headless-Chrome / Vite-dev-server
- * end-to-end paths are SKIPPed narrowly when the host shell does not
- * have browser infrastructure (per the M5 SKIP discipline).
+ * Pins the browser runtime + the ahead-of-time CLI + the Vite plugin.
+ * Headless-Chrome / Vite-dev-server end-to-end paths are SKIPped narrowly
+ * when the host shell does not have browser infrastructure, each printing
+ * `SKIP:` and the prerequisite it lacks rather than passing silently.
  *
- * Cross-references:
- *   * `codetracer-specs/Planned-Features/Value-Origin-Tracking.milestones.org` M26.
- *   * `codetracer-specs/GUI/Debugging-Features/Value-Origin-Tracking.md` §14.4.
+ * The wire format under test: newline-delimited JSON over WebSocket, one
+ * trace event per line, and no protocol shims (the recorder never
+ * intercepts `fetch`, `XMLHttpRequest`, `WebSocket` or `postMessage`).
  */
 
 import { describe, it, expect } from "vitest";
@@ -447,11 +447,10 @@ describe("browser runtime value encoder mirrors Node runtime", () => {
   });
 });
 
-// ── M38d: the flush policy has a time bound as well as a count bound ─────
+// ── The flush policy has a time bound as well as a count bound ──────────
 //
-// `codetracer-specs/Recording-Backends/WASM-Replay-Snapshots-And-Slices.md`
-// §2 requires a consumer to be able to derive artefacts from this stream
-// *while the page is still running*. A count-only policy makes that
+// A consumer must be able to derive artefacts (replay snapshots) from this
+// stream *while the page is still running*. A count-only policy makes that
 // unreachable for any page producing fewer events than the threshold — most
 // short pages, and every fixture in this repo — because the whole recording
 // then reaches the daemon in one batch at `stop()`.

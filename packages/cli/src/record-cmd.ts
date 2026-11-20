@@ -13,11 +13,11 @@
  *
  * The recorder always writes the canonical CTFS multi-stream container into
  * --out-dir.  There is no `--format` flag and no `CODETRACER_FORMAT` env
- * var — see codetracer-specs/Recorder-CLI-Conventions.md §4.  For
+ * var: like every CodeTracer recorder it writes no other format.  For
  * human-readable conversion of the produced bundle, use `ct print` from
  * codetracer-trace-format-nim.
  *
- * Environment variables (per Recorder-CLI-Conventions.md §5):
+ * Environment variables (each a fallback for the flag it names; the flag wins):
  *   CODETRACER_JS_RECORDER_OUT_DIR    Fallback for --out-dir.
  *   CODETRACER_JS_RECORDER_DISABLED   When set to "1" / "true", skip recording
  *                                     entirely and exit 0 without running the
@@ -130,7 +130,7 @@ export function linkNodeModules(tmpDir: string, baseDir: string): void {
 /**
  * Parse command-line arguments for the record command.
  *
- * Output-directory resolution order (per Recorder-CLI-Conventions.md §5):
+ * Output-directory resolution order (the same in every CodeTracer recorder):
  *   1. `--out-dir` / `-o` CLI flag (highest precedence)
  *   2. `CODETRACER_JS_RECORDER_OUT_DIR` env var
  *   3. `./ct-traces/` (default)
@@ -203,7 +203,7 @@ function parseArgs(args: string[]): {
     } else if (arg === "--no-autoformat") {
       autoformat = false;
     } else if (arg === "--help" || arg === "-h") {
-      // Per Recorder-CLI-Conventions.md §4 the recorder is CTFS-only:
+      // The recorder writes only the CTFS container:
       // there is no `--format` flag and no `CODETRACER_FORMAT` env var.
       // Use `ct print` from codetracer-trace-format-nim to convert the
       // produced .ct bundle to JSON / text.
@@ -323,7 +323,7 @@ function generateRunner(opts: {
   const esc = (s: string) => JSON.stringify(s);
 
   // The recorder always writes CTFS — no `format` parameter is passed to
-  // the addon (see Recorder-CLI-Conventions.md §4).
+  // the addon.
   return `// Auto-generated CodeTracer runner script.
 // This file is created by "codetracer-js-recorder record" and is not meant to be edited.
 "use strict";
@@ -743,8 +743,8 @@ require(${esc(opts.instrumentedEntry)});
 
 /**
  * Returns true when CODETRACER_JS_RECORDER_DISABLED is set to a truthy
- * value ("1" or "true", case-insensitive).  Per
- * Recorder-CLI-Conventions.md §5 this skips trace emission entirely
+ * value ("1" or "true", case-insensitive).  As in every CodeTracer
+ * recorder, this skips trace emission entirely
  * but still runs the target program (so a CI pipeline that opts out of
  * recording still sees the program's exit code and stdout/stderr —
  * mirrors the Python / Ruby runtime-disable semantics).  We achieve
@@ -1077,10 +1077,10 @@ export function recordCommand(args: string[]): void {
     } catch (err: unknown) {
       // The child may exit non-zero and still have produced a usable
       // (if truncated) trace, so we keep going and finish writing it.
-      // But the recorder's OWN exit code must mirror the target's —
-      // `Recorder-CLI-Conventions.md` §6: "If the target exits with code
-      // 42, the recorder exits with code 42. This allows CI pipelines to
-      // detect target program failures."
+      // But the recorder's OWN exit code must mirror the target's, as every
+      // CodeTracer recorder's does: if the target exits with code 42, the
+      // recorder exits with code 42, so a CI pipeline that records a test
+      // run still sees the tests fail.
       //
       // This used to only print a warning and still exit 0, which turned
       // every caller's `status.success()` check into a silent self-pass:

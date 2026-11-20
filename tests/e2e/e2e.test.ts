@@ -232,9 +232,8 @@ describe("e2e_record_simple_program", () => {
     // leo / miden / move / polkavm / solana / ton (Int round-trip) and
     // evm (Raw byte) precedents — record a real program, then convert
     // the produced CTFS bundle through `ct-print` and assert on the
-    // textual representation.  See `Recorder-CLI-Conventions.md` §4 —
-    // CTFS-only output, with `ct print` as the canonical conversion
-    // tool.
+    // textual representation.  The recorder writes only CTFS, with
+    // `ct print` as the canonical conversion tool.
     //
     // Two layers of assertions:
     //

@@ -433,8 +433,8 @@ const _require = createRequire(__filename);
 /**
  * Shape of the Rust N-API addon exports.
  *
- * Per `codetracer-specs/Recorder-CLI-Conventions.md` §4 the addon is
- * CTFS-only — there is no `format` parameter on `startRecording`.
+ * The addon writes only the CTFS container — there is no `format`
+ * parameter on `startRecording`.
  */
 export interface NativeAddon {
   version(): string;
@@ -447,9 +447,8 @@ export interface NativeAddon {
      * P2.6: opt the writer into column-aware step encoding (CTFS
      * `DeltaColumn` tag 0x07 + `paths.dat` Layout A line-length
      * tables).  Defaults to `true`; pass `false` to fall back to
-     * line-only step encoding (matches the pre-P2 trace shape).
-     * See `codetracer-specs/Planned-Features/
-     * Column-Aware-Tracing-And-Deminification.milestones.org` §P2.
+     * line-only step encoding (the trace shape from before column-aware
+     * steps existed), for a reader that does not know `DeltaColumn`.
      */
     columnAware?: boolean;
   }): number;
@@ -654,9 +653,7 @@ export interface CtRuntime {
    *
    * This is NOT a correlation marker and does not pair with anything: a
    * span has no send/recv sense and no pairing domain. Both kinds land in
-   * the same `corrmark.ns` index under different kind discriminators —
-   * see `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`
-   * §10.2.
+   * the same `corrmark.ns` index under different kind discriminators.
    *
    * Never throws, and mints no step, exactly like {@link markCorrelation}.
    *

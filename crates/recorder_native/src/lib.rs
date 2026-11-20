@@ -254,9 +254,8 @@ struct WriteEntryInput {
 ///
 /// Mirrors `MarkerEntry` in `packages/runtime/src/buffer.ts`, and is
 /// internally tagged by `kind` so the one side channel carries both
-/// marker kinds the correlation index knows about — see
-/// `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md` §10.2
-/// ("one namespace, two kinds"): a boundary crossing has a pairing
+/// marker kinds the correlation index knows about. Both kinds share one
+/// namespace in the container: a boundary crossing has a pairing
 /// domain and a direction, a span-coverage declaration has neither.
 ///
 /// The tag is REQUIRED rather than defaulted. Both producers of this
@@ -268,7 +267,8 @@ struct WriteEntryInput {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum MarkerEntryInput {
-    /// `Correlation-Markers.md` §2.4 — a value crossed a process boundary.
+    /// A value crossed a process boundary (sent to, or received from,
+    /// another recorded process), so a reader can pair the two ends.
     #[serde(rename_all = "camelCase")]
     Correlation {
         /// Index of the event in the batch this marker belongs to.
@@ -1105,7 +1105,7 @@ pub fn start_recording(opts: JsObject) -> Result<u32> {
         .into_utf8()?
         .as_str()?
         .to_string();
-    // The recorder is CTFS-only (Recorder-CLI-Conventions.md §4) — there is
+    // The recorder writes only the CTFS `.ct` container — there is
     // no `format` parameter on the addon's `startRecording` call.
 
     // P2.6: column-aware opt-in.  Defaults to `true` per the milestone
@@ -1622,7 +1622,7 @@ pub fn append_events(
             // declaration, buffered for the shared writer to lower at
             // replay.  Nothing here constructs a payload: that moved into
             // the CTFS writer library so the ~20 recorders cannot drift
-            // (contract §11a.1).
+            // (every recorder writes markers through that one API).
             8 => {
                 let Some(marker) = marker_map.get(&i) else {
                     continue;
@@ -1660,7 +1660,7 @@ pub fn append_events(
                                 // substitute the literal "show" for an empty
                                 // string; passing the real binding name is
                                 // why `show_text` exists as a parameter at
-                                // all (contract §11a.2).
+                                // all (the binding name is what the reader shows).
                                 show_text: show_text.clone().unwrap_or_default(),
                                 description: String::new(),
                             }));
@@ -1804,9 +1804,9 @@ fn local_value_to_upstream(
 /// This writes three stream files (metadata, events, paths) plus the
 /// final `.ct` container via `writer.close()`.  The writer is hard-pinned
 /// to `NimTraceFormat::Binary` (the underlying Nim writer treats this as
-/// CTFS — see `codetracer_trace_writer_nim/src/lib.rs:297`).  Per
-/// `Recorder-CLI-Conventions.md` §4 the recorder is CTFS-only — there is
-/// no JSON output dispatch.
+/// CTFS — see `codetracer_trace_writer_nim/src/lib.rs:297`).  The
+/// recorder writes only the CTFS container — there is no JSON output
+/// dispatch.
 ///
 /// Returns the set of `manifest.extra_files` keys that were successfully
 /// migrated into the canonical CTFS `srcviews.dat` stream (P6.2 →
@@ -1965,7 +1965,7 @@ fn write_binary_trace(
     // M25: interned correlation-boundary label ids, hoisted out of the
     // replay loop.  `ensure_marker_id` is the primary operation of the
     // shared marker API and is meant to be called once per boundary, not
-    // once per crossing (contract §11a.4) — a program that marks the same
+    // once per crossing — a program that marks the same
     // boundary in a loop therefore pays for one interning call, and the
     // per-crossing call does no string lookup.
     let mut marker_ids: HashMap<String, u64> = HashMap::new();
@@ -2180,7 +2180,7 @@ fn write_binary_trace(
             // `db-backend/src/correlation_markers.rs` produces markers
             // that are invisible rather than broken, with no error
             // anywhere, which is why the API lives in the writer library
-            // (contract §11a.1 / §11a.2).
+            // and every recorder calls it.
             //
             // Step attribution is the shared writer's job and needs no
             // argument from here: its C ABI derives the enclosing step
@@ -2200,7 +2200,7 @@ fn write_binary_trace(
             // from this side by
             // `tests/e2e/correlation-markers-recording.test.ts`.
             TraceEvent::CorrelationMarker(cm) => {
-                // The numeric-id call is the primary one (§11a.4): the
+                // The numeric-id call is the primary one: the
                 // label is interned ONCE per distinct boundary and the
                 // per-crossing call then does no string lookup.  The cache
                 // is hoisted out of this loop for exactly that reason.
@@ -2242,7 +2242,7 @@ fn write_binary_trace(
             }
             // A span-coverage declaration: this recording covers the named
             // OTel span.  `corrmark.ns` kind 0 — no `MarkerPayload`, no
-            // direction and no pairing domain (contract §10.2).
+            // direction and no pairing domain.
             TraceEvent::SpanCoverage(sc) => {
                 if let Err(err) = writer.mark_span_coverage_hex(
                     &sc.trace_id_hex,
@@ -2416,7 +2416,7 @@ pub fn flush_and_stop(handle: u32) -> Result<String> {
 
     // Write the canonical CTFS multi-stream `.ct` container via the
     // Nim-backed writer.  This is the only on-disk shape produced by the
-    // recorder per Recorder-CLI-Conventions.md §4 — the legacy
+    // recorder, as for every CodeTracer recorder — the legacy
     // `trace.json` events sidecar (kept during the binary-output
     // transition) was removed on 2026-05-08 along with the `--format` /
     // `CODETRACER_FORMAT` surface area.  Use `ct print` from

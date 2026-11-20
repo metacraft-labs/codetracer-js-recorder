@@ -1,8 +1,7 @@
 /**
  * Smoke tests for the CTFS-recorder-audit fixes (handoff entry 1.38),
  * rewritten on 2026-05-08 against the canonical `ct print` conversion
- * tool after the recorder went CTFS-only per
- * `Recorder-CLI-Conventions.md` §4.
+ * tool after the recorder went CTFS-only (it writes no JSON trace).
  *
  * Pre-2026-05-08 these tests inspected the recorder-emitted `trace.json`
  * sidecar via `--format json`.  That sidecar (and the `--format` flag)

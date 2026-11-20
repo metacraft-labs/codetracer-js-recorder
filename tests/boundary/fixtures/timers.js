@@ -15,10 +15,14 @@
   window.addEventListener("unhandledrejection", function () {
     window.__errors.rejection++;
   });
+  // The CSP violations the page's string timers cause (timers-csp.html states
+  // how many it expects; a page without a CSP expects none).
   var violations = 0;
-  document.addEventListener("securitypolicyviolation", function () {
-    violations++;
-  });
+  var expectedViolations = Number(
+    document.body.getAttribute("data-expect-violations") || "0",
+  );
+  var timerDone = false;
+  var reported = false;
   var out = document.getElementById("out");
   function slot(name, value) {
     var li = document.getElementById("r-" + name);
@@ -57,7 +61,17 @@
   );
   handles.push(window.__iv > 0);
 
-  setTimeout(function () {
+  // The report needs both: the 300 ms timer, which is due after the string
+  // timers (same timer queue, so they have run), and every violation. A
+  // violation is an event the platform queues in a task of its own, and a
+  // timer that is due later can run before it under load (Chromium does not
+  // keep due order across task queues), so the timer alone does not show
+  // that the violations were counted. Without the violations the report
+  // waits, and the test ends at its timeout instead of reading a count
+  // that has not arrived.
+  function reportWhenReady() {
+    if (reported || !timerDone || violations < expectedViolations) return;
+    reported = true;
     slot(
       "results",
       JSON.stringify([
@@ -71,5 +85,13 @@
       ]),
     );
     document.body.setAttribute("data-done", "1");
+  }
+  document.addEventListener("securitypolicyviolation", function () {
+    violations++;
+    reportWhenReady();
+  });
+  setTimeout(function () {
+    timerDone = true;
+    reportWhenReady();
   }, 300);
 })();
