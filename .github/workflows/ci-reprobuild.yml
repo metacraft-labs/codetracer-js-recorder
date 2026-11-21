@@ -98,18 +98,27 @@ jobs:
         # we catch silent divergences between `repro build` outputs
         # and what the dev shell + Justfile produce today.
         #
+        # It is NOT the same cargo build as `repro build` above, and does not
+        # reuse it: `npx napi build` (@napi-rs/cli 3) always passes an explicit
+        # `--target <host triple>`, which makes cargo build into
+        # `target/<triple>/release/`, while the `repro.nim` cargo edge builds
+        # `target/release/`. So this step compiles the whole crate graph again
+        # from cold, release profile with LTO.
+        #
         # Windows: a bound, so a hang fails this leg instead of holding one
         # of the fleet's two Windows slots until the job's 6 h limit. On
         # 2026-11-12 (run 43202169561) this step went silent after `npx napi
-        # build` and was cancelled 2 h 18 min later. The step does the same
-        # cargo release build as `repro build` above plus `npm install` and
-        # `tsc`; `repro build` from cold took 4 min 17 s to 4 min 56 s on
-        # windows-x64 (runs 42312739264, 42322746979, 43202169561), and no
-        # Windows run had reached the napi build before, so 20 min is about
-        # four times the measured cold build. Linux and macOS keep the job
-        # default until a run of theirs gives this step a duration to size
-        # from.
-        timeout-minutes: ${{ matrix.os == 'windows' && 20 || 360 }}
+        # build` and was cancelled 2 h 18 min later. Sized from the first runs
+        # in which napi actually ran (run 44685803773, 2026-11-20): on
+        # windows-x64 the step took 16 min 58 s, of which cargo took 11 min
+        # 19 s; on windows-arm64 cargo alone took 17 min 51 s and the step
+        # hit the previous 20 min bound at 20 min 10 s, during `npm run
+        # build`. With the same ~5 min 40 s of npm and tsc work as x64, the
+        # arm64 step needs about 24 min, so 45 min is a little under twice the
+        # slowest measured leg and still fails a hang within the hour. Linux
+        # and macOS keep the job default until a run of theirs gives this
+        # step a duration to size from.
+        timeout-minutes: ${{ matrix.os == 'windows' && 45 || 360 }}
         run: dev-exec just build
 
       - name: Build codetracer test binaries
@@ -118,7 +127,68 @@ jobs:
         run: dev-exec just build-codetracer-test-bins
 
       - name: just test (cross-check)
+        # Linux: Playwright's browser log goes to one file per Node process
+        # under ci-diagnostics/playwright/, which "Upload logs on failure"
+        # below collects. It is the only record of why a Chromium page crashed
+        # or hung: the test report says just "Page crashed", while this log
+        # has the browser's own stderr and its exit code or signal. The
+        # preload only points playwright-core's DEBUG_FILE at that directory
+        # (see scripts/ci/playwright-debug-log.cjs for why each process needs
+        # its own file); `pw:browser*` selects the browser-process channel and
+        # nothing else, so stdout and the tests' behaviour are unchanged.
+        # Linux only: the browser failures this was added for (run
+        # 44685803773) happened on the linux-x64 leg alone.
+        env:
+          CT_PLAYWRIGHT_DEBUG_DIR: ${{ matrix.os == 'linux' && format('{0}/ci-diagnostics/playwright', github.workspace) || '' }}
+          DEBUG: ${{ matrix.os == 'linux' && 'pw:browser*' || '' }}
+          NODE_OPTIONS: ${{ matrix.os == 'linux' && format('--require={0}/scripts/ci/playwright-debug-log.cjs', github.workspace) || '' }}
         run: dev-exec just test
+
+      # Linux: what the runner gave this job, read after a failure. Browser
+      # tests passed on NixOS hosts and failed on the ephemeral incus container
+      # class at the same commit (run 44685803773: timeouts and "Page crashed"
+      # on linux-x64 only), and nothing in the job log says how many CPUs,
+      # how much memory, or which cgroup limits the container had. The cgroup
+      # counters are cumulative, so memory.events (oom_kill) and pids.events
+      # (max) still show a limit that was hit mid-run. Read directly on the
+      # runner, not through dev-exec, so it describes the host the tests ran
+      # on; every probe tolerates being unreadable, so this step can only add
+      # evidence, never a failure of its own.
+      - name: Record runner resources on failure
+        if: failure() && matrix.os == 'linux'
+        shell: bash
+        run: |
+          mkdir -p ci-diagnostics
+          out=ci-diagnostics/runner-resources.txt
+          probe() {
+            printf '\n===== %s\n' "$*"
+            "$@" 2>&1 || printf '(exit %s)\n' "$?"
+          }
+          {
+            probe uname -a
+            probe nproc
+            probe free -m
+            probe sh -c 'ulimit -a'
+            probe df -h /tmp /dev/shm
+            probe cat /proc/self/cgroup
+            # cgroup v2: the files of this process's cgroup and of each
+            # ancestor visible in the namespace, since a limit may be set
+            # on any of them.
+            rel="$(sed -n 's/^0:://p' /proc/self/cgroup)"
+            dir="/sys/fs/cgroup${rel%/}"
+            while :; do
+              for f in memory.max memory.high memory.current memory.peak \
+                memory.events pids.max pids.current pids.peak pids.events \
+                cpu.max cpu.weight cpuset.cpus.effective; do
+                if [ -r "$dir/$f" ]; then probe cat "$dir/$f"; fi
+              done
+              case "$dir" in /sys/fs/cgroup/?*) dir="${dir%/*}" ;; *) break ;; esac
+            done
+            probe cat /proc/loadavg
+            probe cat /proc/sys/kernel/pid_max /proc/sys/kernel/threads-max
+            probe sh -c 'dmesg | tail -n 200'
+          } > "$out" 2>&1 || true
+          cat "$out"
 
       # Diagnostics on failure. Three things below are load-bearing:
       #
@@ -157,6 +227,7 @@ jobs:
           path: |
             .repro/build/*/build-failure-report.json
             .repro/build/*/build-engine-cache/actions/
+            ci-diagnostics/
           include-hidden-files: true
           retention-days: 1
           if-no-files-found: warn
