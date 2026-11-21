@@ -71,10 +71,10 @@ import {
   sleep,
   startFixtureServer,
 } from "./harness.js";
+import { ctJsboundPath } from "./siblings.js";
 import { type StubIngest, startStubIngest } from "./stub-ingest.js";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
-const WORKSPACE = path.dirname(REPO_ROOT);
 const CLI = path.join(REPO_ROOT, "packages", "cli", "dist", "index.js");
 const TIMEOUT = 240_000;
 /** The transport's initial flush deadline, its fast batches and its cap (§11.1). */
@@ -726,21 +726,7 @@ function sendTimes(sends: Send[]): Map<number, Send> {
 }
 
 beforeAll(async () => {
-  const fromEnv = process.env.CT_JSBOUND;
-  const candidates = [
-    "codetracer/libs/jsbound/target/release/ct-jsbound",
-    "codetracer/libs/jsbound/target/debug/ct-jsbound",
-  ].map((c) => path.join(WORKSPACE, c));
-  const found =
-    fromEnv !== undefined && fromEnv !== ""
-      ? fromEnv
-      : candidates.find((c) => fs.existsSync(c));
-  if (found === undefined) {
-    throw new Error(
-      "ct-jsbound is not built: cargo build --bin ct-jsbound in codetracer/libs/jsbound (or set CT_JSBOUND)",
-    );
-  }
-  CT_JSBOUND = found;
+  CT_JSBOUND = ctJsboundPath();
   browser = await chromium().launch({ headless: true });
 }, TIMEOUT);
 

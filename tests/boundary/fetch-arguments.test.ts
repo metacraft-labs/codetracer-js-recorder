@@ -381,7 +381,7 @@ for (const inverse of ["prefix", "signal-shadow"])
               name: "actual-replay-prefix-inverse",
               setup(plugin) {
                 plugin.onLoad(
-                  { filter: /\/replay\/net\.ts$/ },
+                  { filter: /[\\/]replay[\\/]net\.ts$/ },
                   async (args) => {
                     const source = await fs.promises.readFile(
                         args.path,

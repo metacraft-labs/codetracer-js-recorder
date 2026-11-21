@@ -41,6 +41,7 @@ import {
   ctPrintFull,
   ctPrintPath,
 } from "../helpers/ct-print";
+import { cargoBinaryCandidates } from "../boundary/siblings.js";
 
 const REPO_ROOT = path.resolve(__dirname, "../..");
 const CLI_PATH = path.join(REPO_ROOT, "packages/cli/dist/index.js");
@@ -68,11 +69,11 @@ function findSessionManagerBin(): string | null {
   const env = process.env.SESSION_MANAGER_BIN;
   if (env) return fs.existsSync(env) ? env : null;
   const wsRoot = path.dirname(REPO_ROOT);
-  for (const sub of ["release", "debug"]) {
-    const p = path.join(
-      wsRoot,
-      `codetracer/src/backend-manager/target/${sub}/session-manager`,
-    );
+  for (const c of cargoBinaryCandidates(
+    "codetracer/src/backend-manager",
+    "session-manager",
+  )) {
+    const p = path.join(wsRoot, c);
     if (fs.existsSync(p)) return p;
   }
   return null;

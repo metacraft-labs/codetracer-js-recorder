@@ -27,6 +27,14 @@ import {
 
 const TIMEOUT = 60_000;
 const root = path.resolve(__dirname, "../..");
+/**
+ * `p` with `/` separators. esbuild hands `onLoad` callbacks the host's native
+ * path, which on Windows separates with a backslash, so every suffix check on
+ * `args.path` goes through this, and every `onLoad` filter below accepts
+ * either separator (`[\\/]`).
+ * https://esbuild.github.io/plugins/#on-load-arguments
+ */
+const slashed = (p: string): string => p.split(path.sep).join("/");
 const fixture = path.join(__dirname, "fixtures/fetch-factories.js");
 let browser: Browser,
   server: http.Server,
@@ -82,16 +90,17 @@ async function isolationBundle(mutation?: string): Promise<string> {
           name: "actual-owner-isolation-inverse",
           setup(plugin: import("esbuild").PluginBuild) {
             plugin.onLoad(
-              { filter: /\/(replay\/net|fetch-preparation)\.ts$/ },
+              { filter: /[\\/](replay[\\/]net|fetch-preparation)\.ts$/ },
               async (args) => {
                 let source = await fs.promises.readFile(args.path, "utf8");
                 let from: string, to: string;
                 if (mutation === "scope") {
-                  if (!args.path.endsWith("fetch-preparation.ts")) return;
+                  if (!slashed(args.path).endsWith("fetch-preparation.ts"))
+                    return;
                   from = "previous.scope !== scope";
                   to = "false";
                 } else {
-                  if (!args.path.endsWith("/replay/net.ts")) return;
+                  if (!slashed(args.path).endsWith("/replay/net.ts")) return;
                   from =
                     'if (scope === "fetch" && !meta.has(this)) return settled;';
                   to =
@@ -150,7 +159,7 @@ async function bundled(mutation?: string): Promise<string> {
             // Fetch originally shared this module with the extracted factory.
             // Freeze it too: later body fixes must not rewrite the historical
             // close-context diagnostic that this baseline witnesses.
-            plugin.onLoad({ filter: /\/stream-body\.ts$/ }, (args) => {
+            plugin.onLoad({ filter: /[\\/]stream-body\.ts$/ }, (args) => {
               const saved = legacy.modules.streamBody;
               expect(
                 createHash("sha256").update(saved.source).digest("hex"),
@@ -162,10 +171,10 @@ async function bundled(mutation?: string): Promise<string> {
               };
             });
             plugin.onLoad(
-              { filter: /\/(seams-net|replay\/net)\.ts$/ },
+              { filter: /[\\/](seams-net|replay[\\/]net)\.ts$/ },
               async (args) => {
                 let source = await fs.promises.readFile(args.path, "utf8");
-                const replay = args.path.endsWith("/replay/net.ts"),
+                const replay = slashed(args.path).endsWith("/replay/net.ts"),
                   name = replay ? "replayFetch" : "patchFetch",
                   saved = legacy.functions[name];
                 if (
@@ -226,20 +235,23 @@ async function bundled(mutation?: string): Promise<string> {
           name: "exact-fetch-inverse",
           setup(plugin: import("esbuild").PluginBuild) {
             plugin.onLoad(
-              { filter: /\/(fetch-preparation|seams-net|replay\/net)\.ts$/ },
+              {
+                filter:
+                  /[\\/](fetch-preparation|seams-net|replay[\\/]net)\.ts$/,
+              },
               async (args) => {
                 const source = await fs.promises.readFile(args.path, "utf8");
                 let old: string | undefined, next: string | undefined;
                 if (
                   mutation === "reuse" &&
-                  args.path.endsWith("/fetch-preparation.ts")
+                  slashed(args.path).endsWith("/fetch-preparation.ts")
                 ) {
                   old = "return previous.fetch;";
                   next = "return make();";
                 }
                 if (
                   mutation === "conflict" &&
-                  args.path.endsWith("/fetch-preparation.ts")
+                  slashed(args.path).endsWith("/fetch-preparation.ts")
                 ) {
                   old =
                     "previous.context !== context || previous.mode !== mode";
@@ -247,7 +259,7 @@ async function bundled(mutation?: string): Promise<string> {
                 }
                 if (
                   mutation === "global" &&
-                  args.path.endsWith("/fetch-preparation.ts")
+                  slashed(args.path).endsWith("/fetch-preparation.ts")
                 ) {
                   old = "preparation.fetch = make();";
                   next =
@@ -255,7 +267,7 @@ async function bundled(mutation?: string): Promise<string> {
                 }
                 if (
                   mutation === "record-bypass" &&
-                  args.path.endsWith("/seams-net.ts")
+                  slashed(args.path).endsWith("/seams-net.ts")
                 ) {
                   old =
                     "if (!rec.recording) return origFetch.call(w, input, init);";
@@ -263,7 +275,7 @@ async function bundled(mutation?: string): Promise<string> {
                 }
                 if (
                   mutation === "replay-global" &&
-                  args.path.endsWith("/replay/net.ts")
+                  slashed(args.path).endsWith("/replay/net.ts")
                 ) {
                   old =
                     "return function fetch(input: RequestInfo | URL, init?: RequestInit) {";
@@ -272,7 +284,7 @@ async function bundled(mutation?: string): Promise<string> {
                 }
                 if (
                   mutation === "replay-raw" &&
-                  args.path.endsWith("/replay/net.ts")
+                  slashed(args.path).endsWith("/replay/net.ts")
                 ) {
                   old =
                     "return function fetch(input: RequestInfo | URL, init?: RequestInit) {";

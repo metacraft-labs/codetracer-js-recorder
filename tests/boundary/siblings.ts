@@ -32,7 +32,36 @@ const WORKSPACE = path.dirname(REPO_ROOT);
 /** A canonical UUIDv7, the recording id the assembler requires. */
 export const RECORDING_ID = "01890a5d-ac96-774b-bcce-b302099a8057";
 
-/** A sibling binary: `env` when set, else the first candidate that exists. */
+/**
+ * The file name cargo gives the binary target `name` on this host: `name.exe`
+ * on Windows, `name` elsewhere. Cargo appends the platform's executable
+ * suffix (Rust's `std::env::consts::EXE_SUFFIX`) to every binary it links,
+ * https://doc.rust-lang.org/std/env/consts/constant.EXE_SUFFIX.html
+ */
+export function cargoBinaryName(
+  name: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return platform === "win32" ? `${name}.exe` : name;
+}
+
+/**
+ * The places a cargo binary `bin` of the crate at `crateDir` (relative to the
+ * workspace) can be: its `target/release` and `target/debug` profiles, with
+ * the host's executable suffix. Release first, so an optimised build is
+ * preferred when both exist.
+ */
+export function cargoBinaryCandidates(crateDir: string, bin: string): string[] {
+  const file = cargoBinaryName(bin);
+  return ["release", "debug"].map((profile) =>
+    path.posix.join(crateDir, "target", profile, file),
+  );
+}
+
+/**
+ * A sibling binary: `env` when set, else the first of `candidates` (paths
+ * relative to the workspace) that exists.
+ */
 export function locateSibling(
   env: string,
   candidates: string[],
@@ -51,10 +80,7 @@ export function locateSibling(
 export function sessionManagerPath(): string {
   return locateSibling(
     "CODETRACER_SESSION_MANAGER",
-    [
-      "codetracer/src/backend-manager/target/release/session-manager",
-      "codetracer/src/backend-manager/target/debug/session-manager",
-    ],
+    cargoBinaryCandidates("codetracer/src/backend-manager", "session-manager"),
     "cargo build --bin session-manager in codetracer/src/backend-manager",
   );
 }
@@ -63,10 +89,7 @@ export function sessionManagerPath(): string {
 export function ctJsboundPath(): string {
   return locateSibling(
     "CT_JSBOUND",
-    [
-      "codetracer/libs/jsbound/target/release/ct-jsbound",
-      "codetracer/libs/jsbound/target/debug/ct-jsbound",
-    ],
+    cargoBinaryCandidates("codetracer/libs/jsbound", "ct-jsbound"),
     "cargo build --bin ct-jsbound in codetracer/libs/jsbound",
   );
 }
