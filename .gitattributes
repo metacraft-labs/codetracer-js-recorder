@@ -1,0 +1,24 @@
+# Check every text file out with LF line endings, on every host.
+#
+# Git for Windows defaults to `core.autocrlf=true`, which converts text files
+# to CRLF in the working tree. Several things in this repository read their
+# own sources byte for byte and break on a CRLF checkout:
+#
+# * tests/boundary/vectors/SHA256SUMS is split on "\n", so every file name
+#   it lists keeps a trailing "\r" and cannot be opened.
+# * The boundary-shim falsifier tests (tests/boundary/fetch-*.test.ts) rewrite
+#   one exact anchor in the shipped source before bundling it, and some
+#   anchors span a line break; with CRLF the anchor no longer occurs and the
+#   inverse is never applied.
+# * Shell scripts run by `just` and the Nix files are read by tools that do
+#   not accept "\r".
+#
+# `eol=lf` overrides `core.autocrlf` (https://git-scm.com/docs/gitattributes,
+# "eol"), so the working tree is the same bytes as the repository on Linux,
+# macOS and Windows.
+* text=auto eol=lf
+
+# Binary test vectors: never converted, never diffed as text. `text=auto`
+# would already detect most of them, but a short vector can look like text to
+# git's heuristic (it only checks for NUL bytes), so they are named here.
+*.bin binary
