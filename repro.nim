@@ -101,6 +101,17 @@ package codetracer_js_recorder:
     # https://playwright.dev/docs/browsers#hermetic-install
     when defined(windows):
       "playwright"
+    # A Python that imports the OpenTelemetry SDK, for the traced backend of
+    # ``tests/browser/error-report.test.ts`` (``CT_OTEL_PYTHON``). On Linux
+    # and macOS the flake dev shell exports it from nixpkgs'
+    # ``python3.withPackages``. On Windows the stdlib ``python3-opentelemetry``
+    # package realizes python.org's embeddable CPython with the SDK's pinned
+    # wheels on its own search path (the same SDK version as the nixpkgs
+    # one); the dev env publishes the prefix as
+    # ``REPRO_PREFIX_PYTHON3_OPENTELEMETRY`` and the Justfile ``test`` recipe
+    # points ``CT_OTEL_PYTHON`` at its ``python.exe`` (see there).
+    when defined(windows):
+      "python3-opentelemetry"
     # ``just`` and the shells its recipes run. CI's cross-check steps run
     # ``dev-exec just build`` and ``dev-exec just test`` on every leg
     # (``.github/workflows/ci-reprobuild.yml``). On Linux and macOS the

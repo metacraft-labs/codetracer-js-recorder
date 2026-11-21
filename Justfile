@@ -14,6 +14,16 @@ alias fmt := format
 # naming the cause, instead of as a missing-dev-shell error inside vitest.
 playwright_env := if os_family() == "windows" { "PLAYWRIGHT_CORE_PATH=\"${PLAYWRIGHT_CORE_PATH:-${REPRO_PREFIX_PLAYWRIGHT:?is unset: run inside the reprobuild dev env (repro exec), whose repro.nim declares playwright}}\" PLAYWRIGHT_BROWSERS_PATH=\"${PLAYWRIGHT_BROWSERS_PATH:-0}\"" } else { "" }
 
+# The Python with the OpenTelemetry SDK that tests/browser/error-report.test.ts
+# runs its traced backend with (CT_OTEL_PYTHON). On Linux and macOS the flake
+# dev shell exports it, so this is empty there. On Windows `repro.nim` declares
+# `python3-opentelemetry`, whose prefix the reprobuild dev env publishes as
+# REPRO_PREFIX_PYTHON3_OPENTELEMETRY: python.org's embeddable CPython, whose
+# own search-path file names the SDK's wheels, so the interpreter at
+# `<prefix>/python.exe` imports the SDK with nothing else set. A value already
+# set in the environment wins; an unset prefix fails here, naming the cause.
+otel_env := if os_family() == "windows" { "CT_OTEL_PYTHON=\"${CT_OTEL_PYTHON:-${REPRO_PREFIX_PYTHON3_OPENTELEMETRY:?is unset: run inside the reprobuild dev env (repro exec), whose repro.nim declares python3-opentelemetry}/python.exe}\"" } else { "" }
+
 # Install npm dependencies (idempotent).
 #
 # `build-native` shells out to `npx napi`, and the workspace build/test
@@ -36,7 +46,7 @@ test: install
     cargo test --manifest-path crates/recorder_native/Cargo.toml
     just build-native
     npm run build
-    {{playwright_env}} npm test
+    {{playwright_env}} {{otel_env}} npm test
     just verify-cli-convention
     just verify-request-spans
     just verify-jsbound-vectors
