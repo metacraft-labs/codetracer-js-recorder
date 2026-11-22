@@ -204,6 +204,23 @@
             # when it is unset.
             CT_OTEL_PYTHON = "${pkgs.python3.withPackages (ps: [ ps.opentelemetry-sdk ])}/bin/python3";
 
+            # A prefix holding both zstd.h and libzstd, for reprobuild's path
+            # mode. That mode resolves programs from PATH, and a library has
+            # no program there, so reprobuild reads the prefix of the C
+            # library `zstd-dev` (declared in repro.nim) from this variable and
+            # checks include/zstd.h and lib/libzstd* under it. nixpkgs splits
+            # zstd into a `dev` output (the header) and an `out` output (the
+            # library), so the prefix joins the two. It is the same nixpkgs
+            # zstd as the one above, so the header matches the library this
+            # shell's compiler links.
+            ZSTD_DEV_PREFIX = pkgs.symlinkJoin {
+              name = "zstd-dev-prefix";
+              paths = [
+                pkgs.zstd.dev
+                pkgs.zstd.out
+              ];
+            };
+
             # `cargo <subcommand>` looks for `cargo-<subcommand>` in
             # `$CARGO_HOME/bin` BEFORE it searches PATH. On any machine with
             # rustup -- including the self-hosted macOS runner -- that
