@@ -54,9 +54,15 @@
       done();
     },
     // A body that never ends: the page reads three pieces as they arrive,
-    // then cancels its reader.
+    // then cancels its reader. The server writes the next piece when the
+    // page asks for it (`step`, /api/release), after reading this one, so
+    // each read gets one piece, and when the cancel reaches the server it
+    // has written exactly the three pieces the page read, however late the
+    // host runs the page. Paced by `interval`, a page that ran late let the
+    // server write on until the cancel came (12 lines on a loaded CI host,
+    // 2026-11-24), and how many it wrote measured the host, not the shim.
     "fetch-forever": function () {
-      fetch("/api/stream?n=forever&interval=100").then(function (r) {
+      fetch("/api/stream?n=forever&step=fetch-forever").then(function (r) {
         slot("status", r.status);
         var reader = r.body.getReader();
         var got = [];
@@ -74,6 +80,9 @@
               slot("ended", "no");
               return reader.cancel().then(done);
             }
+            var release = new XMLHttpRequest();
+            release.open("GET", "/api/release?id=fetch-forever");
+            release.send();
             return next();
           });
         }

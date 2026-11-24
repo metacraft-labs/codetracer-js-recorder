@@ -186,38 +186,32 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
       const forever = await open(shimDir, "streams.html?case=fetch-forever");
       const s = await slots(forever.page);
       expect(forever.pageErrors).toEqual([]);
-      // The page's three reads. The server writes a line every 100 ms, and
-      // each read gets what the network has delivered by then: one line,
-      // or, when the renderer was not scheduled for longer than that, the
-      // lines that arrived meanwhile in one piece. Either way the pieces
-      // are the server's lines in order, and the log must hold exactly
-      // these pieces.
+      // The page's three reads. The server writes each line only when the
+      // page has read the one before (`step`, see the fixture), so each
+      // read gets exactly one line, however late the host runs the page,
+      // and the log must hold exactly these pieces.
       const pieces = s["r-chunks"].slice("chunks=".length).split("|");
-      expect(pieces).toHaveLength(3);
-      expect(pieces.join("")).toMatch(/^c0\n(c\d+\n)*$/);
-      expect(
-        pieces
-          .join("")
-          .split("\n")
-          .slice(0, -1)
-          .map((l, k) => l === `c${k}`),
-      ).not.toContain(false);
+      expect(pieces).toEqual(["c0\n", "c1\n", "c2\n"]);
       expect(s["r-ended"]).toBe("ended=no");
       // The page's cancel reached the server: the stream it never finished
-      // was closed by the client.
+      // was closed by the client, and nothing was written after the three
+      // pieces the page read, since the page released no fourth.
       for (let i = 0; i < 100 && forever.server.streamEnds.length === 0; i++) {
         await sleep(20);
       }
-      expect(forever.server.streamEnds).toMatchObject([
-        { url: "/api/stream?n=forever&interval=100", finished: false },
+      expect(forever.server.streamEnds).toEqual([
+        {
+          url: "/api/stream?n=forever&step=fetch-forever",
+          written: 3,
+          finished: false,
+        },
       ]);
-      expect(forever.server.streamEnds[0].written).toBeLessThan(10);
 
       const log = await stopAndDecode(forever.page);
       expect(log.termination).toBe("Complete");
       const { reqId, taskId, at } = request(
         log,
-        "/api/stream?n=forever&interval=100",
+        "/api/stream?n=forever&step=fetch-forever",
       );
       // The head: Task, then NetResponse{outcome 5} with no body.
       const head = recordsOf(log, "NetResponse", (r) => r.req_id === reqId);
@@ -242,9 +236,9 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
         ),
       ).toEqual(pieces);
       expect(chunks[0]).toBeGreaterThan(headAt);
-      // The lines were written 100 ms apart, so each later piece reached the
-      // page in a network task of its own: a Task with the request's id
-      // precedes it.
+      // Each later line was written only after the page had read the one
+      // before, so it reached the page in a network task of its own: a Task
+      // with the request's id precedes it.
       for (const i of chunks.slice(1)) {
         expect(log.records[i - 1]).toMatchObject({
           record: "Task",
