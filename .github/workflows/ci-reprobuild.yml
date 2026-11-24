@@ -76,6 +76,24 @@ jobs:
         with:
           env-flavor: reprobuild
           gh-token: ${{ steps.ci_token.outputs.token }}
+          # The job's Nix GitHub credential has to outlive the hour, because
+          # this job does. An App installation token expires one hour after
+          # it is minted, and on a cold Linux runner setup-dev-env alone takes
+          # about that long: it builds the pinned repro from source (~47 min)
+          # and then realises the dev env. Without these two inputs
+          # setup-dev-env skips its job credential broker, and Nix keeps
+          # presenting `gh-token` after it expires. A 401 from an expired
+          # token is fatal even for a public tarball. In PR #25's linux-x64 job
+          # the token was minted at 14:52:57 and, at 15:52:58, the dev-env
+          # evaluation's fetch of the public `nix-community/fenix` tarball got
+          # `HTTP error 401 "Bad credentials"`. With the App's id and key the
+          # broker re-mints a `contents: read` token before expiry and
+          # rewrites the job's credential files in place, so every later
+          # `nix` and `repro exec` reads a live token. See the `app-id` input
+          # of setup-dev-env. The broker does not run on Windows, so the
+          # Windows legs are unaffected.
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          app-private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
 
       - name: repro build
         # Builds the conventional `build` collection declared in
