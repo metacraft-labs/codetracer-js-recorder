@@ -15,7 +15,7 @@
  * | `recordings`                 | 0, 1   | both sessions ran their interaction and their logs decode, ending with `End` |
  * | `declaration`                | 1      | the framework declares the `sensitive` capability, and `Header.capabilities` carries it (§9.2) |
  * | `vacuity`                    | 0, 1   | the two logs are not byte-identical (at least one `Declassify.output` differs), and the string typed into the public field is found in both sessions' batches, so the scan below reads them |
- * | `differs-only-in-declassify` | 0, 1   | the two decoded logs are identical record for record except `Declassify.output`; otherwise the first record that differs is named |
+ * | `differs-only-in-declassify` | 0, 1   | the two decoded logs are identical record for record except `Declassify.output`, compared by content and not by position (`seq`), with the optional network task before a streamed body's piece or end left out (§6); otherwise the first record that differs is named, with each side's `seq` |
  * | `no-secret-in-batches`       | 0, 1   | neither secret occurs in any uploaded batch of either session, raw, URL-encoded (`encodeURIComponent` and form encoding) or JSON-escaped |
  * | `replay-a`, `replay-b`       | 0, 1   | each log replays with placeholders to its `End`, every checkpoint compared and matched |
  *
@@ -151,13 +151,15 @@ export interface FixturePair {
 /**
  * How many pairs of sessions a fixture is recorded as, at most. The
  * browser schedules some of a page's tasks by its own timing, which no
- * pinning reaches: a small response's end arrives with its last piece or in
- * a network task of its own (`Task` kind 4). Two sessions can then differ in
- * that order alone, so a pair that differs is recorded again; a difference
- * that depends on the secret is in every pair, so the leg still fails on it,
- * naming each pair's first difference. Hover events, the other such source,
- * are kept out by driving the page without the pointer
- * (`RecordPageOptions.keyboardOnly`).
+ * pinning reaches. The comparison itself absorbs the source the spec names
+ * (§6): a streamed body's piece or end arrives in a network task of its own
+ * (`Task` kind 4) or with no task, and that task is left out of the
+ * comparison along with every `seq` (see `compared`). Hover events are kept
+ * out by driving the page without the pointer
+ * (`RecordPageOptions.keyboardOnly`). A pair that still differs is recorded
+ * again, as a guard against scheduling the comparison does not model; a
+ * difference that depends on the secret is in every pair, so the leg still
+ * fails on it, naming each pair's first difference.
  */
 export const MAX_ATTEMPTS = 3;
 
@@ -171,15 +173,85 @@ export function firstDifference(
   ra: readonly BoundaryRecord[],
   rb: readonly BoundaryRecord[],
 ): string | undefined {
-  const n = Math.max(ra.length, rb.length);
+  const ca = compared(ra);
+  const cb = compared(rb);
+  const n = Math.max(ca.length, cb.length);
+  const side = (c: ComparedRecord | undefined) =>
+    c === undefined
+      ? "(none)"
+      : c.seq === undefined
+        ? c.json
+        : `${c.json} at seq ${c.seq}`;
   for (let i = 0; i < n; i++) {
-    const x = ra[i] === undefined ? "(none)" : comparable(ra[i]);
-    const y = rb[i] === undefined ? "(none)" : comparable(rb[i]);
-    if (x !== y) {
-      return `record ${i} differs beyond Declassify.output: with X ${x}, with Y ${y}`;
+    if (ca[i]?.json !== cb[i]?.json) {
+      return `record ${i} differs beyond Declassify.output: with X ${side(ca[i])}, with Y ${side(cb[i])}`;
     }
   }
   return undefined;
+}
+
+/** A record as the comparison reads it, with the `seq` it had in its log. */
+interface ComparedRecord {
+  json: string;
+  seq?: string;
+}
+
+/**
+ * The records of a log that the comparison reads, in order (§11.3.6 step
+ * 2): every record but a network task the browser's timing alone decides,
+ * each as {@link comparable} writes it.
+ *
+ * A piece or the end of a streamed response body that arrives while the
+ * page waits for it comes in a network task of its own, a `Task{kind 4}`
+ * with the request's task id followed by its `WsMessage`; one that was
+ * already there is read inside the page's current task with no `Task` (§6).
+ * Which one happens is the browser's scheduling, which no pinning reaches,
+ * so such a `Task` is left out on both sides. It is recognised narrowly:
+ * kind 4, immediately followed by a `WsMessage` that is a piece (`dir` 1)
+ * or the end (`dir` 4) of a body (`frame` 0), whose `req_id` is the request
+ * that registered this task id (its `TaskReg{kind 4}` right after its
+ * `NetRequest`, §6). The `WsMessage` itself is compared, so a body that
+ * depends on a secret still fails the leg; any other `Task` is compared.
+ */
+function compared(records: readonly BoundaryRecord[]): ComparedRecord[] {
+  // Task id -> the request that registered it.
+  const requestOfTask = new Map<bigint, bigint>();
+  for (let i = 0; i + 1 < records.length; i++) {
+    const r = records[i];
+    const reg = records[i + 1];
+    if (
+      r.record === "NetRequest" &&
+      reg.record === "TaskReg" &&
+      reg.kind === 4
+    ) {
+      requestOfTask.set(reg.task_id, r.req_id);
+    }
+  }
+  const out: ComparedRecord[] = [];
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    const next = records[i + 1];
+    if (
+      r.record === "Task" &&
+      r.kind === 4 &&
+      next?.record === "WsMessage" &&
+      (next.dir === 1 || next.dir === 4) &&
+      next.frame === 0 &&
+      requestOfTask.get(r.task_id) === next.req_id
+    ) {
+      continue;
+    }
+    out.push({ json: comparable(r), seq: positionOf(r) });
+  }
+  return out;
+}
+
+/** The position fields of `r` as one string, or `undefined` if it has none. */
+function positionOf(r: BoundaryRecord): string | undefined {
+  if (r.record === "End") return undefined;
+  if (r.record === "Gap") return `${r.first_seq}..${r.last_seq}`;
+  const s = (r as { seq?: bigint }).seq;
+  return s === undefined ? undefined : s.toString();
 }
 
 /** Why a pair of secrets cannot test non-interference, or `undefined`. */
@@ -257,10 +329,23 @@ export function occursIn(bodies: readonly Uint8Array[], s: string): boolean {
   });
 }
 
-/** A record's canonical JSON with `Declassify.output` left out. */
+/**
+ * A record's canonical JSON with `Declassify.output` and its position in
+ * the log left out: `seq`, `End.last_seq` and `Gap`'s `first_seq` and
+ * `last_seq` say where a record is, which an optional network task before
+ * it shifts (see {@link compared}); what a record says is compared.
+ */
 function comparable(r: BoundaryRecord): string {
   const j = recordToJson(r) as Record<string, unknown>;
   if (r.record === "Declassify") delete j.output;
+  delete j.seq;
+  if (r.record === "End") delete j.last_seq;
+  if (r.record === "Gap") {
+    // How many records the gap stands for is kept; where it starts is not.
+    delete j.first_seq;
+    delete j.last_seq;
+    j.records = (r.last_seq - r.first_seq + 1n).toString();
+  }
   return JSON.stringify(j);
 }
 
@@ -401,14 +486,13 @@ export function runNoninterferenceChecks(
       if (problems.length > 0) return problems;
       const ra = a.records!;
       const rb = b.records!;
-      const outputsDiffer = ra.some((r, i) => {
-        const o = rb[i];
-        return (
-          r.record === "Declassify" &&
-          o?.record === "Declassify" &&
-          r.output !== o.output
-        );
-      });
+      // The declassifiers' calls in order, not at equal positions: an
+      // optional network task shifts every later record (see `compared`).
+      const outputs = (rs: readonly BoundaryRecord[]) =>
+        rs.flatMap((r) => (r.record === "Declassify" ? [r.output] : []));
+      const oa = outputs(ra);
+      const ob = outputs(rb);
+      const outputsDiffer = oa.some((o, i) => i < ob.length && o !== ob[i]);
       if (!outputsDiffer) {
         problems.push(
           "no Declassify.output differs between the two sessions: the secrets do not exercise a declassifier, so the comparison would prove nothing",
