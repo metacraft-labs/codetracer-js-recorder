@@ -572,8 +572,12 @@ export const CHUNK_MARKER = "<!--ct:chunk-->";
  * other tasks while it waits for the next. `hold=<id>` (with `chunks`) holds
  * the pieces after the first until `/api/release?id=<id>` writes them (see
  * `releaseHeld`), so a test decides when the rest of the page arrives, by
- * what the page has done, rather than by a delay. A held page whose release
- * never comes stays open until the client gives up.
+ * what the page has done, rather than by a delay. `hold=<id>` without
+ * `chunks` holds the whole response until that release: a resource that
+ * must arrive after something the page does (a slow image that loads after
+ * a click) is then late by construction, where a delay only makes it late
+ * while the host keeps up. A held page or file whose release never comes
+ * stays open until the client gives up.
  */
 function serveFile(
   res: http.ServerResponse,
@@ -631,6 +635,16 @@ function serveFile(
     };
     next();
   };
+  if (hold !== null && !(gap > 0)) {
+    // The whole response waits for its release (and then `delay`, if any).
+    heldPieces.set(hold, () => {
+      heldPieces.delete(hold);
+      if (delay > 0) setTimeout(send, delay);
+      else send();
+    });
+    res.once("close", () => heldPieces.delete(hold));
+    return;
+  }
   if (delay > 0) setTimeout(send, delay);
   else send();
 }
