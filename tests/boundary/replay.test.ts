@@ -29,6 +29,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { runCommand } from "../helpers/run.js";
 
 import {
   type BoundaryRecord,
@@ -637,12 +638,12 @@ describe("boundary replay runner", () => {
 });
 
 /** Run the shipped `ct-boundary-conformance replay`; its status and report. */
-function runReplayCli(
+async function runReplayCli(
   build: string,
   level: 0 | 1,
-): { status: number | null; report: ReplayLegReport; stderr: string } {
+): Promise<{ status: number | null; report: ReplayLegReport; stderr: string }> {
   const out = path.join(tmp("ct-conformance-replay-report-"), "report.json");
-  const r = spawnSync(
+  const r = await runCommand(
     process.execPath,
     [
       CONFORMANCE_CLI,
@@ -659,7 +660,7 @@ function runReplayCli(
       "--timeout-ms",
       "60000",
     ],
-    { encoding: "utf-8", timeout: TIMEOUT },
+    { timeoutMs: TIMEOUT },
   );
   if (!fs.existsSync(out)) {
     throw new Error(
@@ -1064,7 +1065,7 @@ describe("conformance replay leg", () => {
         "sensitive-pin",
       ];
 
-      const level1 = runReplayCli(reference, 1);
+      const level1 = await runReplayCli(reference, 1);
       expect(level1.report.fixtures.map((f) => f.name)).toEqual(names);
       // The command's stderr names every failed check with its detail.
       expect(verdicts(level1.report), level1.stderr).toEqual(
@@ -1076,7 +1077,7 @@ describe("conformance replay leg", () => {
       );
       expect(level1.status, level1.stderr).toBe(0);
 
-      const level0 = runReplayCli(generic, 0);
+      const level0 = await runReplayCli(generic, 0);
       expect(verdicts(level0.report), level0.stderr).toEqual(
         names.flatMap((n) => [
           `${n} replay pass`,
@@ -1091,7 +1092,7 @@ describe("conformance replay leg", () => {
       const defects: ReferenceDefects = { injectByDispatch: true };
       const broken = path.join(tmp("ct-conformance-broken-"), "site");
       await buildReferenceFixtures(broken, defects);
-      const bad = runReplayCli(broken, 1);
+      const bad = await runReplayCli(broken, 1);
       expect(bad.status).toBe(1);
       expect(
         bad.report.fixtures.flatMap((f) =>

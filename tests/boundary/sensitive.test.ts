@@ -31,6 +31,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { runCommand } from "../helpers/run.js";
 
 import {
   type BoundaryRecord,
@@ -1576,12 +1577,16 @@ describe("sensitive inputs on the record-and-replay route", () => {
 // ── The conformance suite's non-interference leg ────────────────────────
 
 /** Run `ct-boundary-conformance noninterference` on `build`. */
-function runNoninterference(
+async function runNoninterference(
   build: string,
   level: 0 | 1,
-): { status: number | null; report: NoninterferenceReport; stderr: string } {
+): Promise<{
+  status: number | null;
+  report: NoninterferenceReport;
+  stderr: string;
+}> {
   const out = path.join(tmp("ct-ni-report-"), "report.json");
-  const r = spawnSync(
+  const r = await runCommand(
     process.execPath,
     [
       CONFORMANCE_CLI,
@@ -1598,7 +1603,7 @@ function runNoninterference(
       "--timeout-ms",
       "60000",
     ],
-    { encoding: "utf-8", timeout: TIMEOUT },
+    { timeoutMs: TIMEOUT },
   );
   if (!fs.existsSync(out)) {
     throw new Error(
@@ -1658,22 +1663,25 @@ describe("the non-interference leg", () => {
           `${f} replay-b pass`,
         ]);
 
-      const generic = runNoninterference(await genericBuild(false), 0);
+      const generic = await runNoninterference(await genericBuild(false), 0);
       expect(statusOf(generic.report), generic.stderr).toEqual(passing(0));
       expect(generic.status).toBe(0);
       const reference = path.join(tmp("ct-ni-reference-"), "site");
       await buildReferenceFixtures(reference);
-      const ref = runNoninterference(reference, 1);
+      const ref = await runNoninterference(reference, 1);
       expect(statusOf(ref.report), ref.stderr).toEqual(passing(1));
       expect(ref.status).toBe(0);
 
       // The falsifier: a component that branches a request's URL on the
       // raw value's first character makes the comparison fail, naming the
       // first record that differs; both levels.
-      const leakyGeneric = runNoninterference(await genericBuild(true), 0);
+      const leakyGeneric = await runNoninterference(
+        await genericBuild(true),
+        0,
+      );
       const leakyReference = path.join(tmp("ct-ni-reference-leak-"), "site");
       await buildReferenceFixtures(leakyReference, { leakRawRead: true });
-      const leakyRef = runNoninterference(leakyReference, 1);
+      const leakyRef = await runNoninterference(leakyReference, 1);
       for (const run of [leakyGeneric, leakyRef]) {
         expect(run.status).toBe(1);
         const check = run.report.fixtures
@@ -1689,7 +1697,7 @@ describe("the non-interference leg", () => {
       // scan finds the secret (the reference's seeded defect).
       const ignoring = path.join(tmp("ct-ni-reference-ignore-"), "site");
       await buildReferenceFixtures(ignoring, { leakSensitive: true });
-      const ignored = runNoninterference(ignoring, 1);
+      const ignored = await runNoninterference(ignoring, 1);
       expect(ignored.status).toBe(1);
       expect(statusOf(ignored.report)).toEqual(
         expect.arrayContaining([

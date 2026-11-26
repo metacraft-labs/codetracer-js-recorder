@@ -23,6 +23,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { runCommand } from "../helpers/run.js";
 
 import {
   type BatchEnvelope,
@@ -72,12 +73,12 @@ afterAll(async () => {
 });
 
 /** Run the shipped `ct-boundary-conformance record`; its status and report. */
-function runCli(
+async function runCli(
   build: string,
   level: 0 | 1,
-): { status: number | null; report: RecordLegReport; stderr: string } {
+): Promise<{ status: number | null; report: RecordLegReport; stderr: string }> {
   const out = path.join(tmp("ct-conformance-report-"), "report.json");
-  const r = spawnSync(
+  const r = await runCommand(
     process.execPath,
     [
       CONFORMANCE_CLI,
@@ -89,7 +90,7 @@ function runCli(
       "--out",
       out,
     ],
-    { encoding: "utf-8", timeout: TIMEOUT },
+    { timeoutMs: TIMEOUT },
   );
   if (!fs.existsSync(out)) {
     throw new Error(
@@ -158,7 +159,10 @@ describe("the conformance suite's record leg", () => {
     "conformance_record_leg_passes_reference_framework",
     async () => {
       expect(FIXTURES.length).toBeGreaterThanOrEqual(8);
-      const { status, report, stderr } = runCli(await referenceBuild(), 1);
+      const { status, report, stderr } = await runCli(
+        await referenceBuild(),
+        1,
+      );
       expect(failures(report)).toEqual([]);
       expect(status, stderr).toBe(0);
       expect(report.level).toBe(1);
@@ -178,7 +182,10 @@ describe("the conformance suite's record leg", () => {
   it(
     "conformance_record_leg_passes_generic_shim_at_level_0",
     async () => {
-      const { status, report, stderr } = runCli(await genericShimBuild(), 0);
+      const { status, report, stderr } = await runCli(
+        await genericShimBuild(),
+        0,
+      );
       expect(failures(report)).toEqual([]);
       expect(status, stderr).toBe(0);
       expect(report.fixtures.map((f) => f.name)).toEqual(
@@ -216,7 +223,10 @@ describe("the conformance suite's record leg", () => {
       // The shipped command, at level 0, on the generic build: envelope is
       // a pass on every fixture, never not-applicable.
       expect(LEVEL_1_ONLY.has("envelope")).toBe(false);
-      const { status, report, stderr } = runCli(await genericShimBuild(), 0);
+      const { status, report, stderr } = await runCli(
+        await genericShimBuild(),
+        0,
+      );
       expect(envelopeOf(report)).toEqual(FIXTURES.map((f) => `${f.name} pass`));
       expect(status, stderr).toBe(0);
 
