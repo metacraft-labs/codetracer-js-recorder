@@ -30,7 +30,6 @@
  */
 
 import * as fs from "node:fs";
-import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -57,6 +56,7 @@ import {
 import type { Recording } from "./checks.js";
 import { PROBE_PATH, recordPage, SUITE_VERSION } from "./harness.js";
 import type { Browser } from "./playwright.js";
+import { type HarnessListener, openHarnessListener } from "./server.js";
 import {
   type CheckStatus,
   PROTOCOL_VERSION,
@@ -224,18 +224,6 @@ export const PIN_SCRIPT = `(() => {
   });
 })();`;
 
-/** A free loopback port, for the two sessions' one origin. */
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const s = net.createServer();
-    s.once("error", reject);
-    s.listen(0, "127.0.0.1", () => {
-      const port = (s.address() as net.AddressInfo).port;
-      s.close(() => resolve(port));
-    });
-  });
-}
-
 /** The forms of `s` a page or a recorder may write it in (§5.2.1). */
 export function encodedForms(s: string): string[] {
   return [
@@ -272,7 +260,7 @@ async function recordSession(
   level: ProtocolLevel,
   probeSource: string,
   ms: number,
-  port: number,
+  listener: HarnessListener,
   secret: string,
 ): Promise<Session> {
   const recording = await recordPage(
@@ -283,7 +271,7 @@ async function recordSession(
     false,
     probeSource,
     ms,
-    { secret, initScript: PIN_SCRIPT, port, keyboardOnly: true },
+    { secret, initScript: PIN_SCRIPT, listener, keyboardOnly: true },
   );
   const session: Session = { secret, recording };
   if (recording.log === undefined) {
@@ -539,47 +527,55 @@ export async function runNoninterferenceLeg(
       while (next < fixtures.length) {
         const i = next++;
         const fixture = fixtures[i];
-        const port = await freePort();
+        // One listener for every session of this fixture, held until they
+        // are all recorded: the sessions must share an origin, and a port
+        // released between them could be taken by another process
+        // (`HarnessListener`).
+        const listener = await openHarnessListener();
         const discarded: string[] = [];
         const earlier: Session[] = [];
-        let a: Session;
-        let b: Session;
-        for (let attempt = 1; ; attempt++) {
-          // One after the other, at one origin: the two sessions' URLs
-          // are the same, and the server answers them alike.
-          a = await recordSession(
-            browser,
-            build,
-            fixture,
-            options.level,
-            probeSource,
-            ms,
-            port,
-            secretA,
-          );
-          b = await recordSession(
-            browser,
-            build,
-            fixture,
-            options.level,
-            probeSource,
-            ms,
-            port,
-            secretB,
-          );
-          if (
-            attempt >= MAX_ATTEMPTS ||
-            a.records === undefined ||
-            b.records === undefined ||
-            a.decodeError !== undefined ||
-            b.decodeError !== undefined
-          ) {
-            break;
+        let a!: Session;
+        let b!: Session;
+        try {
+          for (let attempt = 1; ; attempt++) {
+            // One after the other, at one origin: the two sessions' URLs
+            // are the same, and the server answers them alike.
+            a = await recordSession(
+              browser,
+              build,
+              fixture,
+              options.level,
+              probeSource,
+              ms,
+              listener,
+              secretA,
+            );
+            b = await recordSession(
+              browser,
+              build,
+              fixture,
+              options.level,
+              probeSource,
+              ms,
+              listener,
+              secretB,
+            );
+            if (
+              attempt >= MAX_ATTEMPTS ||
+              a.records === undefined ||
+              b.records === undefined ||
+              a.decodeError !== undefined ||
+              b.decodeError !== undefined
+            ) {
+              break;
+            }
+            const d = firstDifference(a.records, b.records);
+            if (d === undefined) break;
+            discarded.push(d);
+            earlier.push(a, b);
           }
-          const d = firstDifference(a.records, b.records);
-          if (d === undefined) break;
-          discarded.push(d);
-          earlier.push(a, b);
+        } finally {
+          await listener.close();
         }
         const dir = fs.mkdtempSync(path.join(work, `${fixture.name}-`));
         await replaySessionLog(browser, build, dir, "a", a, ms);

@@ -34,7 +34,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
-import * as net from "node:net";
 import { createRequire } from "node:module";
 import {
   ctPrintAvailable,
@@ -230,45 +229,48 @@ function findChromiumExecutable(): string | null {
 
 // ── Networking ──────────────────────────────────────────────────────────
 
-/** Pick an ephemeral TCP port and immediately release it. */
-async function pickFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.unref();
-    srv.on("error", reject);
-    srv.listen(0, "127.0.0.1", () => {
-      const addr = srv.address();
-      if (typeof addr === "object" && addr) {
-        const port = addr.port;
-        srv.close(() => resolve(port));
-      } else {
-        srv.close();
-        reject(new Error("could not bind ephemeral port"));
-      }
-    });
-  });
+/**
+ * The endpoint `session-manager record-web` announced on stderr once its
+ * listener was bound: `listening on ws://<addr><path>`, where `<addr>` is the
+ * address it actually holds. The daemon is started with `--bind
+ * 127.0.0.1:0`, so the kernel picks the port as it binds and this line is
+ * how the test learns it. A port picked by binding and releasing a probe
+ * socket first is a race: any other process (vitest runs files in parallel,
+ * several of them starting their own `record-web`) can take it before the
+ * daemon binds, and the daemon then exits with `AddrInUse`, or a readiness
+ * probe that only connects to the port finds the other process's listener.
+ * Undefined until the line is complete.
+ */
+function announcedEndpoint(stderr: string): string | undefined {
+  const m = /listening on (ws:\/\/127\.0\.0\.1:(\d+)\/\S*)\r?\n/.exec(stderr);
+  if (m === null || Number(m[2]) === 0) return undefined;
+  return m[1];
 }
 
-/** Poll a TCP port until it accepts connections or the deadline elapses. */
-async function waitForPort(
-  port: number,
-  host: string,
+/** Wait for `daemon` to announce its endpoint; throws if it exits first. */
+async function waitForEndpoint(
+  daemon: Tracked,
   deadlineMs: number,
-): Promise<boolean> {
+): Promise<string> {
   const start = Date.now();
-  while (Date.now() - start < deadlineMs) {
-    const ok = await new Promise<boolean>((resolve) => {
-      const s = net.createConnection(port, host);
-      s.once("connect", () => {
-        s.end();
-        resolve(true);
-      });
-      s.once("error", () => resolve(false));
-    });
-    if (ok) return true;
-    await new Promise((r) => setTimeout(r, 100));
+  for (;;) {
+    const endpoint = announcedEndpoint(daemon.stderr.join(""));
+    if (endpoint !== undefined) return endpoint;
+    if (daemon.child.exitCode !== null || daemon.child.signalCode !== null) {
+      throw new Error(
+        `record-web exited (${daemon.child.exitCode ?? daemon.child.signalCode}) before listening.\n` +
+          `stderr:\n${daemon.stderr.join("")}`,
+      );
+    }
+    if (Date.now() - start > deadlineMs) {
+      await killChild(daemon.child);
+      throw new Error(
+        `record-web did not announce its endpoint within ${deadlineMs} ms.\n` +
+          `stderr:\n${daemon.stderr.join("")}`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 50));
   }
-  return false;
 }
 
 // ── Fixture authoring ───────────────────────────────────────────────────
@@ -281,7 +283,7 @@ async function waitForPort(
  * so the SWC-injected top-level `__ct.enter(0, arguments)` resolves
  * `arguments` against a function scope.
  */
-function writeFixture(dir: string, daemonPort: number): void {
+function writeFixture(dir: string, endpoint: string): void {
   const appJs = [
     "// fixture: 10-line app exercising let / const / arithmetic.",
     "let x = 1;",
@@ -327,7 +329,7 @@ function writeFixture(dir: string, daemonPort: number): void {
   const indexHtml = [
     "<!doctype html>",
     "<html><head><meta charset='utf-8'><title>m26-fullstack</title>",
-    `<script>window.__codetracer_endpoint = "ws://127.0.0.1:${daemonPort}/ct-stream";</script>`,
+    `<script>window.__codetracer_endpoint = ${JSON.stringify(endpoint)};</script>`,
     "</head><body>",
     "<script type='module' src='/bootstrap.js'></script>",
     "</body></html>",
@@ -350,7 +352,7 @@ function writeFixture(dir: string, daemonPort: number): void {
     "import { codetracerVitePlugin } from '@codetracer/vite-plugin';",
     "export default {",
     "  plugins: [codetracerVitePlugin({",
-    `    endpoint: "ws://127.0.0.1:${daemonPort}/ct-stream",`,
+    `    endpoint: ${JSON.stringify(endpoint)},`,
     "    exclude: [",
     "      '**/node_modules/**',",
     "      '**/bootstrap.js',",
@@ -365,7 +367,7 @@ function writeFixture(dir: string, daemonPort: number): void {
     `      '@codetracer/vite-plugin': ${JSON.stringify(VITE_PLUGIN_DIST)},`,
     "    },",
     "  },",
-    "  server: { host: '127.0.0.1', strictPort: true, fs: { strict: false } },",
+    "  server: { host: '127.0.0.1', fs: { strict: false } },",
     "  clearScreen: false,",
     "  logLevel: 'warn',",
     "};",
@@ -515,46 +517,51 @@ describe("test_browser_recorder_full_stack", () => {
     const fixtureDir = path.join(tmp, "fixture");
     fs.mkdirSync(fixtureDir, { recursive: true });
 
-    const daemonPort = await pickFreePort();
-    const vitePort = await pickFreePort();
-    writeFixture(fixtureDir, daemonPort);
-
-    // Symlink workspace node_modules so Vite can resolve dev-dep imports.
-    fs.symlinkSync(
-      path.join(REPO_ROOT, "node_modules"),
-      path.join(fixtureDir, "node_modules"),
-      "dir",
-    );
-
     // ── Launch the daemon ──────────────────────────────────────────────
+    // On port 0, so the kernel picks a free port as it binds; the fixture
+    // is written with the endpoint the daemon announces.
     const daemon = spawnTracked(sessionManagerBin, [
       "record-web",
       "--bind",
-      `127.0.0.1:${daemonPort}`,
+      "127.0.0.1:0",
       "--out-dir",
       outDir,
     ]);
-    if (!(await waitForPort(daemonPort, "127.0.0.1", 10_000))) {
-      await killChild(daemon.child);
-      throw new Error(
-        `daemon did not bind 127.0.0.1:${daemonPort} within 10s.\n` +
-          `stderr:\n${daemon.stderr.join("")}`,
-      );
-    }
 
     // ── Launch Vite + Chromium, drive the page ─────────────────────────
     let viteServer: Awaited<ReturnType<typeof vite.createServer>> | null = null;
     let browser: PwBrowser | null = null;
     try {
+      const endpoint = await waitForEndpoint(daemon, 10_000);
+      writeFixture(fixtureDir, endpoint);
+
+      // Symlink workspace node_modules so Vite can resolve dev-dep imports.
+      fs.symlinkSync(
+        path.join(REPO_ROOT, "node_modules"),
+        path.join(fixtureDir, "node_modules"),
+        "dir",
+      );
+
+      // Port 0 for the same reason as the daemon's: the kernel picks a free
+      // port as Vite binds, and the test reads it back from the listener.
+      // `listen()` resolves once the server is listening.
       viteServer = await vite.createServer({
         configFile: path.join(fixtureDir, "vite.config.js"),
         root: fixtureDir,
-        server: { port: vitePort, host: "127.0.0.1", strictPort: true },
+        server: { port: 0, host: "127.0.0.1", strictPort: true },
       });
       await viteServer.listen();
-      if (!(await waitForPort(vitePort, "127.0.0.1", 10_000))) {
-        throw new Error(`vite did not bind 127.0.0.1:${vitePort} within 10s`);
+      const viteAddr = viteServer.httpServer?.address();
+      if (
+        viteAddr === null ||
+        viteAddr === undefined ||
+        typeof viteAddr === "string"
+      ) {
+        throw new Error(
+          `vite is not listening on a TCP port: ${String(viteAddr)}`,
+        );
       }
+      const vitePort = viteAddr.port;
 
       browser = await pw.chromium.launch({
         headless: true,
@@ -616,10 +623,12 @@ describe("test_browser_recorder_full_stack", () => {
     } finally {
       if (browser) await browser.close().catch(() => undefined);
       if (viteServer) await viteServer.close().catch(() => undefined);
+      // ── Stop the daemon (SIGINT triggers graceful flush) ─────────────
+      // Here rather than after the block, so a failure above does not
+      // leave the daemon running past the test until its idle timeout.
+      await killChild(daemon.child);
     }
 
-    // ── Stop the daemon (SIGINT triggers graceful flush) ───────────────
-    await killChild(daemon.child);
     // Give the writer a moment to finalise the recording before we read it.
     await new Promise((r) => setTimeout(r, 300));
 

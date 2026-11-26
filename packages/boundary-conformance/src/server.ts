@@ -39,13 +39,87 @@ const TYPES: Record<string, string> = {
   ".wasm": "application/wasm",
 };
 
+/**
+ * A loopback listener held open across several harness servers, one after
+ * another, so that they all serve one origin.
+ *
+ * The non-interference leg records two sessions of a fixture and compares
+ * them record for record (§11.3.6), so both must run at the same origin:
+ * the page's URL, and every URL it builds from it, are in the log. The
+ * listener binds port 0 once and stays bound until `close`, and each
+ * session's server takes it over in turn (`startHarnessServer` with
+ * `listener`). Choosing a port by binding and releasing a probe socket and
+ * binding it again for each session instead is a race: between the release
+ * and each bind, any other process on the host (the parallel suite's other
+ * servers, any process's port-0 listener) can be given that port, and the
+ * session's server then fails with EADDRINUSE. Holding the socket leaves no
+ * moment at which the port is free.
+ */
+export interface HarnessListener {
+  /** `http://127.0.0.1:<port>`, the same for every server it carries. */
+  origin: string;
+  /** Close the listener. Any server it carries stops answering. */
+  close(): Promise<void>;
+}
+
+/** The internals a server attaches to: not part of the exported shape. */
+interface HeldListener extends HarnessListener {
+  /** The current server's request handler, or none between servers. */
+  attach(handler: http.RequestListener | undefined): void;
+  /** Close every connection open on the listener (between servers). */
+  dropConnections(): void;
+}
+
+const held = new WeakMap<HarnessListener, HeldListener>();
+
+/** Bind a loopback listener on a port the kernel picks, and hold it. */
+export async function openHarnessListener(): Promise<HarnessListener> {
+  let current: http.RequestListener | undefined;
+  const server = http.createServer((req, res) => {
+    if (current === undefined) {
+      // Between two sessions: nothing of this origin is being served.
+      res.writeHead(503, { "cache-control": "no-store" });
+      res.end();
+      return;
+    }
+    current(req, res);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const port = (server.address() as { port: number }).port;
+  const listener: HeldListener = {
+    origin: `http://127.0.0.1:${port}`,
+    attach(handler) {
+      current = handler;
+    },
+    dropConnections() {
+      server.closeAllConnections();
+    },
+    close: () =>
+      new Promise<void>((resolve) => {
+        current = undefined;
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+  held.set(listener, listener);
+  return listener;
+}
+
 /** Where the harness server listens. */
 export interface HarnessServerOptions {
   /**
-   * The loopback port (default: a free one). The non-interference leg
-   * records its two sessions at one origin, so their URLs are the same.
+   * A listener from `openHarnessListener` to serve on, so this server
+   * answers at the same origin as the others it carries; its `close` then
+   * detaches from the listener without closing it. Default: a listener of
+   * its own on a port the kernel picks, closed with the server.
    */
-  port?: number;
+  listener?: HarnessListener;
 }
 
 /** Start a server for the build in `root` on a loopback port. */
@@ -70,7 +144,7 @@ export async function startHarnessServer(
     res.end("ok");
   };
 
-  const server = http.createServer((req, res) => {
+  const handler: http.RequestListener = (req, res) => {
     // No `Date` header: what the page reads of a response is the same in
     // every session, so two recordings differ only where the page made
     // them differ (the non-interference leg compares them, §11.3.6).
@@ -165,17 +239,15 @@ export async function startHarnessServer(
       });
       res.end(fs.readFileSync(file));
     });
-  });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(options.port ?? 0, "127.0.0.1", () => {
-      server.off("error", reject);
-      resolve();
-    });
-  });
-  const port = (server.address() as { port: number }).port;
+  };
+  const own = options.listener === undefined;
+  const listener = held.get(options.listener ?? (await openHarnessListener()));
+  if (listener === undefined) {
+    throw new Error("the listener was not opened by openHarnessListener");
+  }
+  listener.attach(handler);
   return {
-    origin: `http://127.0.0.1:${port}`,
+    origin: listener.origin,
     batches,
     gateRequested,
     releaseGate() {
@@ -183,10 +255,15 @@ export async function startHarnessServer(
       for (const res of heldGates.splice(0)) answerGate(res);
     },
     finalBatch,
-    close: () =>
-      new Promise<void>((resolve) => {
-        server.closeAllConnections();
-        server.close(() => resolve());
-      }),
+    close: async () => {
+      if (own) {
+        await listener.close();
+        return;
+      }
+      // The listener stays bound for the next server; this one's
+      // connections end with it, so none of them reaches the next.
+      listener.attach(undefined);
+      listener.dropConnections();
+    },
   };
 }
