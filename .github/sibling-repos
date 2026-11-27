@@ -1,8 +1,16 @@
-# Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
-# revisions (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
+# Cross-repo siblings cloned by setup-dev-env beside this checkout, at the
+# revisions the workspace lock for this commit pins (the mainline tip when no
+# lock covers the commit), so CI builds against the same sibling sources a
+# developer's workspace does.
 codetracer-trace-format
 codetracer-trace-format-nim
 # The boundary replay tests run two codetracer binaries, `ct-jsbound`
 # (libs/jsbound) and `session-manager` (src/backend-manager); CI builds them
 # with `just build-codetracer-test-bins`. Neither crate needs a submodule.
 codetracer
+# The Nim packages the trace format requires (stew, results). The `repro
+# test` graph compiles ct-print from ../codetracer-trace-format-nim against
+# these two checkouts, because reprobuild gives a Nim compile no access to
+# ~/.nimble. nim-results is published under arnetheduck, not metacraft-labs.
+nim-stew
+arnetheduck/nim-results

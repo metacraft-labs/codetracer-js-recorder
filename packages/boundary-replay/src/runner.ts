@@ -371,17 +371,6 @@ export function contextOptionsOf(env: LoadedLog["env"]): ContextOptions {
   return o;
 }
 
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.on("error", reject);
-    srv.listen(0, "127.0.0.1", () => {
-      const port = (srv.address() as net.AddressInfo).port;
-      srv.close(() => resolve(port));
-    });
-  });
-}
-
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -463,19 +452,36 @@ interface TraceHost {
   stderr: string[];
 }
 
+/**
+ * The endpoint a `record-web` host announced on stderr, once it has bound its
+ * listener: `codetracer browser-stream host listening on ws://<addr><path>`,
+ * where `<addr>` is the address the listener actually holds. With `--bind
+ * 127.0.0.1:0` that is the only way to learn the port, and it is the one
+ * race-free way: a port picked by binding and releasing a probe socket first
+ * can be taken by any other process before `record-web` binds it, which on a
+ * busy host running replays in parallel made `record-web` exit with
+ * `AddrInUse`. Undefined until the line is complete.
+ */
+function announcedEndpoint(stderr: string): string | undefined {
+  const m = /listening on (ws:\/\/127\.0\.0\.1:(\d+)\/\S*)\r?\n/.exec(stderr);
+  if (m === null || Number(m[2]) === 0) return undefined;
+  return m[1];
+}
+
 async function startTraceHost(
   bin: string,
   outDir: string,
   recordingId: string,
 ): Promise<TraceHost> {
-  const port = await freePort();
   const stderr: string[] = [];
   const child = spawn(
     bin,
     [
       "record-web",
+      // Port 0: the kernel picks a free port as the listener binds, and the
+      // host announces it (`announcedEndpoint`).
       "--bind",
-      `127.0.0.1:${port}`,
+      "127.0.0.1:0",
       "--out-dir",
       outDir,
       "--idle-timeout",
@@ -497,23 +503,25 @@ async function startTraceHost(
   );
   child.stderr?.on("data", (b: Buffer) => stderr.push(b.toString("utf-8")));
   const deadline = Date.now() + 20000;
+  let endpoint: string | undefined;
   for (;;) {
     if (child.exitCode !== null) {
       throw new Error(
         `record-web exited (${child.exitCode}): ${stderr.join("")}`,
       );
     }
-    if (stderr.join("").includes("listening on")) break;
+    endpoint = announcedEndpoint(stderr.join(""));
+    if (endpoint !== undefined) break;
     if (Date.now() > deadline) {
       child.kill("SIGKILL");
       throw new Error(
-        `record-web did not start within 20 s: ${stderr.join("")}`,
+        `record-web did not announce its endpoint within 20 s: ${stderr.join("")}`,
       );
     }
     await sleep(25);
   }
   return {
-    endpoint: `ws://127.0.0.1:${port}/ct-stream`,
+    endpoint,
     outDir,
     child,
     stderr,

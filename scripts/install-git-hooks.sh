@@ -2,7 +2,7 @@
 # Installs this repository's committed .pre-commit-config.yaml as its git hooks.
 #
 # The flake provides the tools, the committed config provides the rules
-# (metacraft-dev-guidelines repo-requirements.md 4.1): each hook runs the
+# (so a hook checks the same thing on every machine): each hook runs the
 # committed config with the flake's pre-commit. git-hooks.nix's own installer
 # cannot do this -- it refuses to replace a non-symlink .pre-commit-config.yaml
 # and then installs nothing at all.

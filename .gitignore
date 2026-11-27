@@ -28,3 +28,6 @@ tests/tmp/
 
 # reprobuild build artifacts
 .repro/
+
+# CI failure diagnostics (.github/workflows/ci-reprobuild.yml)
+ci-diagnostics/

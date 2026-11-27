@@ -27,5 +27,10 @@ export * from "./replay-leg.js";
 export * from "./noninterference.js";
 export * from "./sensitive-logic.js";
 export * from "./builds.js";
-export { startHarnessServer, type HarnessServer } from "./server.js";
+export {
+  openHarnessListener,
+  startHarnessServer,
+  type HarnessListener,
+  type HarnessServer,
+} from "./server.js";
 export { loadPlaywright, type Browser } from "./playwright.js";

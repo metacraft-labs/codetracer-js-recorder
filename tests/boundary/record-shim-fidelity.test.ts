@@ -186,38 +186,32 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
       const forever = await open(shimDir, "streams.html?case=fetch-forever");
       const s = await slots(forever.page);
       expect(forever.pageErrors).toEqual([]);
-      // The page's three reads. The server writes a line every 100 ms, and
-      // each read gets what the network has delivered by then: one line,
-      // or, when the renderer was not scheduled for longer than that, the
-      // lines that arrived meanwhile in one piece. Either way the pieces
-      // are the server's lines in order, and the log must hold exactly
-      // these pieces.
+      // The page's three reads. The server writes each line only when the
+      // page has read the one before (`step`, see the fixture), so each
+      // read gets exactly one line, however late the host runs the page,
+      // and the log must hold exactly these pieces.
       const pieces = s["r-chunks"].slice("chunks=".length).split("|");
-      expect(pieces).toHaveLength(3);
-      expect(pieces.join("")).toMatch(/^c0\n(c\d+\n)*$/);
-      expect(
-        pieces
-          .join("")
-          .split("\n")
-          .slice(0, -1)
-          .map((l, k) => l === `c${k}`),
-      ).not.toContain(false);
+      expect(pieces).toEqual(["c0\n", "c1\n", "c2\n"]);
       expect(s["r-ended"]).toBe("ended=no");
       // The page's cancel reached the server: the stream it never finished
-      // was closed by the client.
+      // was closed by the client, and nothing was written after the three
+      // pieces the page read, since the page released no fourth.
       for (let i = 0; i < 100 && forever.server.streamEnds.length === 0; i++) {
         await sleep(20);
       }
-      expect(forever.server.streamEnds).toMatchObject([
-        { url: "/api/stream?n=forever&interval=100", finished: false },
+      expect(forever.server.streamEnds).toEqual([
+        {
+          url: "/api/stream?n=forever&step=fetch-forever",
+          written: 3,
+          finished: false,
+        },
       ]);
-      expect(forever.server.streamEnds[0].written).toBeLessThan(10);
 
       const log = await stopAndDecode(forever.page);
       expect(log.termination).toBe("Complete");
       const { reqId, taskId, at } = request(
         log,
-        "/api/stream?n=forever&interval=100",
+        "/api/stream?n=forever&step=fetch-forever",
       );
       // The head: Task, then NetResponse{outcome 5} with no body.
       const head = recordsOf(log, "NetResponse", (r) => r.req_id === reqId);
@@ -242,9 +236,9 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
         ),
       ).toEqual(pieces);
       expect(chunks[0]).toBeGreaterThan(headAt);
-      // The lines were written 100 ms apart, so each later piece reached the
-      // page in a network task of its own: a Task with the request's id
-      // precedes it.
+      // Each later line was written only after the page had read the one
+      // before, so it reached the page in a network task of its own: a Task
+      // with the request's id precedes it.
       for (const i of chunks.slice(1)) {
         expect(log.records[i - 1]).toMatchObject({
           record: "Task",
@@ -466,12 +460,15 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
         .filter((st) => st.startsWith("3:"))
         .map((st) => JSON.parse(st.slice(2)) as string);
       // Vacuity: the page saw the body grow while it was still loading.
-      expect(loading.length).toBeGreaterThanOrEqual(3);
-      expect(loading[0]).toBe("c0\n");
+      // The page releases each next piece only after reading this one
+      // (`step`), so it reads c0 alone and then c0c1 before c2 exists; c2
+      // may reach it together with the response's end, so a third LOADING
+      // state is the host's, not the test's.
+      expect(loading.slice(0, 2)).toEqual(["c0\n", "c0\nc1\n"]);
       expect(s["r-text"]).toBe(`text=${JSON.stringify("c0\nc1\nc2\n")}`);
 
       const log = await stopAndDecode(x.page);
-      const { reqId, taskId } = request(log, "/api/stream?n=3&interval=100");
+      const { reqId, taskId } = request(log, "/api/stream?n=3&step=xhr-stream");
       const head = recordsOf(log, "NetResponse", (r) => r.req_id === reqId);
       expect(head).toMatchObject([{ outcome: 5, status: 200 }]);
       expect(log.records[log.records.indexOf(head[0]) - 1]).toMatchObject({
@@ -521,7 +518,7 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
       expect(es.pageErrors).toEqual([]);
       expect((await slots(es.page))["r-events"]).toBe("events=e0|e1");
       const elog = await stopAndDecode(es.page);
-      const e = request(elog, "/api/sse?n=forever&interval=100");
+      const e = request(elog, "/api/sse?n=forever&step=sse");
       const events = indicesOf(elog, isChunk(e.reqId));
       expect(
         events.map((i) =>
@@ -1158,7 +1155,9 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
             0,
             0,
           ]);
-          expect(results[6]).toBeGreaterThan(0);
+          // The report waits for these (timers.js), so the count is complete:
+          // the three string timeouts and the string interval.
+          expect(results[6], "CSP violations before the report").toBe(4);
         }
         expect(shimmed.pageErrors).toEqual([]);
         expect((await slots(shimmed.page))["r-results"], path).toBe(p);
@@ -1198,24 +1197,40 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
       // original setTimeout made N awaits cost the page at least
       // 4 * (N - 5) ms that the platform does not (and a hidden page far
       // more, throttled timers). The plain arm is the platform's own cost.
+      //
+      // The verdict is a count, not a duration, so host speed cannot change
+      // it. Every timer the page or the shim schedules goes through
+      // `setTimeout`, which timer-calls.js counts beneath the shim. The
+      // plain arm (the same fixture without the shim) is the control, counted
+      // the same way in the same kind of page: a shim that settled the awaits
+      // through a timer would make more calls than the control does.
       const n = 100;
-      const clamped = 4 * (n - 5);
       async function arm(
         root: string,
-      ): Promise<{ ms: number; log?: DecodedLog }> {
-        const o = await open(root, "values.html?case=awaits");
+      ): Promise<{ timers: number; log?: DecodedLog }> {
+        const o = await open(root, "values.html?case=awaits", [
+          "timer-calls.js",
+        ]);
         expect(o.pageErrors).toEqual([]);
-        const [count, ms] = (await slots(o.page))["r-awaits"]
+        const [count] = (await slots(o.page))["r-awaits"]
           .slice("awaits=".length)
           .split(":")
           .map(Number);
         expect(count).toBe(n);
+        const timers = await o.page.evaluate(
+          () =>
+            (globalThis as unknown as { __timerCalls: number }).__timerCalls,
+        );
         const log = root === shimDir ? await stopAndDecode(o.page) : undefined;
         await o.context.close();
-        return { ms, log };
+        return { timers, log };
       }
       const plain = await arm(plainDir);
       const shimmed = await arm(shimDir);
+      // Vacuity: the spy sees the page's own timers (the chain that starts
+      // the awaits schedules some), so a spy that is not installed cannot
+      // pass the equality below.
+      expect(plain.timers, "the control's timers, counted").toBeGreaterThan(0);
       // Vacuity: the shim recorded every one of the awaited promises, as a
       // platform task and its outcome (src 9), so each went through it.
       const log = shimmed.log!;
@@ -1227,12 +1242,12 @@ describe("record-side generic boundary shim: fidelity fixes", () => {
       expect(outcomes.length).toBe(n);
       expect(
         recordsOf(log, "Task", (r) => r.kind === 13).length,
+        "awaits settled by the shim in its own task",
       ).toBeGreaterThanOrEqual(n);
-      expect(plain.ms, "the platform's own cost").toBeLessThan(clamped / 2);
       expect(
-        shimmed.ms,
-        `${n} awaits took ${shimmed.ms} ms with the shim, ${plain.ms} ms without; timers clamped to 4 ms would take at least ${clamped} ms`,
-      ).toBeLessThan(clamped / 2);
+        shimmed.timers,
+        `timers scheduled with the shim: ${shimmed.timers}; without it (the control): ${plain.timers}`,
+      ).toBe(plain.timers);
     },
     TIMEOUT,
   );

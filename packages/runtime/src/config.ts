@@ -4,8 +4,8 @@
  * All values are read once at init() time and cached for the duration
  * of the process.
  *
- * Per `codetracer-specs/Recorder-CLI-Conventions.md` §4 the recorder is
- * CTFS-only — it never reads `CODETRACER_FORMAT` and never writes JSON.
+ * The recorder writes only the CTFS container, as every CodeTracer recorder
+ * does — it never reads `CODETRACER_FORMAT` and never writes JSON.
  * Use `ct print` from `codetracer-trace-format-nim` to convert the
  * produced `.ct` bundle to human-readable JSON / text.
  */
@@ -29,8 +29,8 @@ export interface RuntimeConfig {
  * - CODETRACER_JS_RECORDER_INCLUDE — comma-separated include glob patterns
  * - CODETRACER_JS_RECORDER_EXCLUDE — comma-separated exclude glob patterns
  *
- * `CODETRACER_FORMAT` is NOT read — recorders are CTFS-only per
- * Recorder-CLI-Conventions.md §4.  The legacy variable is intentionally
+ * `CODETRACER_FORMAT` is NOT read — recorders write only CTFS.  The
+ * legacy variable is intentionally
  * absent so accidental reliance on it surfaces as missing behaviour.
  */
 export function readConfig(): RuntimeConfig {

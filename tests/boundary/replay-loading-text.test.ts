@@ -49,7 +49,11 @@ import {
 } from "../../packages/boundary-format/src/index.js";
 import { seqAt } from "../../packages/boundary-replay/src/index.js";
 import {
+  type Context,
+  type DocumentWatch,
+  type Page,
   type RecordReplay,
+  untilInDocument,
   expectDiverged,
   expectReplayed,
   lastCheckpoint,
@@ -90,22 +94,54 @@ const RCDATA_TIMER_MS = 100;
 async function recordUntil(
   pagePath: string,
   wanted: (slots: string[]) => boolean,
+  prepare?: (page: Page, context: Context) => Promise<void>,
 ): Promise<{ records: BoundaryRecord[]; slots: string[] }> {
   const ofTheCase = (r: { records: BoundaryRecord[]; slots: string[] }) =>
     timerRanWhileParsing(r.records) && wanted(r.slots);
-  let recorded = await rr.recordPage(pagePath);
+  let recorded = await rr.recordPage(pagePath, undefined, prepare);
   for (let i = 1; i < 3 && !ofTheCase(recorded); i++) {
-    recorded = await rr.recordPage(pagePath);
+    recorded = await rr.recordPage(pagePath, undefined, prepare);
   }
   return recorded;
 }
 
-/** Record `trailing-rcdata.html`, sent in two pieces, cut inside its text. */
-function recordRcdata() {
-  return recordUntil(
-    `trailing-rcdata.html?chunks=${CHUNK_GAP_MS}&timer=${RCDATA_TIMER_MS}`,
+/** The id the rcdata page's second piece is held by (`hold=`). */
+const RCDATA_HOLD = "rcdata-second-piece";
+
+/**
+ * Record `trailing-rcdata.html`, sent in two pieces, cut inside its text.
+ *
+ * The second piece is held until the page's timer has run (its `#late` is in
+ * the document, seen through DevTools, which runs nothing in the page), and
+ * only then released (the fixture server's `hold`, `harness.ts`
+ * `serveFile`). The timer therefore always runs while the parser is inside
+ * the textarea's text, as the case needs. A fixed gap between the pieces
+ * would race the timer: on a loaded host the timer can run after the second
+ * piece has arrived, and the recording is then of another case.
+ */
+async function recordRcdata() {
+  let released: Promise<number> = Promise.resolve(200);
+  const recorded = await recordUntil(
+    `trailing-rcdata.html?chunks=${CHUNK_GAP_MS}&hold=${RCDATA_HOLD}&timer=${RCDATA_TIMER_MS}`,
     (got) => got.length === 2 && got[0] === "followed by text",
+    async (page, context) => {
+      const watch: DocumentWatch = {
+        cdp: await context.newCDPSession(page),
+        turn: Promise.resolve(),
+      };
+      // Not awaited here: the page's load, which `recordPage` waits for,
+      // is what the release lets finish.
+      released = untilInDocument(watch, "#late").then(
+        async () =>
+          (await fetch(`${rr.server.origin}/api/release?id=${RCDATA_HOLD}`))
+            .status,
+      );
+    },
   );
+  // A 404 means nothing was held: the page was not served in held pieces,
+  // so the recording is not of the case.
+  expect(await released, "the second piece was held and released").toBe(200);
+  return recorded;
 }
 
 /**
@@ -224,11 +260,12 @@ describe("a task released while the document is parsed", () => {
   it(
     "replay_reports_a_task_recorded_inside_a_run_of_text_as_a_typed_divergence",
     async () => {
-      // The timer waits RCDATA_TIMER_MS, within the gap between the
-      // pieces, so the parser is inside the textarea when it runs; under
-      // load the parser may not have got there yet (the timer then runs
-      // before the textarea is in the document, a recording of another
-      // case), so the page is recorded again, at most three times.
+      // The timer waits RCDATA_TIMER_MS, and the textarea's second piece is
+      // held until it has run (`recordRcdata`), so the parser is inside the
+      // textarea's text when it runs. Under load the parser may not have
+      // got to the textarea by then (the timer then runs before the
+      // textarea is in the document, a recording of another case), so the
+      // page is recorded again, at most three times.
       const { records: rs, slots } = await recordRcdata();
       // Vacuity guard: on record the timer ran with only the textarea's
       // first piece of text in the document.

@@ -23,12 +23,10 @@
  *   3. The page-side `__ct.value("z", z)` value is recorded against its
  *      name (proof that the value path lowers cleanly into the recording).
  *
- * Skip discipline (Recorder-CLI-Conventions §1 / §6): the test prints
- * `SKIP:` with the precise missing prerequisite so a CI runner that
- * does not ship the relevant infrastructure has an actionable failure
- * reason rather than a silent pass.  The companion CI script at
- * `codetracer-specs/Planned-Features/value-origin-ci-scripts/run-m26-full-stack.sh`
- * is the runnable surface for an infra-equipped runner.
+ * Skip discipline: the test prints `SKIP:` with the precise missing
+ * prerequisite so a CI runner that does not ship the relevant
+ * infrastructure has an actionable failure reason rather than a silent
+ * pass.
  */
 
 import { describe, it, expect } from "vitest";
@@ -36,18 +34,27 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
-import * as net from "node:net";
+import { createRequire } from "node:module";
 import {
   ctPrintAvailable,
   ctPrintFull,
   ctPrintPath,
 } from "../helpers/ct-print";
+import { cargoBinaryCandidates } from "../boundary/siblings.js";
 
 const REPO_ROOT = path.resolve(__dirname, "../..");
 const CLI_PATH = path.join(REPO_ROOT, "packages/cli/dist/index.js");
 const RUNTIME_BROWSER_SRC = path.join(
   REPO_ROOT,
   "packages/runtime-browser/src/index.ts",
+);
+// The runtime's own dependency: a workspace package whose dist is CommonJS,
+// served from outside node_modules, so Vite's dependency optimiser does not
+// convert it and its named exports do not resolve as ES module imports. Its
+// TypeScript source is ESM, as the runtime's is.
+const BOUNDARY_FORMAT_SRC = path.join(
+  REPO_ROOT,
+  "packages/boundary-format/src/index.ts",
 );
 const VITE_PLUGIN_DIST = path.join(
   REPO_ROOT,
@@ -61,20 +68,73 @@ function findSessionManagerBin(): string | null {
   const env = process.env.SESSION_MANAGER_BIN;
   if (env) return fs.existsSync(env) ? env : null;
   const wsRoot = path.dirname(REPO_ROOT);
-  for (const sub of ["release", "debug"]) {
-    const p = path.join(
-      wsRoot,
-      `codetracer/src/backend-manager/target/${sub}/session-manager`,
-    );
+  for (const c of cargoBinaryCandidates(
+    "codetracer/src/backend-manager",
+    "session-manager",
+  )) {
+    const p = path.join(wsRoot, c);
     if (fs.existsSync(p)) return p;
   }
   return null;
 }
 
-/** Try to load Playwright; returns the module or null. */
-function tryRequirePlaywright(): typeof import("playwright") | null {
+/** The slice of playwright-core's API this test drives. */
+interface PlaywrightCore {
+  chromium: {
+    launch(options: {
+      headless: boolean;
+      executablePath?: string;
+      args?: string[];
+    }): Promise<PwBrowser>;
+    executablePath(): string;
+  };
+}
+interface PwBrowser {
+  newContext(): Promise<PwContext>;
+  close(): Promise<void>;
+}
+interface PwContext {
+  newPage(): Promise<PwPage>;
+  close(): Promise<void>;
+}
+interface PwPage {
+  on(
+    event: "response",
+    f: (r: { status(): number; url(): string }) => void,
+  ): void;
+  on(event: "pageerror", f: (e: Error) => void): void;
+  on(
+    event: "console",
+    f: (m: { type(): string; text(): string }) => void,
+  ): void;
+  goto(
+    url: string,
+    options: { waitUntil: "load"; timeout: number },
+  ): Promise<unknown>;
+  waitForSelector(
+    selector: string,
+    options: { timeout: number },
+  ): Promise<unknown>;
+  evaluate(fn: () => void): Promise<void>;
+  waitForTimeout(ms: number): Promise<void>;
+}
+
+/**
+ * Load playwright-core the way the boundary suites do
+ * (`tests/boundary/harness.ts` `loadPlaywright`): from
+ * `PLAYWRIGHT_CORE_PATH` when it is set, which the Nix dev shell exports
+ * from nixpkgs' playwright-driver and the Windows `just test` recipe points
+ * at the reprobuild `playwright` package; else from a `playwright-core`
+ * Node resolves from the repository. Returns null only when neither exists
+ * (the test then says so and skips); a `PLAYWRIGHT_CORE_PATH` that does not
+ * load is an error, not a skip.
+ */
+function tryRequirePlaywright(): PlaywrightCore | null {
+  const req = createRequire(path.join(REPO_ROOT, "noop.js"));
+  const fromEnv = process.env.PLAYWRIGHT_CORE_PATH;
+  if (fromEnv) return req(fromEnv) as PlaywrightCore;
   try {
-    return require("playwright");
+    return req("playwright-core") as PlaywrightCore;
   } catch {
     return null;
   }
@@ -90,6 +150,27 @@ function tryRequireVite(): typeof import("vite") | null {
 }
 
 /**
+ * The directory `PLAYWRIGHT_BROWSERS_PATH` names, or null when it names none.
+ *
+ * `0` is not a directory: it is Playwright's sentinel for a hermetic install,
+ * where the browsers live in the playwright-core package's own
+ * `.local-browsers/` (https://playwright.dev/docs/browsers#hermetic-install;
+ * playwright-core `lib/server/registry/index.js`, `registryDirectory`). The
+ * Windows reprobuild dev env uses that layout, with the package directory in
+ * `PLAYWRIGHT_CORE_PATH`, so the root is resolved from there. Taken as a path,
+ * `0` would be resolved against the working directory instead.
+ */
+function browsersRootFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const browsers = env.PLAYWRIGHT_BROWSERS_PATH;
+  if (!browsers) return null;
+  if (browsers !== "0") return browsers;
+  const core = env.PLAYWRIGHT_CORE_PATH;
+  return core ? path.join(core, ".local-browsers") : null;
+}
+
+/**
  * Discover a chromium executable Playwright can launch.  In Nix dev
  * shells Playwright's bundled-browser version doesn't always match the
  * `/nix/store/.../playwright-browsers/` content, so we walk common
@@ -99,8 +180,8 @@ function findChromiumExecutable(): string | null {
   const explicit = process.env.PLAYWRIGHT_CHROMIUM_BIN;
   if (explicit) return fs.existsSync(explicit) ? explicit : null;
   const roots: string[] = [];
-  if (process.env.PLAYWRIGHT_BROWSERS_PATH)
-    roots.push(process.env.PLAYWRIGHT_BROWSERS_PATH);
+  const fromEnv = browsersRootFromEnv();
+  if (fromEnv) roots.push(fromEnv);
   try {
     for (const entry of fs.readdirSync("/nix/store")) {
       if (entry.includes("playwright-browsers"))
@@ -127,6 +208,9 @@ function findChromiumExecutable(): string | null {
         path.join(root, child, "chrome-linux64", "chrome"),
         path.join(root, child, "chrome-linux", "chrome"),
         path.join(root, child, "chrome-linux", "headless_shell"),
+        // Playwright's Windows builds (its registry's EXECUTABLE_PATHS `win`).
+        path.join(root, child, "chrome-win", "headless_shell.exe"),
+        path.join(root, child, "chrome-win", "chrome.exe"),
       ];
       for (const t of tries) if (fs.existsSync(t)) return t;
     }
@@ -145,45 +229,48 @@ function findChromiumExecutable(): string | null {
 
 // ── Networking ──────────────────────────────────────────────────────────
 
-/** Pick an ephemeral TCP port and immediately release it. */
-async function pickFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.unref();
-    srv.on("error", reject);
-    srv.listen(0, "127.0.0.1", () => {
-      const addr = srv.address();
-      if (typeof addr === "object" && addr) {
-        const port = addr.port;
-        srv.close(() => resolve(port));
-      } else {
-        srv.close();
-        reject(new Error("could not bind ephemeral port"));
-      }
-    });
-  });
+/**
+ * The endpoint `session-manager record-web` announced on stderr once its
+ * listener was bound: `listening on ws://<addr><path>`, where `<addr>` is the
+ * address it actually holds. The daemon is started with `--bind
+ * 127.0.0.1:0`, so the kernel picks the port as it binds and this line is
+ * how the test learns it. A port picked by binding and releasing a probe
+ * socket first is a race: any other process (vitest runs files in parallel,
+ * several of them starting their own `record-web`) can take it before the
+ * daemon binds, and the daemon then exits with `AddrInUse`, or a readiness
+ * probe that only connects to the port finds the other process's listener.
+ * Undefined until the line is complete.
+ */
+function announcedEndpoint(stderr: string): string | undefined {
+  const m = /listening on (ws:\/\/127\.0\.0\.1:(\d+)\/\S*)\r?\n/.exec(stderr);
+  if (m === null || Number(m[2]) === 0) return undefined;
+  return m[1];
 }
 
-/** Poll a TCP port until it accepts connections or the deadline elapses. */
-async function waitForPort(
-  port: number,
-  host: string,
+/** Wait for `daemon` to announce its endpoint; throws if it exits first. */
+async function waitForEndpoint(
+  daemon: Tracked,
   deadlineMs: number,
-): Promise<boolean> {
+): Promise<string> {
   const start = Date.now();
-  while (Date.now() - start < deadlineMs) {
-    const ok = await new Promise<boolean>((resolve) => {
-      const s = net.createConnection(port, host);
-      s.once("connect", () => {
-        s.end();
-        resolve(true);
-      });
-      s.once("error", () => resolve(false));
-    });
-    if (ok) return true;
-    await new Promise((r) => setTimeout(r, 100));
+  for (;;) {
+    const endpoint = announcedEndpoint(daemon.stderr.join(""));
+    if (endpoint !== undefined) return endpoint;
+    if (daemon.child.exitCode !== null || daemon.child.signalCode !== null) {
+      throw new Error(
+        `record-web exited (${daemon.child.exitCode ?? daemon.child.signalCode}) before listening.\n` +
+          `stderr:\n${daemon.stderr.join("")}`,
+      );
+    }
+    if (Date.now() - start > deadlineMs) {
+      await killChild(daemon.child);
+      throw new Error(
+        `record-web did not announce its endpoint within ${deadlineMs} ms.\n` +
+          `stderr:\n${daemon.stderr.join("")}`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 50));
   }
-  return false;
 }
 
 // ── Fixture authoring ───────────────────────────────────────────────────
@@ -196,7 +283,7 @@ async function waitForPort(
  * so the SWC-injected top-level `__ct.enter(0, arguments)` resolves
  * `arguments` against a function scope.
  */
-function writeFixture(dir: string, daemonPort: number): void {
+function writeFixture(dir: string, endpoint: string): void {
   const appJs = [
     "// fixture: 10-line app exercising let / const / arithmetic.",
     "let x = 1;",
@@ -242,7 +329,7 @@ function writeFixture(dir: string, daemonPort: number): void {
   const indexHtml = [
     "<!doctype html>",
     "<html><head><meta charset='utf-8'><title>m26-fullstack</title>",
-    `<script>window.__codetracer_endpoint = "ws://127.0.0.1:${daemonPort}/ct-stream";</script>`,
+    `<script>window.__codetracer_endpoint = ${JSON.stringify(endpoint)};</script>`,
     "</head><body>",
     "<script type='module' src='/bootstrap.js'></script>",
     "</body></html>",
@@ -256,28 +343,31 @@ function writeFixture(dir: string, daemonPort: number): void {
   );
 
   // Vite config.  Wires `@codetracer/vite-plugin` and aliases
-  // `@codetracer/runtime-browser` to its .ts source (the dist is CJS;
-  // serving CJS through Vite's ESM pipeline mis-resolves named exports).
+  // `@codetracer/runtime-browser`, and the `@codetracer/boundary-format` it
+  // imports, to their .ts sources (the dists are CJS; serving CJS through
+  // Vite's ESM pipeline mis-resolves named exports).
   // The plugin's `exclude` skips bootstrap.js (it installs __ct itself)
-  // and the runtime-browser package tree (it DEFINES __ct).
+  // and the runtime's package trees (they DEFINE __ct).
   const viteConfig = [
     "import { codetracerVitePlugin } from '@codetracer/vite-plugin';",
     "export default {",
     "  plugins: [codetracerVitePlugin({",
-    `    endpoint: "ws://127.0.0.1:${daemonPort}/ct-stream",`,
+    `    endpoint: ${JSON.stringify(endpoint)},`,
     "    exclude: [",
     "      '**/node_modules/**',",
     "      '**/bootstrap.js',",
     "      '**/packages/runtime-browser/**',",
+    "      '**/packages/boundary-format/**',",
     "    ],",
     "  })],",
     "  resolve: {",
     "    alias: {",
     `      '@codetracer/runtime-browser': ${JSON.stringify(RUNTIME_BROWSER_SRC)},`,
+    `      '@codetracer/boundary-format': ${JSON.stringify(BOUNDARY_FORMAT_SRC)},`,
     `      '@codetracer/vite-plugin': ${JSON.stringify(VITE_PLUGIN_DIST)},`,
     "    },",
     "  },",
-    "  server: { host: '127.0.0.1', strictPort: true, fs: { strict: false } },",
+    "  server: { host: '127.0.0.1', fs: { strict: false } },",
     "  clearScreen: false,",
     "  logLevel: 'warn',",
     "};",
@@ -351,15 +441,35 @@ async function killChild(
 
 // ── The test ────────────────────────────────────────────────────────────
 
+describe("browsersRootFromEnv", () => {
+  it("returns a browsers directory as given", () => {
+    expect(
+      browsersRootFromEnv({ PLAYWRIGHT_BROWSERS_PATH: "/opt/pw-browsers" }),
+    ).toBe("/opt/pw-browsers");
+  });
+  it("maps the hermetic-install sentinel 0 to the package's .local-browsers", () => {
+    expect(
+      browsersRootFromEnv({
+        PLAYWRIGHT_BROWSERS_PATH: "0",
+        PLAYWRIGHT_CORE_PATH: "/opt/playwright-core",
+      }),
+    ).toBe(path.join("/opt/playwright-core", ".local-browsers"));
+  });
+  it("names no directory for 0 without a package, or for an unset variable", () => {
+    expect(browsersRootFromEnv({ PLAYWRIGHT_BROWSERS_PATH: "0" })).toBeNull();
+    expect(browsersRootFromEnv({})).toBeNull();
+  });
+});
+
 describe("test_browser_recorder_full_stack", () => {
   it("records a .ct trace from a real Vite dev server + headless Chromium + record-web daemon", async () => {
-    // ── Prereq gate (SKIP-narrow, per CLI conventions §6) ──────────────
+    // ── Prereq gate (SKIP-narrow: name the missing prerequisite) ──────
     const sessionManagerBin = findSessionManagerBin();
     if (!sessionManagerBin) {
       console.warn(
         "SKIP: session-manager binary not found (build " +
-          "`codetracer/src/backend-manager` or set SESSION_MANAGER_BIN; " +
-          "see codetracer-specs/Planned-Features/value-origin-ci-scripts/run-m26-full-stack.sh).",
+          "`codetracer/src/backend-manager` with `cargo build --bin " +
+          "session-manager`, or set SESSION_MANAGER_BIN).",
       );
       return;
     }
@@ -370,7 +480,9 @@ describe("test_browser_recorder_full_stack", () => {
     }
     const pw = tryRequirePlaywright();
     if (!pw) {
-      console.warn("SKIP: playwright module not installed.");
+      console.warn(
+        "SKIP: playwright-core not found (set PLAYWRIGHT_CORE_PATH, as the dev shell does).",
+      );
       return;
     }
     const chromiumExec = findChromiumExecutable();
@@ -405,46 +517,51 @@ describe("test_browser_recorder_full_stack", () => {
     const fixtureDir = path.join(tmp, "fixture");
     fs.mkdirSync(fixtureDir, { recursive: true });
 
-    const daemonPort = await pickFreePort();
-    const vitePort = await pickFreePort();
-    writeFixture(fixtureDir, daemonPort);
-
-    // Symlink workspace node_modules so Vite can resolve dev-dep imports.
-    fs.symlinkSync(
-      path.join(REPO_ROOT, "node_modules"),
-      path.join(fixtureDir, "node_modules"),
-      "dir",
-    );
-
     // ── Launch the daemon ──────────────────────────────────────────────
+    // On port 0, so the kernel picks a free port as it binds; the fixture
+    // is written with the endpoint the daemon announces.
     const daemon = spawnTracked(sessionManagerBin, [
       "record-web",
       "--bind",
-      `127.0.0.1:${daemonPort}`,
+      "127.0.0.1:0",
       "--out-dir",
       outDir,
     ]);
-    if (!(await waitForPort(daemonPort, "127.0.0.1", 10_000))) {
-      await killChild(daemon.child);
-      throw new Error(
-        `daemon did not bind 127.0.0.1:${daemonPort} within 10s.\n` +
-          `stderr:\n${daemon.stderr.join("")}`,
-      );
-    }
 
     // ── Launch Vite + Chromium, drive the page ─────────────────────────
     let viteServer: Awaited<ReturnType<typeof vite.createServer>> | null = null;
-    let browser: import("playwright").Browser | null = null;
+    let browser: PwBrowser | null = null;
     try {
+      const endpoint = await waitForEndpoint(daemon, 10_000);
+      writeFixture(fixtureDir, endpoint);
+
+      // Symlink workspace node_modules so Vite can resolve dev-dep imports.
+      fs.symlinkSync(
+        path.join(REPO_ROOT, "node_modules"),
+        path.join(fixtureDir, "node_modules"),
+        "dir",
+      );
+
+      // Port 0 for the same reason as the daemon's: the kernel picks a free
+      // port as Vite binds, and the test reads it back from the listener.
+      // `listen()` resolves once the server is listening.
       viteServer = await vite.createServer({
         configFile: path.join(fixtureDir, "vite.config.js"),
         root: fixtureDir,
-        server: { port: vitePort, host: "127.0.0.1", strictPort: true },
+        server: { port: 0, host: "127.0.0.1", strictPort: true },
       });
       await viteServer.listen();
-      if (!(await waitForPort(vitePort, "127.0.0.1", 10_000))) {
-        throw new Error(`vite did not bind 127.0.0.1:${vitePort} within 10s`);
+      const viteAddr = viteServer.httpServer?.address();
+      if (
+        viteAddr === null ||
+        viteAddr === undefined ||
+        typeof viteAddr === "string"
+      ) {
+        throw new Error(
+          `vite is not listening on a TCP port: ${String(viteAddr)}`,
+        );
       }
+      const vitePort = viteAddr.port;
 
       browser = await pw.chromium.launch({
         headless: true,
@@ -478,9 +595,16 @@ describe("test_browser_recorder_full_stack", () => {
         timeout: 15_000,
       });
       // `data-ct-ready=1` is set by app.js after `__ct.value('z', z)`.
-      await page.waitForSelector("body[data-ct-ready='1']", {
-        timeout: 10_000,
-      });
+      try {
+        await page.waitForSelector("body[data-ct-ready='1']", {
+          timeout: 10_000,
+        });
+      } catch (e) {
+        // Name what the page reported, which is why it never got ready.
+        throw new Error(
+          `${(e as Error).message}\npage errors:\n${pageErrors.join("\n")}`,
+        );
+      }
       // Graceful flush: invoke the page-side __ct.stop() (synchronous
       // queue drain + SessionEnd), then synthesise a `pagehide` so the
       // runtime's lifecycle listener also fires.
@@ -499,10 +623,12 @@ describe("test_browser_recorder_full_stack", () => {
     } finally {
       if (browser) await browser.close().catch(() => undefined);
       if (viteServer) await viteServer.close().catch(() => undefined);
+      // ── Stop the daemon (SIGINT triggers graceful flush) ─────────────
+      // Here rather than after the block, so a failure above does not
+      // leave the daemon running past the test until its idle timeout.
+      await killChild(daemon.child);
     }
 
-    // ── Stop the daemon (SIGINT triggers graceful flush) ───────────────
-    await killChild(daemon.child);
     // Give the writer a moment to finalise the recording before we read it.
     await new Promise((r) => setTimeout(r, 300));
 

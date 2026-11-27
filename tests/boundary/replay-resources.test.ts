@@ -214,11 +214,29 @@ describe("replay runs the document's resource tasks in recorded order", () => {
   it(
     "replay_holds_an_image_that_loaded_after_a_click_until_its_turn",
     async () => {
+      // The first image is held by the server until the second one, which
+      // the click starts, has loaded: it arrives after the click by
+      // construction. A fixed delay instead (1.5 s) raced the test's own
+      // wait for the page and its click, and on a busy host the image won.
       const { records: rs, slots } = await rr.recordPage(
-        "resources.html?case=image&delay=1500",
+        "resources.html?case=image&hold-resource=late-image",
         async (page) => {
           await until(page, isReady, "the image case");
           await page.click("#btn");
+          await until(
+            page,
+            () =>
+              (document.getElementById("r-order")?.textContent ?? "").includes(
+                "dot:",
+              ),
+            "the second image's load",
+          );
+          const answer = await fetch(
+            `${rr.server.origin}/api/release?id=late-image`,
+          );
+          // A 404 means nothing was held: the image was not the held one,
+          // so fail rather than wait for a load that never comes.
+          expect(answer.status).toBe(200);
         },
       );
       // The image had not arrived when the second one, started by the

@@ -33,12 +33,15 @@ export const ARMS_ATTRIBUTE = "data-ct-arms";
 export const LABEL_ATTRIBUTE = "data-ct-label";
 
 /**
- * `Env.arms`: the canonical JSON (keys sorted) of the document element's
- * `data-ct-arms` when it is a JSON object of at most {@link MAX_ARMS}
- * experiments whose keys and arms are non-empty strings of at most
- * {@link MAX_ARM_TEXT} characters; `{}` otherwise (no attribute, or one
- * that is not such an object, which is ignored as a whole rather than
- * half-read).
+ * `Env.arms`: the canonical JSON of the document element's `data-ct-arms`
+ * when it is a JSON object of at most {@link MAX_ARMS} experiments whose
+ * keys and arms are non-empty strings of at most {@link MAX_ARM_TEXT}
+ * characters; `{}` otherwise (no attribute, or one that is not such an
+ * object, which is ignored as a whole rather than half-read). Canonical:
+ * every member kept, whatever its key (`__proto__` and integer-like keys
+ * too), keys sorted by their UTF-16 code units (JavaScript's string order,
+ * so `"10"` before `"2"`), no whitespace, strings as `JSON.stringify`
+ * writes them.
  */
 export function declaredArms(doc: Document): string {
   let raw: string | null = null;
@@ -57,9 +60,11 @@ export function declaredArms(doc: Document): string {
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     return "{}";
   }
+  // `JSON.parse` defines every member as an own property, `__proto__`
+  // included, so the entries are exactly the members the page declared.
   const entries = Object.entries(parsed as Record<string, unknown>);
   if (entries.length > MAX_ARMS) return "{}";
-  const arms: Record<string, string> = {};
+  const members: string[] = [];
   for (const [key, arm] of entries.sort(([a], [b]) =>
     a < b ? -1 : a > b ? 1 : 0,
   )) {
@@ -72,9 +77,13 @@ export function declaredArms(doc: Document): string {
     ) {
       return "{}";
     }
-    arms[key] = arm;
+    members.push(`${JSON.stringify(key)}:${JSON.stringify(arm)}`);
   }
-  return JSON.stringify(arms);
+  // Serialised member by member, never through an object: assigning to an
+  // ordinary object's `__proto__` sets its prototype instead of adding a
+  // member, and an object enumerates integer-index keys ("2", "10") first
+  // and numerically, whatever order they were inserted in.
+  return `{${members.join(",")}}`;
 }
 
 /**

@@ -1,13 +1,12 @@
 /**
- * M16b verification suite: JavaScript complex assignment patterns.
+ * Verification suite: JavaScript complex assignment patterns.
  *
- * Covers the five verification tests pinned in
- * `codetracer-specs/Planned-Features/Value-Origin-Tracking.milestones.org`
- * §M16b — destructuring (object + array + nested + with defaults),
+ * Covers value-origin tracking of the complex assignment shapes —
+ * destructuring (object + array + nested + with defaults),
  * rest / spread, optional chaining, and the Path A confidence-1.0
  * recorder-side contract for the JS complex fixture.
  *
- * As with the M16a tests in `m16a.test.ts`, we inspect the
+ * As with the simple-assignment tests in `m16a.test.ts`, we inspect the
  * `ManifestSlice.sites` array the SWC visitor emits — the runtime
  * event-buffer round-trip is exercised by the integration suite.
  */

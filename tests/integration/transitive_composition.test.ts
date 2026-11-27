@@ -3,9 +3,6 @@
  * `formatted-view → recorded-minified → original-pre-minification →
  *  renamed identifier`.
  *
- * Spec: `codetracer-specs/Planned-Features/
- * Column-Aware-Tracing-And-Deminification.milestones.org` §P6.
- *
  * ## Why this test exists
  *
  * The deminification stack has FOUR composable layers:

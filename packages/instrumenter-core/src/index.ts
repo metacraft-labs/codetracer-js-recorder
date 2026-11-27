@@ -2,9 +2,9 @@
  * `@codetracer/instrumenter-core` — runtime-agnostic re-export of the
  * SWC-based AST visitor.
  *
- * Per M26 (`codetracer-specs/Planned-Features/Value-Origin-Tracking.milestones.org`)
- * the browser recorder, Node recorder, and bundler plugins (Vite / Webpack /
- * esbuild / Rollup) MUST share a single instrumentation pass.  The pass itself
+ * The browser recorder, Node recorder, and bundler plugins (Vite / Webpack /
+ * esbuild / Rollup) MUST share a single instrumentation pass: they number
+ * steps and sites the same way only if one implementation numbers them.  The pass itself
  * is runtime-agnostic: it parses source, walks the AST, and produces
  * `{ code, map, manifestSlice }`.  No filesystem, no native addon, no
  * Node-specific surface is touched.
@@ -15,12 +15,10 @@
  * indirection lets us evolve the in-browser surface (Vite plugin, AOT CLI
  * targeting static hosting) without forcing the Node recorder to follow.
  *
- * Cross-references:
- *   * `codetracer-specs/GUI/Debugging-Features/Value-Origin-Tracking.md` §14.4
- *     — the wire format / no-shim policy that constrains what the visitor
- *     emits on the browser path.
- *   * `codetracer-specs/Planned-Features/Value-Origin-Tracking.milestones.org`
- *     M26 — the milestone whose deliverables include this package.
+ * What constrains the browser path: events go out as newline-delimited JSON
+ * over WebSocket, and the recorder installs no protocol shims (it never
+ * intercepts `fetch`, `XMLHttpRequest`, `WebSocket` or `postMessage`), so the
+ * visitor emits only `__ct.*` calls (see `@codetracer/runtime-browser`).
  */
 
 export {

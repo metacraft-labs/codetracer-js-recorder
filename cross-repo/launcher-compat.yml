@@ -5,8 +5,8 @@
 #   The checked-in contract between this recorder and the `ct` launcher, read
 #   at test time by the shared end-to-end driver
 #   `codetracer/ci/test/launcher-recorder-e2e.sh`
-#   (design: codetracer-specs/Testing/Launcher-Recorder-Compatibility-Tests.md
-#   §5.6; this edge is milestone LRC-4, the schema is LRC-2's).
+#   (this file is this recorder's entry for that driver, in the shared
+#   `launcher-compat/v1` schema described below).
 #
 #   The driver builds the real launcher, the real desktop core and this
 #   recorder, stages the real `codetracer-desktop` component bundle, and then
@@ -25,7 +25,7 @@
 #   enforces; only what is SPECIFIC TO JAVASCRIPT is explained here.
 #
 # WHY THIS EDGE MATTERS MORE THAN THE OTHER FAN-OUT ROWS
-#   `.js` is the extension milestone LRC-1 ADDED to
+#   `.js` is an extension that was only later ADDED to
 #   codetracer/resources/codetracer-desktop-capabilities.  Before that fix the
 #   capability file declared `record .py .rb .nr .styl .wasm`, so the launcher
 #   returned `mkNone` for `ct record app.js` and refused to route it — this
@@ -63,7 +63,8 @@
 #   NOT write to its own default location.  `resolveRecordOptions` in
 #   packages/cli/src/record-cmd.ts resolves
 #   `--out-dir` -> `CODETRACER_JS_RECORDER_OUT_DIR` -> `./ct-traces/`, which is
-#   also what Recorder-CLI-Conventions.md §3 documents as the convention.
+#   also the order every CodeTracer recorder follows: the flag, then the
+#   recorder's own output-directory variable, then `./ct-traces/`.
 #
 # WHY THE SAMPLE PRINTS ${CODETRACER_COMPONENT_DIR}
 #   It is the gate's only proof of hop 1 -- see the sample's own header and

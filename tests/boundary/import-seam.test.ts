@@ -37,9 +37,19 @@ import { codetracerBoundaryShimPlugin } from "../../packages/vite-plugin/src/ind
 const CLI = path.resolve(__dirname, "..", "..", "packages/cli/dist/index.js");
 const tmpDirs: string[] = [];
 function tmp(prefix: string): string {
-  // The real path: vite's root and the HTML paths it resolves must agree,
-  // and on macOS os.tmpdir() can be under the /tmp -> /private/tmp symlink.
-  const d = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), prefix));
+  // The real path: vite's root and the HTML paths it resolves must agree.
+  // Vite takes `root` as given but resolves every module id with
+  // `fs.realpathSync.native` (on Windows, once its startup `net use` probe
+  // returns), so the root has to be canonical in that same sense. On macOS
+  // os.tmpdir() can be under the /tmp -> /private/tmp symlink; on Windows it
+  // can carry 8.3 short names (`C:\WINDOWS\SERVIC~1\NETWOR~1\...` for a
+  // service account), which only the native realpath expands. The JS
+  // `fs.realpathSync` resolves links but keeps short names, and vite then
+  // sees the HTML entry outside its root.
+  // https://nodejs.org/api/fs.html#fsrealpathsyncnativepath-options
+  const d = fs.mkdtempSync(
+    path.join(fs.realpathSync.native(os.tmpdir()), prefix),
+  );
   tmpDirs.push(d);
   return d;
 }

@@ -203,7 +203,7 @@ export interface SiteEntry {
    *
    * For sites with `kind === "write"`, these fields describe the assignment
    * the runtime should serialise into a `BindVariable + Assignment` pair
-   * (see `codetracer-specs/Trace-Files/Trace-Event-Types.md`).  The fields
+   * (two events of the trace format's `TraceLowLevelEvent` vocabulary).  The fields
    * are populated by the SWC visitor when it recognises a simple
    * assignment shape:
    *

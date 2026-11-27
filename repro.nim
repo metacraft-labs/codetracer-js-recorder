@@ -2,8 +2,9 @@
 ##
 ## Ships an npm package whose native addon is implemented in Rust +
 ## napi-rs. The recipe expresses the cargo build + test edges
-## natively per ``codetracer-specs/Repo-Requirements.md`` §2.8 — no
-## ``shell(command = "just ..."")`` delegations.
+## natively — no ``shell(command = "just ..."")`` delegations — so the
+## engine sees each edge's inputs and outputs and can cache and invalidate
+## them, which a delegated ``just`` call would hide from it.
 ##
 ## **Tool provisioning.** The engine refuses ``uses:`` declarations
 ## without a provisioning mode (it will not fall back to PATH
@@ -15,14 +16,41 @@
 ##   and the Justfile build with one set of tools.
 ## * Windows: ``tarball``. There is no Nix; every tool in ``uses:``
 ##   has a Windows tarball entry in reprobuild's stdlib
-##   (``repro_dsl_stdlib/packages/{rustc,cargo,nim,nimble,git,capnp,zstd,
-##   node,npm}.nim``), which the engine downloads and verifies.
+##   (``repro_dsl_stdlib/packages/{rustc,cargo,gcc,nim,nimble,git,capnp,
+##   zstd,zstd_dev,node,npm,just,sh,bash}.nim``), which the engine downloads
+##   and verifies.
 ##
 ## ``--tool-provisioning=<mode>`` or ``REPRO_TOOL_PROVISIONING``
 ## overrides the default for one invocation.
+##
+## **ct-print.** The vitest suite ``just test`` runs decodes its recordings
+## with ``ct-print`` from the sibling ``../codetracer-trace-format-nim``
+## checkout (``tests/helpers/ct-print.ts``) and fails without it. The
+## ``test`` collection builds it there through the sibling's own
+## ``buildCtPrint`` constructor, so the compile flags stay in the
+## repository that owns them and the engine supplies the declared C
+## compiler and ``zstd-dev`` to the compile on every host. CI's ``just test
+## (cross-check)`` step runs after ``repro test`` and reads that binary.
 
+import std/os
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
+
+# The owning constructor of ``ct-print``. It lives in the sibling checkout
+# this repository's cargo ``path`` dependencies already resolve at
+# ``../codetracer-trace-format-nim``, and the tests read the binary it
+# builds there.
+import "../codetracer-trace-format-nim/build_writer_artifacts"
+
+const traceFormatNimRoot = "../codetracer-trace-format-nim"
+
+# The sibling checkouts of the Nim packages the trace format's ``.nimble``
+# requires (``stew``, ``results``). ``ct-print`` is compiled against them and
+# against nothing else: reprobuild runs every Nim compile without access to
+# the host's ``~/.nimble``, so a compile that is not told where its packages
+# are fails with ``cannot open file: results``. Both are pinned in
+# ``repro.lock``, so the compile reads fixed revisions of them.
+const ctPrintNimDependencyRoots = ["../nim-stew", "../nim-results"]
 
 package codetracer_js_recorder:
   defaultToolProvisioning (when defined(windows): tarball else: path)
@@ -34,11 +62,19 @@ package codetracer_js_recorder:
     # (cc-rs, the Nim FFI) compile C. The stdlib's `cargo` lists `gcc` /
     # `clang` as sub-tools, so declaring it here puts it on every cargo
     # edge's PATH; a `uses:` entry for a tool that no edge lists puts it
-    # on none. Windows links with MSVC instead.
-    when defined(linux):
-      "gcc"
-    elif defined(macosx):
+    # on none.
+    #
+    # Windows links with MSVC, and still declares ``gcc``: the ct-print
+    # edge ``build_writer_artifacts.buildCtPrint`` constructs compiles with
+    # ``nim c``'s gcc back-end on every host but macOS and names ``gcc`` on
+    # its edge, and the constructor refuses a package that does not declare
+    # it (the module's "Native tool contract"). On the cargo edges it is
+    # inert there: rustc and cc-rs drive MSVC for the ``*-windows-msvc``
+    # target, and the Nim FFI build script passes ``--cc:vcc`` for it.
+    when defined(macosx):
       "clang"
+    else:
+      "gcc"
     # Run by the build scripts of the dependency tree, not by cargo; the
     # cargo edges attach them explicitly (see "Build-script tools" below).
     "nim >=2.2 <3.0"
@@ -46,6 +82,13 @@ package codetracer_js_recorder:
     "git"
     "capnp"
     "zstd"
+    # zstd.h + libzstd for the sibling ct-print edge
+    # (``build_writer_artifacts.buildCtPrint`` compiles and links against
+    # them; ``zstd`` is the CLI only). The constructor cannot provision a
+    # tool from inside ``build:`` and refuses a recipe that omits it, on
+    # every host: on Windows ``zstd-dev`` is a MinGW static ``libzstd.a``
+    # for the ct-print edge's gcc back-end, beside the ``gcc`` above.
+    "zstd-dev"
     # ``node`` + ``npm`` drive the napi-rs binding step. With MR2's
     # stdlib tarball entries the engine materialises a content-
     # addressed Node 20.x LTS prefix and surfaces ``node`` / ``npm``
@@ -55,6 +98,38 @@ package codetracer_js_recorder:
     when not defined(windows):
       "pkg-config"
       "openssl"
+    # playwright-core and the headless Chromium the vitest suite drives
+    # (``tests/boundary/harness.ts`` ``loadPlaywright``). On Linux and macOS
+    # the flake dev shell supplies both from nixpkgs' ``playwright-driver``
+    # and exports ``PLAYWRIGHT_CORE_PATH`` / ``PLAYWRIGHT_BROWSERS_PATH``.
+    # On Windows the stdlib ``playwright`` package realizes playwright-core
+    # with its pinned browser builds under ``<prefix>/.local-browsers/``,
+    # Playwright's own hermetic layout, and sets no variables; the dev env
+    # publishes the prefix as ``REPRO_PREFIX_PLAYWRIGHT`` and the Justfile
+    # ``test`` recipe points the two variables at it (see there).
+    # https://playwright.dev/docs/browsers#hermetic-install
+    when defined(windows):
+      "playwright"
+    # A Python that imports the OpenTelemetry SDK, for the traced backend of
+    # ``tests/browser/error-report.test.ts`` (``CT_OTEL_PYTHON``). On Linux
+    # and macOS the flake dev shell exports it from nixpkgs'
+    # ``python3.withPackages``. On Windows the stdlib ``python3-opentelemetry``
+    # package realizes python.org's embeddable CPython with the SDK's pinned
+    # wheels on its own search path (the same SDK version as the nixpkgs
+    # one); the dev env publishes the prefix as
+    # ``REPRO_PREFIX_PYTHON3_OPENTELEMETRY`` and the Justfile ``test`` recipe
+    # points ``CT_OTEL_PYTHON`` at its ``python.exe`` (see there).
+    when defined(windows):
+      "python3-opentelemetry"
+    # ``just`` and the shells its recipes run. CI's cross-check steps run
+    # ``dev-exec just build`` and ``dev-exec just test`` on every leg
+    # (``.github/workflows/ci-reprobuild.yml``). On Linux and macOS the
+    # flake dev shell provides all three; on Windows there is no dev shell,
+    # so the environment holds only what this block declares. ``just`` runs
+    # each recipe line with ``sh``, and the recipes call ``bash`` scripts.
+    "just"
+    "sh"
+    "bash"
 
   library codetracerJsRecorder
 
@@ -154,4 +229,22 @@ package codetracer_js_recorder:
       appendRegisteredActionToolIdentityRefs(action.id, nimFfiTools)
       appendRegisteredActionToolIdentityRefs(action.id, ["capnp"])
 
-    discard collect("test", @[cargoTestsRun.action])
+    # ---- ``ct-print`` for the vitest suite ---------------------------
+    #
+    # Its Nim packages come from the sibling checkouts named by
+    # ``ctPrintNimDependencyRoots``, not from a nimble directory, so it reads
+    # nothing the cargo build installs and needs no ordering after it.
+    # Absolute and normalized, as ``buildCtPrint`` requires; it passes each
+    # as a ``--path:`` and declares it an input of the compile. The provider
+    # also runs this body once while it starts up, with no project root to
+    # resolve them against; nothing that pass registers is kept, so it gets
+    # no directories instead of relative ones the constructor would refuse.
+    var ctPrintNimDependencyDirs: seq[string] = @[]
+    if not providerStartupBodyActive():
+      for dependencyRoot in ctPrintNimDependencyRoots:
+        ctPrintNimDependencyDirs.add(
+          normalizedPath(activeProviderProjectRoot() / dependencyRoot))
+    let ctPrintBuild = buildCtPrint(traceFormatNimRoot,
+      nimDependencyDirs = ctPrintNimDependencyDirs)
+
+    discard collect("test", @[cargoTestsRun.action, ctPrintBuild])

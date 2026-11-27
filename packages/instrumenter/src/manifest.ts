@@ -173,9 +173,9 @@ export class ManifestBuilder {
    * shape the visitor recognised.  Each write site carries a target
    * identifier name (LHS) plus an `RValue` description (RHS) so the
    * runtime can synthesise the `BindVariable + Assignment` pair the
-   * trace-format vocabulary expects.  See
-   * `codetracer-specs/Trace-Files/Trace-Event-Types.md` §RValue for the
-   * shape set.
+   * trace-format vocabulary expects.  The `RValue` shapes are `Literal`,
+   * `Simple` (another variable), `FieldAccess`, `IndexAccess`,
+   * `FunctionReturn` and `Compound` (several sources).
    */
   addWriteSite(
     pathIndex: number,

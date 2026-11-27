@@ -54,9 +54,15 @@
       done();
     },
     // A body that never ends: the page reads three pieces as they arrive,
-    // then cancels its reader.
+    // then cancels its reader. The server writes the next piece when the
+    // page asks for it (`step`, /api/release), after reading this one, so
+    // each read gets one piece, and when the cancel reaches the server it
+    // has written exactly the three pieces the page read, however late the
+    // host runs the page. Paced by `interval`, a page that ran late let the
+    // server write on until the cancel came (12 lines on a loaded CI host,
+    // 2026-11-24), and how many it wrote measured the host, not the shim.
     "fetch-forever": function () {
-      fetch("/api/stream?n=forever&interval=100").then(function (r) {
+      fetch("/api/stream?n=forever&step=fetch-forever").then(function (r) {
         slot("status", r.status);
         var reader = r.body.getReader();
         var got = [];
@@ -74,6 +80,9 @@
               slot("ended", "no");
               return reader.cancel().then(done);
             }
+            var release = new XMLHttpRequest();
+            release.open("GET", "/api/release?id=fetch-forever");
+            release.send();
             return next();
           });
         }
@@ -235,14 +244,25 @@
 
     // An XMLHttpRequest whose body arrives in three pieces: the page sees
     // each piece at readyState 3 (LOADING) before the response is done.
+    // The server writes the next piece when the page asks for it
+    // (`step`, /api/release), which it does once it has read this one, so
+    // no two pieces reach the page together.
     "xhr-stream": function () {
       var x = new XMLHttpRequest();
       var states = [];
-      x.open("GET", "/api/stream?n=3&interval=100");
+      var read = 0;
+      x.open("GET", "/api/stream?n=3&step=xhr-stream");
       x.onreadystatechange = function () {
         if (x.readyState === 3) {
           states.push("3:" + JSON.stringify(x.responseText));
           window.__readAt = Date.now();
+          var pieces = x.responseText.split("\n").length - 1;
+          if (pieces > read) {
+            read = pieces;
+            var r = new XMLHttpRequest();
+            r.open("GET", "/api/release?id=xhr-stream");
+            r.send();
+          }
         } else {
           states.push(String(x.readyState));
         }
@@ -426,8 +446,11 @@
     },
 
     // An EventSource on a stream that never ends: two events, then close.
+    // The server writes the next event when the page asks for it (`step`,
+    // /api/release), after reading this one, so a page that runs late
+    // still reads the events one at a time and never sees a third.
     sse: function () {
-      var es = new EventSource("/api/sse?n=forever&interval=100");
+      var es = new EventSource("/api/sse?n=forever&step=sse");
       var got = [];
       es.onmessage = function (e) {
         got.push(e.data);
@@ -436,6 +459,10 @@
           es.close();
           slot("events", got.join("|"));
           done();
+        } else {
+          var r = new XMLHttpRequest();
+          r.open("GET", "/api/release?id=sse");
+          r.send();
         }
       };
     },

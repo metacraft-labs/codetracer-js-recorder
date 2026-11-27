@@ -29,7 +29,6 @@
  * is pinned by `tests/transform/manifest-id-spaces.test.ts`.
  *
  * Cross-references:
- *   * `codetracer-specs/Planned-Features/Value-Origin-Tracking.milestones.org` M26.
  *   * `codetracer/src/backend-manager/src/browser_stream_host.rs`
  *     (`InstrumentationManifest`) — the consuming decoder.
  */

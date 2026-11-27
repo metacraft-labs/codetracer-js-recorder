@@ -29,6 +29,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { runCommand } from "../helpers/run.js";
 
 import {
   type BoundaryRecord,
@@ -637,12 +638,12 @@ describe("boundary replay runner", () => {
 });
 
 /** Run the shipped `ct-boundary-conformance replay`; its status and report. */
-function runReplayCli(
+async function runReplayCli(
   build: string,
   level: 0 | 1,
-): { status: number | null; report: ReplayLegReport; stderr: string } {
+): Promise<{ status: number | null; report: ReplayLegReport; stderr: string }> {
   const out = path.join(tmp("ct-conformance-replay-report-"), "report.json");
-  const r = spawnSync(
+  const r = await runCommand(
     process.execPath,
     [
       CONFORMANCE_CLI,
@@ -659,7 +660,7 @@ function runReplayCli(
       "--timeout-ms",
       "60000",
     ],
-    { encoding: "utf-8", timeout: TIMEOUT },
+    { timeoutMs: TIMEOUT },
   );
   if (!fs.existsSync(out)) {
     throw new Error(
@@ -691,6 +692,16 @@ interface Mouse {
 const MOVES_BEFORE_LOAD = 3;
 
 /**
+ * The pointer moves the recording waits for while it holds the rest of the
+ * document after its first piece, so while it parses (see
+ * {@link recordSlowLoad}).
+ */
+const MOVES_WHILE_PARSING = 3;
+
+/** The fixture server's hold on the document's second piece (`serveFile`). */
+const PARSE_HOLD = "slow-load-parse";
+
+/**
  * Record `slow-load.html` while the pointer moves over it the whole time it
  * loads: real, trusted input, which the browser dispatches between the
  * page's own tasks wherever the network leaves it room. The document comes
@@ -710,16 +721,26 @@ const MOVES_BEFORE_LOAD = 3;
  * which `mouse.move` awaits, returns once the renderer has handled the
  * event.
  *
- * The input while the document parses needs no hold: the gaps between the
- * document's pieces are server timers, which a busy host makes longer, never
- * shorter. (Holding the head's parser-blocking script instead stalls the
- * pointer: Chromium handles no input before the first frame, which that
- * script keeps back.)
+ * The input while the document parses is imposed the same way. The gaps
+ * between the document's pieces are server timers, and a host that runs the
+ * page late can parse every piece without dispatching a move in between:
+ * a move that is still waiting for the first frame when the last piece
+ * lands runs after parsing (`inputs while parsing: expected 0 to be greater
+ * than 0`, measured 2026-11-13 on a loaded Linux host). So the server holds
+ * the document after its first piece ({@link PARSE_HOLD}) until
+ * {@link MOVES_WHILE_PARSING} moves started after the navigation committed
+ * have completed, and the recording releases it from Node, which the page
+ * does not see. The first piece ends after the head's parser-blocking
+ * scripts and the title, so a frame can be shown while it is held. (Holding
+ * the head's parser-blocking script instead stalls the pointer: Chromium
+ * handles no input before the first frame, which that script keeps back.)
  *
  * Only the recording is constrained: what it logs is still the browser's
  * own order, and the replay under test gets that log unchanged.
  */
-async function recordSlowLoad(): Promise<BoundaryRecord[]> {
+async function recordSlowLoad(
+  fixture = "slow-load.html",
+): Promise<BoundaryRecord[]> {
   const context = (await browser.newContext()) as unknown as Context;
   // Moves started and completed so far. A move in flight when
   // `DOMContentLoaded` is seen may have been dispatched before it, so only
@@ -749,9 +770,11 @@ async function recordSlowLoad(): Promise<BoundaryRecord[]> {
       }
     });
     await mouse.move(3, 3);
-    await page.goto(`${recorded.server.origin}/slow-load.html?chunks=250`, {
-      waitUntil: "commit",
-    });
+    await page.goto(
+      `${recorded.server.origin}/${fixture}?chunks=250&hold=${PARSE_HOLD}`,
+      { waitUntil: "commit" },
+    );
+    let parseHeld = true;
     // A hang guard, not a measure: a starved host takes many times longer.
     const deadline = Date.now() + 120_000;
     for (let n = 0; ; n++) {
@@ -766,6 +789,20 @@ async function recordSlowLoad(): Promise<BoundaryRecord[]> {
         steps: 2,
       });
       completed++;
+      if (parseHeld && completed >= MOVES_WHILE_PARSING) {
+        parseHeld = false;
+        const answer = await fetch(
+          `${recorded.server.origin}/api/release?id=${PARSE_HOLD}`,
+        );
+        // A 404 means nothing was held: the document was not served in
+        // pieces, so no move is known to have run while it parsed.
+        if (answer.status !== 200) {
+          throw new Error(
+            `releasing ${fixture}'s held piece answered ${answer.status}`,
+          );
+        }
+        await answer.text();
+      }
     }
     await mouse.move(400, 300, { steps: 4 });
     const bytes = await page.evaluate(() => {
@@ -812,10 +849,14 @@ describe("tasks recorded while the document loaded", () => {
       // own tasks are in the log, and the page's notes (written into the
       // document at load, where the last checkpoint covers them) saw the
       // document at several extents.
+      // The recording holds the document until MOVES_WHILE_PARSING moves
+      // have completed while it parses (recordSlowLoad), so at least that
+      // many inputs ran at phase 1; the browser's own pointer events, which
+      // it dispatches when the layout moves under the pointer, may add more.
       expect(
         phases.filter((p) => p === 1).length,
         "inputs while parsing",
-      ).toBeGreaterThan(0);
+      ).toBeGreaterThanOrEqual(MOVES_WHILE_PARSING);
       expect(
         phases.filter((p) => p === 2 || p === 3).length,
         "inputs between parsing and load",
@@ -844,6 +885,87 @@ describe("tasks recorded while the document loaded", () => {
       expect(report.checkpoints).toBe(
         records.filter((r) => r.record === "Checkpoint").length,
       );
+      expect(report.injections).toBe(phases.length);
+    },
+    TIMEOUT,
+  );
+});
+
+/**
+ * The inputs that ran directly after a `Loading` of phase 2 or 3 (the document
+ * parsed) and right after an input that ran while it parsed: the records that
+ * follow the input are that `Loading`, so the replay takes it with nothing
+ * else to move the document on, and the parser must already be there.
+ */
+function directlyAfterParseInputs(records: BoundaryRecord[]): number {
+  let phase = 0;
+  let count = 0;
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.record === "Loading") {
+      if (
+        r.phase >= 2 &&
+        i > 0 &&
+        records[i - 1].record === "Input" &&
+        phase === 1
+      ) {
+        count++;
+      }
+      phase = r.phase;
+    }
+    if (r.record === "DocTask" && r.kind === 3) phase = 0;
+  }
+  return count;
+}
+
+describe("a task after parsing, at a position the replay holds", () => {
+  it(
+    "replay_reproduces_a_task_that_ran_after_parsing_at_a_held_position",
+    async () => {
+      // JS-Boundary-Recording.md §6, "The position": the `Loading` of phase
+      // 2 says the document had been parsed. The replay reaches that point
+      // by letting the parser go on past its gates, and only when the
+      // scheduler moves the document on. Recorded where the page runs
+      // nothing between an input while the parser waits and the next input
+      // after the parse (`slow-load-quiet.html`), the log has that input
+      // directly before the `Loading` of phase 2: a replay that takes the
+      // `Loading` without the parser there runs the second input in a
+      // document that lacks the parsed elements, and the notes the page
+      // writes at load diverge at the last checkpoint.
+      const records = await recordSlowLoad("slow-load-quiet.html");
+      const phases = inputPhases(records);
+      // The recording holds the document until MOVES_WHILE_PARSING moves
+      // have completed while it parses (recordSlowLoad), so at least that
+      // many inputs ran at phase 1; the browser's own pointer events, which
+      // it dispatches when the layout moves under the pointer, may add more.
+      expect(
+        phases.filter((p) => p === 1).length,
+        "inputs while parsing",
+      ).toBeGreaterThanOrEqual(MOVES_WHILE_PARSING);
+      expect(
+        phases.filter((p) => p === 2 || p === 3).length,
+        "inputs between parsing and load",
+      ).toBeGreaterThan(0);
+      // Vacuity: the pattern this test exists for is in the log.
+      expect(
+        directlyAfterParseInputs(records),
+        "inputs after parsing, directly after an input while parsing",
+      ).toBeGreaterThan(0);
+      const last = records[records.length - 2];
+      expect(last.record, "the session ends with a checkpoint").toBe(
+        "Checkpoint",
+      );
+
+      const report = await replaySession({
+        log: assemble(records),
+        build: recorded.build,
+        browser,
+        timeoutMs: 60_000,
+      });
+      expect(
+        report.status,
+        JSON.stringify(report.divergence ?? report.error),
+      ).toBe("replayed");
       expect(report.injections).toBe(phases.length);
     },
     TIMEOUT,
@@ -943,7 +1065,7 @@ describe("conformance replay leg", () => {
         "sensitive-pin",
       ];
 
-      const level1 = runReplayCli(reference, 1);
+      const level1 = await runReplayCli(reference, 1);
       expect(level1.report.fixtures.map((f) => f.name)).toEqual(names);
       // The command's stderr names every failed check with its detail.
       expect(verdicts(level1.report), level1.stderr).toEqual(
@@ -955,7 +1077,7 @@ describe("conformance replay leg", () => {
       );
       expect(level1.status, level1.stderr).toBe(0);
 
-      const level0 = runReplayCli(generic, 0);
+      const level0 = await runReplayCli(generic, 0);
       expect(verdicts(level0.report), level0.stderr).toEqual(
         names.flatMap((n) => [
           `${n} replay pass`,
@@ -970,7 +1092,7 @@ describe("conformance replay leg", () => {
       const defects: ReferenceDefects = { injectByDispatch: true };
       const broken = path.join(tmp("ct-conformance-broken-"), "site");
       await buildReferenceFixtures(broken, defects);
-      const bad = runReplayCli(broken, 1);
+      const bad = await runReplayCli(broken, 1);
       expect(bad.status).toBe(1);
       expect(
         bad.report.fixtures.flatMap((f) =>

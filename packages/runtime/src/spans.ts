@@ -17,12 +17,12 @@
  * / `webRequestStop` if they are there and does nothing if they are not, so an
  * app can keep the middleware installed when it is not being recorded.
  *
- * See `codetracer-specs/Trace-Files/CTFS-Request-Span-Streams.md` for the
- * on-wire record and `codetracer-specs/GUI/Core-Panes/Request-Panel.md` for
- * what the panel does with each key.
+ * The on-wire span record is the container's span stream, written and read
+ * by the codetracer-trace-format libraries; CodeTracer's Request panel shows
+ * one row per span, from the metadata keys written here.
  */
 
-/** Span status wire values (`CTFS-Request-Span-Streams.md` §"Record Model"). */
+/** Span status wire values (the span record's `status` field). */
 export const SPAN_STATUS_UNKNOWN = 0 as const;
 /** The interval completed normally. */
 export const SPAN_STATUS_OK = 1 as const;

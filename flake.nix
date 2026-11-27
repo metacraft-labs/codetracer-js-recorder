@@ -196,6 +196,26 @@
             PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
             PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
 
+            # The fontconfig configuration Chromium reads. Playwright launches
+            # `headless: true` with the headless shell
+            # (chromium_headless_shell-*/chrome-linux/headless_shell), which
+            # nixpkgs installs unwrapped, unlike the full `chrome` beside it,
+            # whose wrapper defaults FONTCONFIG_FILE to a nixpkgs fonts.conf.
+            # With no /etc/fonts (the ephemeral container runners have none)
+            # the headless shell's fontconfig has no configuration at all
+            # ("Fontconfig error: Cannot load default config file"), and its
+            # renderer aborts the first time it needs a font
+            # (SkFontMgr_FontConfigInterface.cpp "Not implemented", FATAL):
+            # pages crash or never finish loading. This is the same
+            # `makeFontsConf` the `chrome` wrapper uses, so both browsers read
+            # the same configuration on every host. It names no font
+            # directories of its own: the fonts are still whatever the host
+            # has in the usual places (/usr/share/fonts, ~/.nix-profile,
+            # /etc/fonts/conf.d when present), and none at all is enough for
+            # the tests, which only need fontconfig to load.
+            # Linux only: Chromium on macOS uses CoreText, not fontconfig.
+            FONTCONFIG_FILE = if isLinux then pkgs.makeFontsConf { fontDirectories = [ ]; } else null;
+
             # A Python with the OpenTelemetry SDK, for the backend of the
             # browser error report test (tests/browser/error-report.test.ts),
             # whose page request is traced by the real SDK. An absolute path
@@ -203,6 +223,23 @@
             # front of the developer's own; the test fails, naming this shell,
             # when it is unset.
             CT_OTEL_PYTHON = "${pkgs.python3.withPackages (ps: [ ps.opentelemetry-sdk ])}/bin/python3";
+
+            # A prefix holding both zstd.h and libzstd, for reprobuild's path
+            # mode. That mode resolves programs from PATH, and a library has
+            # no program there, so reprobuild reads the prefix of the C
+            # library `zstd-dev` (declared in repro.nim) from this variable and
+            # checks include/zstd.h and lib/libzstd* under it. nixpkgs splits
+            # zstd into a `dev` output (the header) and an `out` output (the
+            # library), so the prefix joins the two. It is the same nixpkgs
+            # zstd as the one above, so the header matches the library this
+            # shell's compiler links.
+            ZSTD_DEV_PREFIX = pkgs.symlinkJoin {
+              name = "zstd-dev-prefix";
+              paths = [
+                pkgs.zstd.dev
+                pkgs.zstd.out
+              ];
+            };
 
             # `cargo <subcommand>` looks for `cargo-<subcommand>` in
             # `$CARGO_HOME/bin` BEFORE it searches PATH. On any machine with

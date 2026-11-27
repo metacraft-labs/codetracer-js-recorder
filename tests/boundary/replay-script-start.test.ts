@@ -58,6 +58,8 @@ import {
   indexWhere,
   replaced,
   startRecordReplay,
+  type DocumentWatch,
+  untilInDocument,
 } from "./record-replay.js";
 
 const TIMEOUT = 120_000;
@@ -75,43 +77,6 @@ afterAll(async () => {
 /** Whether `src` is the URL of `script-start.js` (any query). */
 const isScriptStart = (src: string): boolean =>
   new URL(src).pathname === "/script-start.js";
-
-/** The DevTools session a case's waits share, and the turn they take on it. */
-interface DocumentWatch {
-  cdp: Awaited<ReturnType<Context["newCDPSession"]>>;
-  turn: Promise<unknown>;
-}
-
-/**
- * Wait until the page's document, as DevTools sees it, has an element that
- * matches `selector`. No script of the page runs (`DOM.querySelector` over
- * the Chrome DevTools Protocol), so the recording sees nothing of it. The
- * waits of a case take turns on its one session: `DOM.getDocument` renumbers
- * the nodes, so a query between another wait's two calls would name a node
- * that is gone. A query that fails (the document being replaced) counts as
- * not yet.
- */
-async function untilInDocument(
-  watch: DocumentWatch,
-  selector: string,
-): Promise<void> {
-  const look = async (): Promise<boolean> => {
-    const doc = (await watch.cdp.send("DOM.getDocument", { depth: 0 })) as {
-      root: { nodeId: number };
-    };
-    const found = (await watch.cdp.send("DOM.querySelector", {
-      nodeId: doc.root.nodeId,
-      selector,
-    })) as { nodeId: number };
-    return found.nodeId !== 0;
-  };
-  for (;;) {
-    const mine = watch.turn.then(look, look);
-    watch.turn = mine.catch(() => false);
-    if (await mine.catch(() => false)) return;
-    await new Promise((r) => setTimeout(r, 5));
-  }
-}
 
 /**
  * The order a case is about, imposed rather than hoped for. The fixture
@@ -234,9 +199,33 @@ describe("a script that changes the document before its first record", () => {
   it(
     "an_async_script_run_while_the_parser_waited_for_the_network_diverges_at_its_loading",
     async () => {
+      // The page's second piece is held by the fixture server (`hold`, see
+      // `serveFile`) until the script has run, so the script's position is
+      // the same however the network paces the page. The release is not
+      // awaited by the prepare step: the page's load, which `recordPage`
+      // waits for, is what the release lets finish.
+      let released: Promise<unknown> = Promise.resolve();
       const { records: rs, slots } = await rr.recordPage(
-        "script-start-async-stream.html?chunks=600",
+        "script-start-async-stream.html?chunks=600&hold=script-start",
+        undefined,
+        async (page, context) => {
+          const watch: DocumentWatch = {
+            cdp: await context.newCDPSession(page),
+            turn: Promise.resolve(),
+          };
+          released = untilInDocument(watch, "#host h2")
+            .then(() =>
+              fetch(`${rr.server.origin}/api/release?id=script-start`),
+            )
+            .then(async (answer) => {
+              // A 404 means nothing was held: the page is not what the case
+              // is about, so fail rather than wait for a load that never comes.
+              expect(answer.status).toBe(200);
+              return answer.text();
+            });
+        },
       );
+      await released;
       expect(slots).toEqual(["observed 1", "clock true", "after true"]);
       const task = scriptStart(rs, 1);
       const loading = rs[task - 1] as RecordOf<"Loading">;

@@ -1,4 +1,4 @@
-# Web-request spans (RS-M9)
+# Web-request spans
 
 The recorder writes one **span** per HTTP request straight into the `.ct`
 container it is already producing. There is no `codetracer_spans.jsonl` sidecar,
@@ -6,13 +6,13 @@ no second file to find or tail, and no second decoder: the records go out
 through the trace format's own span-stream writer and come back through the
 canonical Nim span reader.
 
-Specs: [`CTFS-Request-Span-Streams.md`][fmt] for the wire record,
-[`Trace-Spans.md`][spans] §2.3–2.4 for the model and the structural bits, and
-[`Request-Panel-Live-Sessions.milestones.org`][ms] §RS-M9 for this milestone.
-
-[fmt]: ../../codetracer-specs/Trace-Files/CTFS-Request-Span-Streams.md
-[spans]: ../../codetracer-specs/Planned-Features/Trace-Spans.md
-[ms]: ../../codetracer-specs/Planned-Features/Request-Panel-Live-Sessions.milestones.org
+A span is a named range of the recording — here, one HTTP request from the
+moment the server received it to the moment its response finished — with the
+request's metadata and a few structural bits (below) that tell a reader how
+the range lies in the trace. The span-stream record layout is defined, and
+written and read, by the
+[codetracer-trace-format](https://github.com/metacraft-labs/codetracer-trace-format)
+libraries this recorder links.
 
 ## Using it
 
@@ -82,9 +82,9 @@ recorded so far".
 
 ## The structural bits, for Node
 
-[`Trace-Spans.md`][spans] §2.4 is explicit that `contiguous_on_one_thread` is a
-property of the recorder's stream layout rather than of the language, and that a
-recorder must **compute** it. For this recorder:
+`contiguous_on_one_thread` is a property of the recorder's stream layout rather
+than of the language, so a recorder must **compute** it rather than assume a
+value for its language. For this recorder:
 
 | Bit | Value | Why |
 | --- | --- | --- |

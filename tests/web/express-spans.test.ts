@@ -1,10 +1,7 @@
 /**
- * RS-M9 — Express web-request spans land in the container's span stream.
- *
- * Required by
- * `codetracer-specs/Planned-Features/Request-Panel-Live-Sessions.milestones.org`
- * §RS-M9 (`express_requests_land_in_span_stream`), plus the two controls the
- * milestone's structural claims need in order to be falsifiable.
+ * Express web-request spans land in the container's span stream
+ * (`express_requests_land_in_span_stream`), plus the two controls the
+ * structural claims below need in order to be falsifiable.
  *
  * ## What is real here
  *
@@ -128,9 +125,8 @@ function record(options: RecordOptions = {}): Recording {
   // instead of a hang. `execFileSync` blocks the event loop, so without a
   // timeout vitest cannot interrupt it and its own per-test timeout never
   // fires: the whole run wedges, and the only signal is the runner being
-  // killed from outside with rc 124 and nothing else. That is the exact shape
-  // `codetracer-specs/Testing/Verification-Harness-Traps.md` names — "a hang
-  // arm is one whose rc is 124 and nothing else" — and it made this repo's
+  // killed from outside with rc 124 and nothing else — the signature of a
+  // hang rather than of a failure — and it made this repo's
   // `just test` unable to complete at all, so no change to the recorder could
   // be verified through it.
   //

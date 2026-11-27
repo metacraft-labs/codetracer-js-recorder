@@ -53,7 +53,11 @@ import {
   PROTOCOL_VERSION,
   type ProtocolLevel,
 } from "./protocol.js";
-import { type HarnessServer, startHarnessServer } from "./server.js";
+import {
+  type HarnessListener,
+  type HarnessServer,
+  startHarnessServer,
+} from "./server.js";
 
 /** This suite's package version, written into every report. */
 export const SUITE_VERSION = "0.1.0";
@@ -223,8 +227,13 @@ export interface RecordPageOptions {
    * random sources with it (§11.3.6).
    */
   initScript?: string;
-  /** The harness server's port (default: a free one). */
-  port?: number;
+  /**
+   * The listener the harness server serves on, from `openHarnessListener`
+   * (default: one of its own, on a port the kernel picks). The
+   * non-interference leg records its two sessions on one, so they share an
+   * origin.
+   */
+  listener?: HarnessListener;
   /**
    * Drive the page without the pointer: the cursor parked outside the
    * viewport before the page loads, and each `click` step made by the
@@ -248,7 +257,9 @@ export async function recordPage(
   ms: number,
   options: RecordPageOptions = {},
 ): Promise<Recording> {
-  const server = await startHarnessServer(build, { port: options.port });
+  const server = await startHarnessServer(build, {
+    listener: options.listener,
+  });
   const secret = options.secret ?? DEFAULT_SECRETS[0];
   const pagePath = fixturePage(fixture.name, perturbed);
   const problems: string[] = [];
@@ -317,7 +328,10 @@ export async function recordPage(
       recording.envelope = checkBatches(recording.batches);
       recording.log = recording.envelope.log;
     } catch (e) {
-      recording.collectError = (e as Error).message;
+      // What the server saw when the wait ended goes with the reason, so a
+      // stop that never resolved says whether the page's upload reached
+      // the server at all. Diagnostic only: no check reads it.
+      recording.collectError = `${(e as Error).message}; ${server.activity()}`;
       if (server.batches.length > 0) {
         recording.batches = server.batches.slice();
         recording.envelope = checkBatches(recording.batches);

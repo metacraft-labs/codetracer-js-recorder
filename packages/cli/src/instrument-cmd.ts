@@ -156,10 +156,9 @@ function buildBrowserRuntimeStub(endpoint: string, manifest: unknown): string {
   // The runtime stub mirrors `packages/runtime-browser/src/index.ts`'s
   // queue-and-flush semantics.  We keep it ES5 / no-modules so it loads
   // from a plain `<script>` tag without `type="module"`.
-  return `// CodeTracer browser runtime (M26 AOT bundle bootstrap).
+  return `// CodeTracer browser runtime (ahead-of-time bundle bootstrap).
 ${recorderVersionDeclaration()}
-// Wire format: newline-delimited JSON over WebSocket.
-// Spec: codetracer-specs/GUI/Debugging-Features/Value-Origin-Tracking.md §14.4
+// Wire format: newline-delimited JSON over WebSocket, one trace event per line.
 (function () {
   if (typeof globalThis === "undefined") return;
   if (globalThis.__ct) return;

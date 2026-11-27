@@ -6,9 +6,6 @@
  * `tests/integration/recorder_autoformat.test.ts`; this file covers
  * the pure functions (heuristic + sourcemap generation + outcome
  * dispatch) without going through the recorder pipeline.
- *
- * See `codetracer-specs/Planned-Features/
- * Column-Aware-Tracing-And-Deminification.milestones.org` §P6.2.
  */
 
 import { describe, it, expect } from "vitest";

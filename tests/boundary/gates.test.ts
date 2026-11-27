@@ -283,10 +283,32 @@ async function treeOf(html: string, hold = false): Promise<string[]> {
     // external gate script (`document.write`), parsed in the insertion mode
     // the inline gate left, and then takes every gate out of the document.
     // A gate that holds must leave the tree as it was too.
+    //
+    // An external gate (the `async` load gate, the `defer` DOMContentLoaded
+    // gate, a written held gate) takes out only itself and the gates right
+    // before it, as the replay runtime's `removeRunningGate` does, never a
+    // gate after it. The `async` load gate can run while the parser is
+    // between the start tag and the end tag of the last parser gate, which
+    // follows it: the parser inserts a script element at its start tag and
+    // runs it at its end tag, and may yield to the event loop in between
+    // (more often on a slow or busy host). Taking every gate out there
+    // would remove that parser gate before it ran, so it would write no
+    // held script, and the count below would come out one short.
+    // https://html.spec.whatwg.org/multipage/parsing.html#scriptEndTag
     await context.addInitScript({
       content: `globalThis.__ctReplay = { gate() {
         const s = document.currentScript;
-        if (${hold} && s !== null && !s.src && document.readyState === "loading") {
+        if (s !== null && s.src) {
+          let before = s.previousElementSibling;
+          while (before !== null && before.hasAttribute("data-ct-replay-gate")) {
+            const next = before.previousElementSibling;
+            before.remove();
+            before = next;
+          }
+          s.remove();
+          return;
+        }
+        if (${hold} && s !== null && document.readyState === "loading") {
           document.write('<script data-ct-replay-gate src="${GATE_PATH}gate/held?n=' + (globalThis.__ctHeld = (globalThis.__ctHeld || 0) + 1) + '"></' + 'script>');
         }
         for (const s of Array.from(document.querySelectorAll("script[data-ct-replay-gate]"))) s.remove();

@@ -11,12 +11,10 @@
  *    offset decoding.
  *  - The `--no-column-aware` opt-out (and explicit `columnAware: false`
  *    addon option) produces a line-only trace byte-for-byte identical
- *    in shape to the pre-P2 output (meta.dat flag bit 4 clear, no
- *    DeltaColumn events).
+ *    in shape to the output from before column-aware steps (meta.dat
+ *    flag bit 4 clear, no DeltaColumn events).
  *
- * See `codetracer-specs/Planned-Features/
- * Column-Aware-Tracing-And-Deminification.milestones.org` §P2 and
- * `codetracer-trace-format-spec/trace-events.md` §"Column Encoding".
+ * See `codetracer-trace-format-spec/trace-events.md` §"Column Encoding".
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";

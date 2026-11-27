@@ -3,12 +3,16 @@
 // dynamic import() and a script the page inserts, each racing a task of the
 // page's own, so the order the page saw is the order it writes into
 // `<li id="r-order">`. `?case=<name>` picks one scenario; `delay=<ms>` slows
-// the resource down on record (the fixture server's `delay` parameter). The
+// the resource down on record (the fixture server's `delay` parameter), and
+// `hold-resource=<id>` holds it until the test releases it (the fixture
+// server's `hold=<id>` parameter, released by `/api/release?id=<id>`; named
+// apart from it so the page itself is not held). The
 // page sets `<body data-ready="1">` once it listens and `data-done="1"` when
 // it is finished.
 (function () {
   var params = new URLSearchParams(location.search);
   var delay = Number(params.get("delay") || "0");
+  var hold = params.get("hold-resource");
   var out = document.getElementById("out");
   var host = document.getElementById("host");
   var order = [];
@@ -36,7 +40,12 @@
       if (order.length === n) f();
     };
   }
-  var slow = delay > 0 ? "?delay=" + delay : "";
+  var slow =
+    hold !== null
+      ? "?hold=" + encodeURIComponent(hold)
+      : delay > 0
+        ? "?delay=" + delay
+        : "";
 
   var cases = {
     // An image whose load races the user's click.
