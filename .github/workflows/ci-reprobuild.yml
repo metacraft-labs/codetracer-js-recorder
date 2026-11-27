@@ -150,21 +150,26 @@ jobs:
         run: dev-exec just build-codetracer-test-bins
 
       - name: just test (cross-check)
-        # Linux: Playwright's browser log goes to one file per Node process
-        # under ci-diagnostics/playwright/, which "Upload logs on failure"
-        # below collects. It is the only record of why a Chromium page crashed
-        # or hung: the test report says just "Page crashed", while this log
-        # has the browser's own stderr and its exit code or signal. The
-        # preload only points playwright-core's DEBUG_FILE at that directory
+        # Linux and Windows: Playwright's browser log goes to one file per
+        # Node process under ci-diagnostics/playwright/, which "Upload logs on
+        # failure" below collects. It is the only record of why a Chromium
+        # page crashed or hung: the test report says just "Page crashed",
+        # while this log has the browser's own stderr and its exit code or
+        # signal. The preload only points playwright-core's DEBUG_FILE at
+        # that directory
         # (see scripts/ci/playwright-debug-log.cjs for why each process needs
         # its own file); `pw:browser*` selects the browser-process channel and
         # nothing else, so stdout and the tests' behaviour are unchanged.
-        # Linux only: the browser failures this was added for (run
-        # 44685803773) happened on the linux-x64 leg alone.
+        # Linux and Windows: the browser failures this was added for (run
+        # 44685803773) happened on the linux-x64 leg, and a page's record
+        # stop that never resolved (run 45834561012, windows-x64) needs the
+        # browser's side of the story too. The Windows path has no spaces,
+        # and NODE_OPTIONS treats a backslash outside quotes literally, so
+        # the unquoted `--require=<path>` is read as written.
         env:
-          CT_PLAYWRIGHT_DEBUG_DIR: ${{ matrix.os == 'linux' && format('{0}/ci-diagnostics/playwright', github.workspace) || '' }}
-          DEBUG: ${{ matrix.os == 'linux' && 'pw:browser*' || '' }}
-          NODE_OPTIONS: ${{ matrix.os == 'linux' && format('--require={0}/scripts/ci/playwright-debug-log.cjs', github.workspace) || '' }}
+          CT_PLAYWRIGHT_DEBUG_DIR: ${{ (matrix.os == 'linux' || matrix.os == 'windows') && format('{0}/ci-diagnostics/playwright', github.workspace) || '' }}
+          DEBUG: ${{ (matrix.os == 'linux' || matrix.os == 'windows') && 'pw:browser*' || '' }}
+          NODE_OPTIONS: ${{ (matrix.os == 'linux' || matrix.os == 'windows') && format('--require={0}/scripts/ci/playwright-debug-log.cjs', github.workspace) || '' }}
         run: dev-exec just test
 
       # Linux: what the runner gave this job, read after a failure. Browser
