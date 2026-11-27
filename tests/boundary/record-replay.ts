@@ -226,6 +226,43 @@ export async function until(page: Page, probe: () => boolean, what: string) {
   }
 }
 
+/** The DevTools session a case's waits share, and the turn they take on it. */
+export interface DocumentWatch {
+  cdp: Awaited<ReturnType<Context["newCDPSession"]>>;
+  turn: Promise<unknown>;
+}
+
+/**
+ * Wait until the page's document, as DevTools sees it, has an element that
+ * matches `selector`. No script of the page runs (`DOM.querySelector` over
+ * the Chrome DevTools Protocol), so the recording sees nothing of it. The
+ * waits of a case take turns on its one session: `DOM.getDocument` renumbers
+ * the nodes, so a query between another wait's two calls would name a node
+ * that is gone. A query that fails (the document being replaced) counts as
+ * not yet.
+ */
+export async function untilInDocument(
+  watch: DocumentWatch,
+  selector: string,
+): Promise<void> {
+  const look = async (): Promise<boolean> => {
+    const doc = (await watch.cdp.send("DOM.getDocument", { depth: 0 })) as {
+      root: { nodeId: number };
+    };
+    const found = (await watch.cdp.send("DOM.querySelector", {
+      nodeId: doc.root.nodeId,
+      selector,
+    })) as { nodeId: number };
+    return found.nodeId !== 0;
+  };
+  for (;;) {
+    const mine = watch.turn.then(look, look);
+    watch.turn = mine.catch(() => false);
+    if (await mine.catch(() => false)) return;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
 export const isDone = () => document.body?.getAttribute("data-done") === "1";
 export const isReady = () => document.body?.getAttribute("data-ready") === "1";
 

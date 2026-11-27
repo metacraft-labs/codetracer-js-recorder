@@ -58,6 +58,8 @@ import {
   indexWhere,
   replaced,
   startRecordReplay,
+  type DocumentWatch,
+  untilInDocument,
 } from "./record-replay.js";
 
 const TIMEOUT = 120_000;
@@ -75,43 +77,6 @@ afterAll(async () => {
 /** Whether `src` is the URL of `script-start.js` (any query). */
 const isScriptStart = (src: string): boolean =>
   new URL(src).pathname === "/script-start.js";
-
-/** The DevTools session a case's waits share, and the turn they take on it. */
-interface DocumentWatch {
-  cdp: Awaited<ReturnType<Context["newCDPSession"]>>;
-  turn: Promise<unknown>;
-}
-
-/**
- * Wait until the page's document, as DevTools sees it, has an element that
- * matches `selector`. No script of the page runs (`DOM.querySelector` over
- * the Chrome DevTools Protocol), so the recording sees nothing of it. The
- * waits of a case take turns on its one session: `DOM.getDocument` renumbers
- * the nodes, so a query between another wait's two calls would name a node
- * that is gone. A query that fails (the document being replaced) counts as
- * not yet.
- */
-async function untilInDocument(
-  watch: DocumentWatch,
-  selector: string,
-): Promise<void> {
-  const look = async (): Promise<boolean> => {
-    const doc = (await watch.cdp.send("DOM.getDocument", { depth: 0 })) as {
-      root: { nodeId: number };
-    };
-    const found = (await watch.cdp.send("DOM.querySelector", {
-      nodeId: doc.root.nodeId,
-      selector,
-    })) as { nodeId: number };
-    return found.nodeId !== 0;
-  };
-  for (;;) {
-    const mine = watch.turn.then(look, look);
-    watch.turn = mine.catch(() => false);
-    if (await mine.catch(() => false)) return;
-    await new Promise((r) => setTimeout(r, 5));
-  }
-}
 
 /**
  * The order a case is about, imposed rather than hoped for. The fixture

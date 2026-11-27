@@ -610,6 +610,9 @@ async function checkSite(
   return logs;
 }
 
+/** The id the pending-script page's second piece is held by (`hold=`). */
+const PENDING_HOLD = "pending-script-second-piece";
+
 describe("the record bootstrap's position", () => {
   it(
     "every_shape_runs_the_shim_first_through_the_cli_and_vite",
@@ -767,15 +770,27 @@ describe("the record bootstrap's position", () => {
       let log: Uint8Array;
       try {
         const p = await context.newPage();
-        const loaded = p.goto(`${server.origin}/pending.html?chunks=600`, {
-          waitUntil: "commit",
-        });
+        // The second piece is held until the pointer has moved (`hold`, the
+        // fixture server's `serveFile`), so the inputs always come while the
+        // script is in the document and has not run. A fixed gap between the
+        // pieces would race the moves: on a loaded host the second piece can
+        // arrive first, and the script then runs before any input.
+        const loaded = p.goto(
+          `${server.origin}/pending.html?chunks=600&hold=${PENDING_HOLD}`,
+          { waitUntil: "commit" },
+        );
         await loaded;
         // While the second piece is held back.
         for (let k = 0; k < 6; k++) {
           await p.mouse.move(20 + k * 15, 20 + k * 10);
           await new Promise((r) => setTimeout(r, 40));
         }
+        const answer = await fetch(
+          `${server.origin}/api/release?id=${PENDING_HOLD}`,
+        );
+        // A 404 means nothing was held: the page was not served in held
+        // pieces, so this is not the case under test.
+        expect(answer.status, "the second piece was held").toBe(200);
         for (const deadline = Date.now() + 15_000; ; ) {
           if ((await p.evaluate(() => document.readyState)) === "complete") {
             break;
