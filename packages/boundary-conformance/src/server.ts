@@ -26,6 +26,14 @@ export interface HarnessServer {
   releaseGate(): void;
   /** Resolves once a batch whose envelope says `final: true` has arrived. */
   finalBatch: Promise<void>;
+  /**
+   * What the server has seen of the page's traffic, for a report that a
+   * wait on the page timed out: how many batches arrived and when the last
+   * one did, and every request still open (received but not yet answered,
+   * or answered but not yet finished sending). It tells "the page never
+   * sent" from "the request reached the server and was not answered".
+   */
+  activity(): string;
   close(): Promise<void>;
 }
 
@@ -144,7 +152,28 @@ export async function startHarnessServer(
     res.end("ok");
   };
 
+  // For `activity()`: when the server started, when the last batch came, and
+  // the requests still open, by when each arrived.
+  const startedAt = Date.now();
+  let lastBatchAt: number | undefined;
+  const open = new Map<http.IncomingMessage, number>();
+  const activity = (): string => {
+    const now = Date.now();
+    const last =
+      lastBatchAt === undefined ? "none" : `${now - lastBatchAt} ms ago`;
+    const pending = [...open].map(
+      ([r, at]) => `${r.method} ${r.url} (open ${now - at} ms)`,
+    );
+    return (
+      `the server, up ${now - startedAt} ms, received ${batches.length} ` +
+      `batch(es), the last ${last}; requests still open: ` +
+      (pending.length === 0 ? "none" : pending.join(", "))
+    );
+  };
+
   const handler: http.RequestListener = (req, res) => {
+    open.set(req, Date.now());
+    res.once("close", () => open.delete(req));
     // No `Date` header: what the page reads of a response is the same in
     // every session, so two recordings differ only where the page made
     // them differ (the non-interference leg compares them, §11.3.6).
@@ -157,6 +186,7 @@ export async function startHarnessServer(
       if (pathname === ROUTES.batches && req.method === "POST") {
         const bytes = new Uint8Array(body);
         batches.push(bytes);
+        lastBatchAt = Date.now();
         try {
           if (parseBatch(bytes).envelope.final) onFinal();
         } catch (e) {
@@ -255,6 +285,7 @@ export async function startHarnessServer(
       for (const res of heldGates.splice(0)) answerGate(res);
     },
     finalBatch,
+    activity,
     close: async () => {
       if (own) {
         await listener.close();

@@ -163,7 +163,9 @@ describe("the conformance suite's record leg", () => {
         await referenceBuild(),
         1,
       );
-      expect(failures(report)).toEqual([]);
+      // The CLI's stderr goes with the failures: it names every failed
+      // check with its detail and carries whatever else the leg reported.
+      expect(failures(report), stderr).toEqual([]);
       expect(status, stderr).toBe(0);
       expect(report.level).toBe(1);
       expect(report.fixtures.map((f) => f.name)).toEqual(

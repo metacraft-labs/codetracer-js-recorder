@@ -328,7 +328,10 @@ export async function recordPage(
       recording.envelope = checkBatches(recording.batches);
       recording.log = recording.envelope.log;
     } catch (e) {
-      recording.collectError = (e as Error).message;
+      // What the server saw when the wait ended goes with the reason, so a
+      // stop that never resolved says whether the page's upload reached
+      // the server at all. Diagnostic only: no check reads it.
+      recording.collectError = `${(e as Error).message}; ${server.activity()}`;
       if (server.batches.length > 0) {
         recording.batches = server.batches.slice();
         recording.envelope = checkBatches(recording.batches);
